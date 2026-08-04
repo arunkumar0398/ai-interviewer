@@ -258,3 +258,52 @@ pub async fn record_test_clip(
 
     Ok(tmp_path)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recording_handle_stop_sets_flag() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let handle = RecordingHandle { stop: flag.clone() };
+        assert!(!flag.load(Ordering::SeqCst));
+        handle.stop();
+        assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn recording_handle_clone_shares_flag() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let handle1 = RecordingHandle { stop: flag.clone() };
+        let handle2 = handle1.clone();
+        handle2.stop();
+        assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn capture_event_started_serializes() {
+        let event = CaptureEvent::Started { sample_rate: 44100 };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("Started"));
+        assert!(json.contains("44100"));
+    }
+
+    #[test]
+    fn capture_event_level_serializes() {
+        let event = CaptureEvent::Level { rms: 0.5 };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("Level"));
+        assert!(json.contains("0.5"));
+    }
+
+    #[test]
+    fn capture_event_error_serializes() {
+        let event = CaptureEvent::Error {
+            message: "test error".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("Error"));
+        assert!(json.contains("test error"));
+    }
+}
