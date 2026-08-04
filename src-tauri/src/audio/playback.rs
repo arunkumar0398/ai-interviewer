@@ -2,9 +2,6 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use tokio::sync::mpsc;
 
-/// Absolute path to the Piper tools directory
-const PIPER_BASE_DIR: &str = r"D:\_Career\__ntingAcc-\_work\ai-interviewer-tools";
-
 /// Piper outputs raw PCM at 22050 Hz mono — tied to the en_US-amy-medium model
 const PIPER_SAMPLE_RATE: u32 = 22050;
 
@@ -173,8 +170,9 @@ pub async fn generate_tts(
 pub async fn generate_tts_with_paths(
     text: &str,
     output_path: PathBuf,
+    tools_dir: &str,
 ) -> anyhow::Result<()> {
-    let base = PathBuf::from(PIPER_BASE_DIR);
+    let base = PathBuf::from(tools_dir);
 
     let piper_exe = base.join("piper").join("piper").join("piper.exe");
     let model = base.join("piper-models").join("en_US-amy-medium.onnx");

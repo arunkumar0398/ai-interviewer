@@ -23,7 +23,7 @@ pub struct PiperSupervisor {
 
 impl PiperSupervisor {
     pub fn new(tools_dir: &Path) -> Self {
-        let piper_bin = tools_dir.join("piper").join("piper.exe");
+        let piper_bin = tools_dir.join("piper").join("piper").join("piper.exe");
         let model_path = tools_dir
             .join("piper-models")
             .join("en_US-amy-medium.onnx");
@@ -216,7 +216,7 @@ fn play_raw_pcm(
 
 /// Verify that Piper binary exists and model file is present
 pub fn verify_piper_installation(tools_dir: &Path) -> anyhow::Result<()> {
-    let piper_bin = tools_dir.join("piper").join("piper.exe");
+    let piper_bin = tools_dir.join("piper").join("piper").join("piper.exe");
     if !piper_bin.exists() {
         anyhow::bail!("Piper binary not found at {}", piper_bin.display());
     }

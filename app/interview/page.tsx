@@ -68,7 +68,7 @@ export default function InterviewPage() {
     const checkTools = async () => {
       try {
         // TODO: Use app_data_dir() for tools path in production
-        const toolsDir = `D:\\_Career\\__ntingAcc-_work\\ai-interviewer-tools`;
+        const toolsDir = await invoke<string>("get_tools_dir");
         const status = await invoke<ToolsStatus>("verify_tools_installation", {
           toolsDir,
         });

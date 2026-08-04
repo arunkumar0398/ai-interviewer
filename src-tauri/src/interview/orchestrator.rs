@@ -160,7 +160,7 @@ pub async fn run_interview_round(
 
 /// Transcribe a WAV file using whisper.cpp
 async fn transcribe_wav(tools_dir: &Path, wav_path: &Path) -> anyhow::Result<String> {
-    let whisper_bin = tools_dir.join("whisper").join("main.exe");
+    let whisper_bin = tools_dir.join("whisper").join("Release").join("main.exe");
     let model_path = tools_dir.join("models").join("ggml-tiny.en.bin");
 
     if !whisper_bin.exists() {

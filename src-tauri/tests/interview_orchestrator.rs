@@ -20,7 +20,7 @@ fn piper_verify_missing_model() {
     let _ = std::fs::remove_dir_all(&fake_dir);
 
     // Create piper binary but no model
-    let piper_bin = fake_dir.join("piper").join("piper.exe");
+    let piper_bin = fake_dir.join("piper").join("piper").join("piper.exe");
     std::fs::create_dir_all(piper_bin.parent().unwrap()).unwrap();
     std::fs::write(&piper_bin, b"fake binary").unwrap();
 
@@ -38,7 +38,7 @@ fn piper_verify_all_present() {
     let fake_dir = std::env::temp_dir().join("fake_piper_ok_dir");
     let _ = std::fs::remove_dir_all(&fake_dir);
 
-    let piper_bin = fake_dir.join("piper").join("piper.exe");
+    let piper_bin = fake_dir.join("piper").join("piper").join("piper.exe");
     let model_path = fake_dir.join("piper-models").join("en_US-amy-medium.onnx");
     std::fs::create_dir_all(piper_bin.parent().unwrap()).unwrap();
     std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();

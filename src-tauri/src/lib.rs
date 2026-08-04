@@ -2,6 +2,9 @@ pub mod audio;
 pub mod db;
 pub mod interview;
 
+/// Single source of truth for external tools directory
+const TOOLS_DIR: &str = r"D:\_Career\__ntingAcc-\_work\ai-interviewer-tools";
+
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tauri::{Manager, State};
@@ -120,7 +123,7 @@ async fn generate_tts(text: String, output_path: String) -> Result<String, Strin
     }
 
     let path = std::path::PathBuf::from(&output_path);
-    audio::playback::generate_tts_with_paths(&text, path)
+    audio::playback::generate_tts_with_paths(&text, path, TOOLS_DIR)
         .await
         .map_err(|e| e.to_string())?;
     Ok(output_path)
@@ -232,7 +235,7 @@ async fn verify_tools_installation(tools_dir: String) -> Result<serde_json::Valu
     let tools = std::path::PathBuf::from(&tools_dir);
 
     let piper_ok = audio::tts_supervisor::verify_piper_installation(&tools).is_ok();
-    let whisper_ok = tools.join("whisper").join("main.exe").exists();
+    let whisper_ok = tools.join("whisper").join("Release").join("main.exe").exists();
     let model_ok = tools
         .join("models")
         .join("ggml-tiny.en.bin")
@@ -243,6 +246,13 @@ async fn verify_tools_installation(tools_dir: String) -> Result<serde_json::Valu
         "whisper": whisper_ok,
         "model": model_ok,
     }))
+}
+
+// --- Tools Commands ---
+
+#[tauri::command]
+fn get_tools_dir() -> String {
+    TOOLS_DIR.to_string()
 }
 
 // --- Database Commands ---
@@ -363,6 +373,7 @@ pub fn run() {
             stop_interview_round,
             verify_tools_installation,
             get_app_dir,
+            get_tools_dir,
             init_database,
             create_session,
             insert_round,
