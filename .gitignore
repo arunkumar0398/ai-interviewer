@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Next.js
+.next/
+out/
+
+# Rust build
+src-tauri/target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Tauri
+src-tauri/WixTools/
+src-tauri/Frameworks/
+src-tauri/msvc/
+
+# Audio recordings (never commit)
+*.wav
+*.mp3
+*.ogg
+
+# Models (never commit)
+*.bin
+*.gguf
+*.onnx

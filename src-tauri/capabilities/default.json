@@ -1,0 +1,9 @@
+{
+  "identifier": "com.example.tauri-hello-world",
+  "description": "Tauri Hello World",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "opener:default"
+  ]
+}

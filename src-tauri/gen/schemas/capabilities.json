@@ -1,0 +1,1 @@
+{"com.example.tauri-hello-world":{"identifier":"com.example.tauri-hello-world","description":"Tauri Hello World","local":true,"windows":["main"],"permissions":["core:default","opener:default"]}}
