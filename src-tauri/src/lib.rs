@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod interview;
 
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
@@ -23,20 +24,17 @@ async fn start_recording(
     state: State<'_, Arc<RecordingState>>,
 ) -> Result<RecordingResult, String> {
     let (tx, mut rx) = mpsc::channel(32);
-    let sr = sample_rate.unwrap_or(16000); // 16kHz for whisper compatibility
+    let sr = sample_rate.unwrap_or(16000);
     let path = std::path::PathBuf::from(&output_path);
 
-    // Create a stop handle
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handle = audio::capture::RecordingHandle { stop: stop_flag.clone() };
 
-    // Store the handle so stop_recording can access it
     {
         let mut guard = state.handle.lock().await;
         *guard = Some(handle);
     }
 
-    // Spawn recording on a blocking thread using the shared capture function
     let path_clone = path.clone();
     let event_tx = tx.clone();
     let stop_clone = stop_flag.clone();
@@ -47,11 +45,9 @@ async fn start_recording(
         }
     });
 
-    // Wait for completion or error
     while let Some(event) = rx.recv().await {
         match event {
             audio::capture::CaptureEvent::Stopped { file_path, duration_ms } => {
-                // Clear the stored handle
                 let mut guard = state.handle.lock().await;
                 *guard = None;
                 return Ok(RecordingResult { path: file_path, duration_ms });
@@ -131,6 +127,118 @@ async fn list_audio_devices() -> Result<Vec<String>, String> {
         .map_err(|e| e.to_string())
 }
 
+// --- Phase 2 Commands ---
+
+#[tauri::command]
+async fn check_audio_devices() -> Result<interview::device_check::DeviceCheckResult, String> {
+    let (tx, _rx) = mpsc::channel(32);
+    interview::device_check::run_device_check(tx)
+        .await
+        .pipe_into(Ok)
+}
+
+/// Result of a single interview round
+#[derive(serde::Serialize)]
+struct InterviewRoundResult {
+    metadata: interview::orchestrator::AudioMetadata,
+    transcription: String,
+}
+
+#[tauri::command]
+async fn run_interview_round(
+    question: String,
+    tools_dir: String,
+    output_dir: String,
+    round_index: usize,
+    state: State<'_, Arc<RecordingState>>,
+) -> Result<InterviewRoundResult, String> {
+    let tools = std::path::PathBuf::from(&tools_dir);
+    let output = std::path::PathBuf::from(&output_dir);
+
+    // Create output directory if it doesn't exist
+    std::fs::create_dir_all(&output).map_err(|e| e.to_string())?;
+
+    let (event_tx, _event_rx) = mpsc::channel(32);
+    let (tts_event_tx, _tts_event_rx) = mpsc::channel(32);
+
+    // Shared stop flag for this round
+    let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Store a handle so the frontend can cancel
+    {
+        let recording_handle = audio::capture::RecordingHandle {
+            stop: stop_flag.clone(),
+        };
+        let mut guard = state.handle.lock().await;
+        *guard = Some(recording_handle);
+    }
+
+    let tools_clone = tools.clone();
+    let output_clone = output.clone();
+    let stop_clone = stop_flag.clone();
+    let event_tx_clone = event_tx.clone();
+    let tts_event_tx_clone = tts_event_tx.clone();
+
+    let result = tokio::spawn(async move {
+        interview::orchestrator::run_interview_round(
+            &question,
+            &tools_clone,
+            &output_clone,
+            round_index,
+            event_tx_clone,
+            tts_event_tx_clone,
+            stop_clone,
+        )
+        .await
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Clear the handle
+    {
+        let mut guard = state.handle.lock().await;
+        *guard = None;
+    }
+
+    match result {
+        Ok((metadata, transcription)) => Ok(InterviewRoundResult {
+            metadata,
+            transcription,
+        }),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+async fn stop_interview_round(state: State<'_, Arc<RecordingState>>) -> Result<String, String> {
+    let guard = state.handle.lock().await;
+    match &*guard {
+        Some(handle) => {
+            handle.stop();
+            Ok("Stop signal sent".to_string())
+        }
+        None => Err("No active interview round".to_string()),
+    }
+}
+
+#[tauri::command]
+async fn verify_tools_installation(tools_dir: String) -> Result<serde_json::Value, String> {
+    let tools = std::path::PathBuf::from(&tools_dir);
+
+    let piper_ok = audio::tts_supervisor::verify_piper_installation(&tools).is_ok();
+    let whisper_ok = tools.join("whisper").join("main.exe").exists();
+    let model_ok = tools
+        .join("models")
+        .join("ggml-tiny.en.bin")
+        .exists();
+
+    Ok(serde_json::json!({
+        "piper": piper_ok,
+        "whisper": whisper_ok,
+        "model": model_ok,
+    }))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let recording_state = Arc::new(RecordingState {
@@ -146,7 +254,27 @@ pub fn run() {
             play_audio,
             generate_tts,
             list_audio_devices,
+            check_audio_devices,
+            run_interview_round,
+            stop_interview_round,
+            verify_tools_installation,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// Extension trait for chaining
+trait PipeInto<T> {
+    fn pipe_into<F, R>(self, f: F) -> R
+    where
+        F: FnOnce(T) -> R;
+}
+
+impl<T> PipeInto<T> for T {
+    fn pipe_into<F, R>(self, f: F) -> R
+    where
+        F: FnOnce(T) -> R,
+    {
+        f(self)
+    }
 }

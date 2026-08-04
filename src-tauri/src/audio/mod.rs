@@ -1,4 +1,3 @@
 pub mod capture;
 pub mod playback;
-
-pub use capture::RecordingHandle;
+pub mod tts_supervisor;
