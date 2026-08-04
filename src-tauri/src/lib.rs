@@ -4,7 +4,7 @@ pub mod interview;
 
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
-use tauri::State;
+use tauri::{Manager, State};
 
 /// Holds the current recording handle so stop_recording can cancel it
 struct RecordingState {
@@ -248,6 +248,16 @@ async fn verify_tools_installation(tools_dir: String) -> Result<serde_json::Valu
 // --- Database Commands ---
 
 #[tauri::command]
+async fn get_app_dir(app: tauri::AppHandle) -> Result<String, String> {
+    let path = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
 async fn init_database(db_path: String, state: State<'_, Arc<DbState>>) -> Result<String, String> {
     let path = std::path::PathBuf::from(&db_path);
     let database = db::Database::open(&path).map_err(|e| e.to_string())?;
@@ -352,6 +362,7 @@ pub fn run() {
             run_interview_round,
             stop_interview_round,
             verify_tools_installation,
+            get_app_dir,
             init_database,
             create_session,
             insert_round,

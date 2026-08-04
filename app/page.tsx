@@ -53,7 +53,7 @@ export default function Home() {
         </p>
 
         {/* Navigation Cards */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 w-full max-w-lg">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 w-full max-w-2xl">
           <a
             href="/interview"
             className="block p-6 border rounded-lg dark:border-zinc-800 hover:border-indigo-500 dark:hover:border-indigo-400 transition-colors"
@@ -75,6 +75,18 @@ export default function Home() {
             </h2>
             <p className="text-sm text-zinc-500 dark:text-zinc-400">
               Restricted window for the interviewee.
+            </p>
+          </a>
+
+          <a
+            href="/dashboard"
+            className="block p-6 border rounded-lg dark:border-zinc-800 hover:border-indigo-500 dark:hover:border-indigo-400 transition-colors"
+          >
+            <h2 className="text-lg font-medium dark:text-zinc-200 mb-2">
+              Dashboard
+            </h2>
+            <p className="text-sm text-zinc-500 dark:text-zinc-400">
+              View past sessions and manage questions.
             </p>
           </a>
         </div>
