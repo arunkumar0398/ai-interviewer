@@ -25,16 +25,14 @@ impl RecordingHandle {
 }
 
 /// Start recording from the default microphone to a WAV file using cpal (WASAPI on Windows).
-/// Returns a RecordingHandle that can be used to stop the recording early.
+/// Accepts an external stop flag so the caller controls when to stop.
 pub async fn record_to_wav(
     output_path: PathBuf,
     sample_rate: u32,
     channels: u16,
     event_tx: mpsc::Sender<CaptureEvent>,
-) -> anyhow::Result<RecordingHandle> {
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let handle = RecordingHandle { stop: stop_flag.clone() };
-
+    stop_flag: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
     let sr = sample_rate;
     let ch = channels;
 
@@ -67,6 +65,7 @@ pub async fn record_to_wav(
         let stream = device.build_input_stream(
             &config,
             move |data: &[f32], _info: &cpal::InputCallbackInfo| {
+                // TODO: Heap alloc per callback (fine for MVP). Future: ring buffer for zero-copy.
                 let _ = sample_tx.send(data.to_vec());
             },
             move |err| {
@@ -118,7 +117,7 @@ pub async fn record_to_wav(
     })
     .await??;
 
-    Ok(handle)
+    Ok(())
 }
 
 /// List available audio input devices

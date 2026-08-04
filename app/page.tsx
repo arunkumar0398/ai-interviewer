@@ -12,7 +12,6 @@ interface RecordingResult {
 
 export default function Home() {
   const [recordingState, setRecordingState] = useState<RecordingState>("idle");
-  const [audioLevel, setAudioLevel] = useState(0);
   const [result, setResult] = useState<RecordingResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [ttsText, setTtsText] = useState("");
@@ -36,17 +35,14 @@ export default function Home() {
     // Start recording
     try {
       setRecordingState("recording");
+      // TODO: Use app_data_dir() for stable output path in production
       const outputPath = `recording_${Date.now()}.wav`;
-      const result = await invoke<string>("start_recording", {
+      const result = await invoke<RecordingResult>("start_recording", {
         outputPath,
         sampleRate: 16000,
       });
 
-      // Parse result: "Recording saved: path (durationms)"
-      const match = result.match(/Recording saved: (.+?) \((\d+)ms\)/);
-      if (match) {
-        setResult({ path: match[1], duration_ms: parseInt(match[2]) });
-      }
+      setResult(result);
       setRecordingState("stopped");
     } catch (e) {
       setError(String(e));

@@ -53,10 +53,22 @@ fn main() -> anyhow::Result<()> {
 
     // Step 2: Verify WAV is valid
     println!("[2/4] Verifying WAV file...");
-    let wav_info = ai_interviewer_lib::audio::wav::validate_wav(&tts_output)?;
-    println!("      Sample rate: {} Hz", wav_info.sample_rate);
-    println!("      Channels: {}", wav_info.channels);
-    println!("      Bits per sample: {}", wav_info.bits_per_sample);
+    let data = std::fs::read(&tts_output)?;
+    if data.len() < 44 {
+        anyhow::bail!("File too small to be a valid WAV");
+    }
+    if &data[0..4] != b"RIFF" {
+        anyhow::bail!("Missing RIFF header");
+    }
+    if &data[8..12] != b"WAVE" {
+        anyhow::bail!("Missing WAVE format");
+    }
+    let wav_channels = u16::from_le_bytes([data[22], data[23]]);
+    let wav_sample_rate = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
+    let wav_bits = u16::from_le_bytes([data[34], data[35]]);
+    println!("      Sample rate: {} Hz", wav_sample_rate);
+    println!("      Channels: {}", wav_channels);
+    println!("      Bits per sample: {}", wav_bits);
 
     // Step 3: "Playback" (placeholder — real WASAPI in Phase 1)
     println!("[3/4] Playback (placeholder — real WASAPI capture in Phase 1)");

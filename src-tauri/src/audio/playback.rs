@@ -2,6 +2,12 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use tokio::sync::mpsc;
 
+/// Absolute path to the Piper tools directory
+const PIPER_BASE_DIR: &str = r"D:\_Career\__ntingAcc-\_work\ai-interviewer-tools";
+
+/// Piper outputs raw PCM at 22050 Hz mono — tied to the en_US-amy-medium model
+const PIPER_SAMPLE_RATE: u32 = 22050;
+
 /// Playback events sent to the UI
 #[derive(Debug, Clone, serde::Serialize)]
 pub enum PlaybackEvent {
@@ -89,6 +95,7 @@ pub async fn play_wav(
         stream.play()?;
 
         // Wait for playback to finish
+        // TODO: Replace busy-poll with tokio::sync::Notify for cleaner async wakeup
         let total_samples = samples.len();
         loop {
             let current = pos.load(std::sync::atomic::Ordering::Relaxed);
@@ -139,12 +146,12 @@ pub async fn generate_tts(
         anyhow::bail!("Piper TTS failed: {}", stderr);
     }
 
-    // Piper outputs raw PCM (16-bit signed, mono, 22050 Hz).
+    // Piper outputs raw PCM (16-bit signed, mono, PIPER_SAMPLE_RATE Hz).
     // Wrap it in a proper WAV file using hound.
     let raw_pcm = output.stdout;
     let spec = hound::WavSpec {
         channels: 1,
-        sample_rate: 22050,
+        sample_rate: PIPER_SAMPLE_RATE,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
@@ -167,20 +174,18 @@ pub async fn generate_tts_with_paths(
     text: &str,
     output_path: PathBuf,
 ) -> anyhow::Result<()> {
-    let piper_exe = std::env::current_dir()?
-        .join("..")
-        .join("..")
-        .join("ai-interviewer-tools")
-        .join("piper")
-        .join("piper")
-        .join("piper.exe");
+    let base = PathBuf::from(PIPER_BASE_DIR);
 
-    let model = std::env::current_dir()?
-        .join("..")
-        .join("..")
-        .join("ai-interviewer-tools")
-        .join("piper-models")
-        .join("en_US-amy-medium.onnx");
+    let piper_exe = base.join("piper").join("piper").join("piper.exe");
+    let model = base.join("piper-models").join("en_US-amy-medium.onnx");
+
+    // Validate paths exist before spawning
+    if !piper_exe.exists() {
+        anyhow::bail!("Piper binary not found at: {}", piper_exe.display());
+    }
+    if !model.exists() {
+        anyhow::bail!("Piper model not found at: {}", model.display());
+    }
 
     let piper_str = piper_exe.to_string_lossy().to_string();
     let model_str = model.to_string_lossy().to_string();

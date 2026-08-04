@@ -8,7 +8,7 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 anyhow = "1"
 hound = "3.5"
 cpal = "0.15"
@@ -19,6 +19,10 @@ tauri-build = { version = "2", features = [] }
 [[bin]]
 name = "audio-spike"
 path = "src/bin/audio_spike.rs"
+required-features = ["spike"]
+
+[features]
+spike = []
 
 [lib]
 name = "ai_interviewer_lib"
