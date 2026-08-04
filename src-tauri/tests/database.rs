@@ -112,3 +112,160 @@ fn db_serialization() {
     assert_eq!(json["question"], "Q1");
     assert_eq!(json["sha256"], "abc");
 }
+
+// ============================================================
+// NEW: Database edge case tests
+// ============================================================
+
+/// Test: Complete a nonexistent session is idempotent (no error, 0 rows affected)
+#[test]
+fn db_complete_session_nonexistent() {
+    let db_path = std::env::temp_dir().join("test_complete_nonexistent.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
+    let result = db.complete_session("does-not-exist", 5);
+    assert!(result.is_ok(), "Completing nonexistent session should not error");
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// Test: Get rounds for a session with no rounds returns empty vec
+#[test]
+fn db_get_rounds_empty_session() {
+    let db_path = std::env::temp_dir().join("test_empty_rounds.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
+    db.create_session("empty-session", "Nobody").unwrap();
+
+    let rounds = db.get_rounds("empty-session").unwrap();
+    assert_eq!(rounds.len(), 0, "Should return empty vec for session with no rounds");
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// Test: Get session by ID returns None for nonexistent ID
+#[test]
+fn db_get_session_nonexistent() {
+    let db_path = std::env::temp_dir().join("test_nonexistent_session.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
+    let result = db.get_session("ghost-session").unwrap();
+    assert!(result.is_none(), "Should return None for nonexistent session");
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// Test: Multiple sessions are ordered by started_at DESC
+#[test]
+fn db_sessions_ordered_by_recency() {
+    let db_path = std::env::temp_dir().join("test_session_order.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
+
+    // Insert sessions with slight delay to ensure different timestamps
+    db.create_session("first", "Alice").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    db.create_session("second", "Bob").unwrap();
+
+    let sessions = db.get_sessions().unwrap();
+    assert_eq!(sessions.len(), 2);
+    assert_eq!(sessions[0].id, "second", "Most recent session should be first");
+    assert_eq!(sessions[1].id, "first");
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// Test: Duplicate session ID insertion fails (PRIMARY KEY constraint)
+#[test]
+fn db_duplicate_session_id_fails() {
+    let db_path = std::env::temp_dir().join("test_dup_session.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
+    db.create_session("dup-session", "Alice").unwrap();
+
+    let result = db.create_session("dup-session", "Bob");
+    assert!(result.is_err(), "Duplicate session ID should fail");
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// Test: Round insert returns auto-incremented ID
+#[test]
+fn db_round_insert_returns_id() {
+    let db_path = std::env::temp_dir().join("test_round_id.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
+    db.create_session("id-session", "Test").unwrap();
+
+    let id1 = db.insert_round("id-session", 0, "Q1", "A1", "/tmp/r1.wav", "h1", 5000, 16000, 1, 160044).unwrap();
+    let id2 = db.insert_round("id-session", 1, "Q2", "A2", "/tmp/r2.wav", "h2", 6000, 16000, 1, 192044).unwrap();
+
+    assert!(id2 > id1, "Second round ID should be greater than first");
+    assert!(id1 > 0, "IDs should be positive");
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// Test: Empty candidate name is allowed (empty string default)
+#[test]
+fn db_empty_candidate_name() {
+    let db_path = std::env::temp_dir().join("test_empty_name.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
+    db.create_session("anon-session", "").unwrap();
+
+    let session = db.get_session("anon-session").unwrap().unwrap();
+    assert_eq!(session.candidate_name, "");
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// Test: Database re-opens cleanly (idempotent initialize)
+#[test]
+fn db_reopen_idempotent() {
+    let db_path = std::env::temp_dir().join("test_reopen.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    // Create and populate
+    {
+        let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
+        db.create_session("reopen-session", "Test").unwrap();
+    }
+
+    // Re-open — tables already exist, should not fail
+    {
+        let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
+        let sessions = db.get_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "reopen-session");
+    }
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// Test: Large transcription text round-trips correctly
+#[test]
+fn db_large_transcription() {
+    let db_path = std::env::temp_dir().join("test_large_transcription.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
+    db.create_session("large-session", "Test").unwrap();
+
+    // 10KB transcription
+    let long_text = "word ".repeat(2000);
+    db.insert_round("large-session", 0, "Q1", &long_text, "/tmp/r.wav", "h", 5000, 16000, 1, 160044).unwrap();
+
+    let rounds = db.get_rounds("large-session").unwrap();
+    assert_eq!(rounds.len(), 1);
+    assert_eq!(rounds[0].transcription.len(), long_text.len());
+
+    let _ = std::fs::remove_file(&db_path);
+}
