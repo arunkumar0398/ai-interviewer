@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod db;
 pub mod interview;
 
 use std::sync::Arc;
@@ -8,6 +9,11 @@ use tauri::State;
 /// Holds the current recording handle so stop_recording can cancel it
 struct RecordingState {
     handle: Mutex<Option<audio::capture::RecordingHandle>>,
+}
+
+/// Holds the database connection
+struct DbState {
+    db: Mutex<Option<db::Database>>,
 }
 
 /// Structured return type for recording results
@@ -239,15 +245,103 @@ async fn verify_tools_installation(tools_dir: String) -> Result<serde_json::Valu
     }))
 }
 
+// --- Database Commands ---
+
+#[tauri::command]
+async fn init_database(db_path: String, state: State<'_, Arc<DbState>>) -> Result<String, String> {
+    let path = std::path::PathBuf::from(&db_path);
+    let database = db::Database::open(&path).map_err(|e| e.to_string())?;
+    let mut guard = state.db.lock().await;
+    *guard = Some(database);
+    Ok(db_path)
+}
+
+#[tauri::command]
+async fn create_session(
+    session_id: String,
+    candidate_name: String,
+    state: State<'_, Arc<DbState>>,
+) -> Result<(), String> {
+    let guard = state.db.lock().await;
+    let db = guard.as_ref().ok_or("Database not initialized")?;
+    db.create_session(&session_id, &candidate_name)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn insert_round(
+    session_id: String,
+    round_index: i32,
+    question: String,
+    transcription: String,
+    audio_path: String,
+    sha256: String,
+    duration_ms: u64,
+    sample_rate: u32,
+    channels: u16,
+    file_size_bytes: u64,
+    state: State<'_, Arc<DbState>>,
+) -> Result<i64, String> {
+    let guard = state.db.lock().await;
+    let db = guard.as_ref().ok_or("Database not initialized")?;
+    db.insert_round(
+        &session_id,
+        round_index,
+        &question,
+        &transcription,
+        &audio_path,
+        &sha256,
+        duration_ms,
+        sample_rate,
+        channels,
+        file_size_bytes,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn complete_session(
+    session_id: String,
+    total_rounds: i32,
+    state: State<'_, Arc<DbState>>,
+) -> Result<(), String> {
+    let guard = state.db.lock().await;
+    let db = guard.as_ref().ok_or("Database not initialized")?;
+    db.complete_session(&session_id, total_rounds)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_sessions(state: State<'_, Arc<DbState>>) -> Result<Vec<db::InterviewSession>, String> {
+    let guard = state.db.lock().await;
+    let db = guard.as_ref().ok_or("Database not initialized")?;
+    db.get_sessions().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_rounds(
+    session_id: String,
+    state: State<'_, Arc<DbState>>,
+) -> Result<Vec<db::InterviewRound>, String> {
+    let guard = state.db.lock().await;
+    let db = guard.as_ref().ok_or("Database not initialized")?;
+    db.get_rounds(&session_id).map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let recording_state = Arc::new(RecordingState {
         handle: Mutex::new(None),
     });
 
+    let db_state = Arc::new(DbState {
+        db: Mutex::new(None),
+    });
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(recording_state)
+        .manage(db_state)
         .invoke_handler(tauri::generate_handler![
             start_recording,
             stop_recording,
@@ -258,6 +352,12 @@ pub fn run() {
             run_interview_round,
             stop_interview_round,
             verify_tools_installation,
+            init_database,
+            create_session,
+            insert_round,
+            complete_session,
+            get_sessions,
+            get_rounds,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
