@@ -15,6 +15,10 @@ hound = "3.5"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[[bin]]
+name = "audio-spike"
+path = "src/bin/audio_spike.rs"
+
 [lib]
 name = "ai_interviewer_lib"
 crate-type = ["lib", "cdylib", "staticlib"]
