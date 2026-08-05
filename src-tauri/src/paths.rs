@@ -79,6 +79,10 @@ pub fn resolve_app_paths(app_handle: &tauri::AppHandle) -> anyhow::Result<AppPat
     std::fs::create_dir_all(&recordings_dir)?;
 
     let temp_dir = app_data.join("temp");
+    // Clean up stale temp files from previous runs
+    if temp_dir.exists() {
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
     std::fs::create_dir_all(&temp_dir)?;
 
     let db_path = app_data.join("interviewer.db");

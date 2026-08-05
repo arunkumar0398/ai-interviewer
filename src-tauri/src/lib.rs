@@ -172,9 +172,6 @@ async fn run_interview_round(
     state: State<'_, Arc<RecordingState>>,
     paths: State<'_, PathsState>,
 ) -> Result<InterviewRoundResult, String> {
-    let output_dir = paths.paths.recordings_dir.clone();
-    std::fs::create_dir_all(&output_dir).map_err(|e| e.to_string())?;
-
     let (event_tx, _event_rx) = mpsc::channel(32);
     let (tts_event_tx, _tts_event_rx) = mpsc::channel(32);
 
@@ -189,7 +186,6 @@ async fn run_interview_round(
     }
 
     let paths_clone = paths.paths.clone();
-    let output_clone = output_dir.clone();
     let stop_clone = stop_flag.clone();
     let event_tx_clone = event_tx.clone();
     let tts_event_tx_clone = tts_event_tx.clone();
@@ -198,7 +194,6 @@ async fn run_interview_round(
         interview::orchestrator::run_interview_round(
             &question,
             &paths_clone,
-            &output_clone,
             round_index,
             event_tx_clone,
             tts_event_tx_clone,

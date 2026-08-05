@@ -50,7 +50,6 @@ fn sha256_file(path: &Path) -> anyhow::Result<String> {
 pub async fn run_interview_round(
     question: &str,
     paths: &crate::paths::AppPaths,
-    output_dir: &std::path::Path,
     round_index: usize,
     event_tx: mpsc::Sender<CaptureEvent>,
     tts_event_tx: mpsc::Sender<TtsEvent>,
@@ -80,7 +79,9 @@ pub async fn run_interview_round(
     }
 
     // Phase 3: Record the answer
-    let wav_path = output_dir.join(format!("round_{}_answer.wav", round_index));
+    let wav_path = paths
+        .recordings_dir
+        .join(format!("round_{}_answer.wav", round_index));
 
     let _record_stop = stop_flag.clone();
     let record_event_tx = event_tx.clone();
@@ -174,17 +175,17 @@ async fn transcribe_wav(
         anyhow::bail!("Whisper model not found at {}", model_path.display());
     }
 
-    let output_dir = paths.temp_dir.clone();
     let stem = wav_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("whisper_out")
-        .to_string(); // own the string
+        .to_string();
 
+    // Clone only what's needed for the blocking task
     let whisper_bin = whisper_bin.clone();
     let model_path = model_path.clone();
     let wav_path = wav_path.to_path_buf();
-    let output_dir = output_dir;
+    let output_dir = paths.temp_dir.clone();
     let stem_clone = stem.clone();
 
     tokio::task::spawn_blocking(move || {
