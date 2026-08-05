@@ -39,3 +39,7 @@ src-tauri/msvc/
 *.bin
 *.gguf
 *.onnx
+
+# Implementation plan (local only)
+8-branch-plan.md
+8-branch-plan.pdf
