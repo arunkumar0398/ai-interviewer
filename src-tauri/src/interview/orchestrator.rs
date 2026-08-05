@@ -49,21 +49,22 @@ fn sha256_file(path: &Path) -> anyhow::Result<String> {
 /// Returns (audio_metadata, transcription_text) on success.
 pub async fn run_interview_round(
     question: &str,
-    tools_dir: &Path,
-    output_dir: &Path,
+    paths: &crate::paths::AppPaths,
+    output_dir: &std::path::Path,
     round_index: usize,
     event_tx: mpsc::Sender<CaptureEvent>,
     tts_event_tx: mpsc::Sender<TtsEvent>,
     stop_flag: Arc<AtomicBool>,
 ) -> anyhow::Result<(AudioMetadata, String)> {
-    let piper = PiperSupervisor::new(tools_dir);
+    let piper = PiperSupervisor::new(paths);
 
     // Phase 1: Speak the question
     let _ = tts_event_tx.try_send(TtsEvent::Speaking {
         text: question.to_string(),
     });
 
-    piper.speak(question, tts_event_tx.clone(), stop_flag.clone())
+    piper
+        .speak(question, tts_event_tx.clone(), stop_flag.clone())
         .await?;
 
     if stop_flag.load(Ordering::SeqCst) {
@@ -153,15 +154,18 @@ pub async fn run_interview_round(
     };
 
     // Phase 5: Transcribe with whisper
-    let transcription = transcribe_wav(tools_dir, &wav_path).await?;
+    let transcription = transcribe_wav(paths, &wav_path).await?;
 
     Ok((metadata, transcription))
 }
 
 /// Transcribe a WAV file using whisper.cpp
-async fn transcribe_wav(tools_dir: &Path, wav_path: &Path) -> anyhow::Result<String> {
-    let whisper_bin = tools_dir.join("whisper").join("Release").join("main.exe");
-    let model_path = tools_dir.join("models").join("ggml-tiny.en.bin");
+async fn transcribe_wav(
+    paths: &crate::paths::AppPaths,
+    wav_path: &std::path::Path,
+) -> anyhow::Result<String> {
+    let whisper_bin = &paths.whisper_bin;
+    let model_path = &paths.whisper_model;
 
     if !whisper_bin.exists() {
         anyhow::bail!("Whisper binary not found at {}", whisper_bin.display());
@@ -170,17 +174,17 @@ async fn transcribe_wav(tools_dir: &Path, wav_path: &Path) -> anyhow::Result<Str
         anyhow::bail!("Whisper model not found at {}", model_path.display());
     }
 
-    let output_dir = std::env::temp_dir();
+    let output_dir = paths.temp_dir.clone();
     let stem = wav_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("whisper_out")
         .to_string(); // own the string
 
-    let whisper_bin = whisper_bin.to_path_buf();
-    let model_path = model_path.to_path_buf();
+    let whisper_bin = whisper_bin.clone();
+    let model_path = model_path.clone();
     let wav_path = wav_path.to_path_buf();
-    let output_dir = output_dir.to_path_buf();
+    let output_dir = output_dir;
     let stem_clone = stem.clone();
 
     tokio::task::spawn_blocking(move || {

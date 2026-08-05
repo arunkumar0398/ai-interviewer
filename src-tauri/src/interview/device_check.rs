@@ -1,4 +1,6 @@
-use crate::audio::capture::{list_input_devices, list_output_devices, record_test_clip, CaptureEvent};
+use crate::audio::capture::{
+    list_input_devices, list_output_devices, record_test_clip, CaptureEvent,
+};
 use tokio::sync::mpsc;
 
 /// Device check result

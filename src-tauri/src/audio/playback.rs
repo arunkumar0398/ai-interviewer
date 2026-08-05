@@ -54,10 +54,7 @@ pub async fn play_wav(
                 .filter_map(|s| s.ok())
                 .map(|s| s as f32 / 32768.0)
                 .collect(),
-            hound::SampleFormat::Float => reader
-                .samples::<f32>()
-                .filter_map(|s| s.ok())
-                .collect(),
+            hound::SampleFormat::Float => reader.samples::<f32>().filter_map(|s| s.ok()).collect(),
         };
 
         let samples = std::sync::Arc::new(samples);
@@ -166,27 +163,21 @@ pub async fn generate_tts(
     Ok(())
 }
 
-/// Generate TTS using the absolute path to the Piper binary and model
+/// Generate TTS using paths resolved by `AppPaths`
 pub async fn generate_tts_with_paths(
     text: &str,
     output_path: PathBuf,
-    tools_dir: &str,
+    paths: &crate::paths::AppPaths,
 ) -> anyhow::Result<()> {
-    let base = PathBuf::from(tools_dir);
-
-    let piper_exe = base.join("piper").join("piper").join("piper.exe");
-    let model = base.join("piper-models").join("en_US-amy-medium.onnx");
-
-    // Validate paths exist before spawning
-    if !piper_exe.exists() {
-        anyhow::bail!("Piper binary not found at: {}", piper_exe.display());
+    if !paths.piper_bin.exists() {
+        anyhow::bail!("Piper binary not found at: {}", paths.piper_bin.display());
     }
-    if !model.exists() {
-        anyhow::bail!("Piper model not found at: {}", model.display());
+    if !paths.piper_model.exists() {
+        anyhow::bail!("Piper model not found at: {}", paths.piper_model.display());
     }
 
-    let piper_str = piper_exe.to_string_lossy().to_string();
-    let model_str = model.to_string_lossy().to_string();
+    let piper_str = paths.piper_bin.to_string_lossy().to_string();
+    let model_str = paths.piper_model.to_string_lossy().to_string();
 
     generate_tts(text, output_path, Some(&piper_str), Some(&model_str)).await
 }

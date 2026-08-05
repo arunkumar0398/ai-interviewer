@@ -32,6 +32,13 @@ interface ToolsStatus {
   model: boolean;
 }
 
+interface AppConfig {
+  tool_dir: string;
+  recordings_dir: string;
+  db_path: string;
+  is_portable: boolean;
+}
+
 type InterviewPhase =
   | "checking-tools"
   | "device-check"
@@ -67,11 +74,9 @@ export default function InterviewPage() {
   useEffect(() => {
     const checkTools = async () => {
       try {
-        // TODO: Use app_data_dir() for tools path in production
-        const toolsDir = await invoke<string>("get_tools_dir");
-        const status = await invoke<ToolsStatus>("verify_tools_installation", {
-          toolsDir,
-        });
+        // Bootstrap readiness check — resolves paths, verifies tools exist
+        const _config = await invoke<AppConfig>("get_app_config");
+        const status = await invoke<ToolsStatus>("verify_tools_installation");
         setToolsStatus(status);
 
         if (status.piper && status.whisper && status.model) {
@@ -125,13 +130,8 @@ export default function InterviewPage() {
     setPhase("speaking-question");
 
     try {
-      const toolsDir = `D:\\_Career\\__ntingAcc-_work\\ai-interviewer-tools`;
-      const outputDir = `D:\\_Career\\__ntingAcc-_work\\tauri-hello-world\\frontend\\interview_data`;
-
       const result = await invoke<InterviewRoundResult>("run_interview_round", {
         question,
-        toolsDir,
-        outputDir,
         roundIndex: currentRound,
       });
 

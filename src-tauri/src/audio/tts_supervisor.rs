@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -22,14 +22,10 @@ pub struct PiperSupervisor {
 }
 
 impl PiperSupervisor {
-    pub fn new(tools_dir: &Path) -> Self {
-        let piper_bin = tools_dir.join("piper").join("piper").join("piper.exe");
-        let model_path = tools_dir
-            .join("piper-models")
-            .join("en_US-amy-medium.onnx");
+    pub fn new(paths: &crate::paths::AppPaths) -> Self {
         Self {
-            piper_bin,
-            model_path,
+            piper_bin: paths.piper_bin.clone(),
+            model_path: paths.piper_model.clone(),
             sample_rate: 22050,
             max_restarts: 3,
         }
@@ -96,9 +92,7 @@ impl PiperSupervisor {
 
                 // Read raw PCM from stdout and play it via cpal
                 let stdout = child.stdout.take();
-                let _ = event_tx.try_send(TtsEvent::Speaking {
-                    text: text.clone(),
-                });
+                let _ = event_tx.try_send(TtsEvent::Speaking { text: text.clone() });
 
                 let _play_result = play_raw_pcm(stdout, sample_rate, stop_flag.clone());
 
@@ -113,10 +107,7 @@ impl PiperSupervisor {
                         restarts += 1;
                         if restarts >= max_restarts {
                             let _ = event_tx.try_send(TtsEvent::Error {
-                                message: format!(
-                                    "Piper crashed {} times, giving up",
-                                    max_restarts
-                                ),
+                                message: format!("Piper crashed {} times, giving up", max_restarts),
                             });
                             return Err(anyhow::anyhow!("Piper exceeded max restarts"));
                         }
@@ -199,10 +190,10 @@ fn play_raw_pcm(
     stream.play()?;
 
     // Wait for playback to finish or stop
-    let total_duration = std::time::Duration::from_secs_f64(
-        samples.len() as f64 / sample_rate as f64,
-    );
-    let deadline = std::time::Instant::now() + total_duration + std::time::Duration::from_millis(200);
+    let total_duration =
+        std::time::Duration::from_secs_f64(samples.len() as f64 / sample_rate as f64);
+    let deadline =
+        std::time::Instant::now() + total_duration + std::time::Duration::from_millis(200);
 
     while std::time::Instant::now() < deadline {
         if stop_flag.load(Ordering::SeqCst) {
@@ -215,18 +206,12 @@ fn play_raw_pcm(
 }
 
 /// Verify that Piper binary exists and model file is present
-pub fn verify_piper_installation(tools_dir: &Path) -> anyhow::Result<()> {
-    let piper_bin = tools_dir.join("piper").join("piper").join("piper.exe");
-    if !piper_bin.exists() {
-        anyhow::bail!("Piper binary not found at {}", piper_bin.display());
+pub fn verify_piper_installation(paths: &crate::paths::AppPaths) -> anyhow::Result<()> {
+    if !paths.piper_bin.exists() {
+        anyhow::bail!("Piper binary not found at {}", paths.piper_bin.display());
     }
-
-    let model_path = tools_dir
-        .join("piper-models")
-        .join("en_US-amy-medium.onnx");
-    if !model_path.exists() {
-        anyhow::bail!("Piper model not found at {}", model_path.display());
+    if !paths.piper_model.exists() {
+        anyhow::bail!("Piper model not found at {}", paths.piper_model.display());
     }
-
     Ok(())
 }

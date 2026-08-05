@@ -10,8 +10,13 @@ vi.mock("@tauri-apps/api/core", () => ({
 describe("Dashboard Page", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    // Default: initDatabase succeeds, get_sessions returns empty
-    mockInvoke.mockResolvedValue("/fake/appdir"); // get_app_dir
+    // Default: get_app_config succeeds (DB is initialized at startup)
+    mockInvoke.mockResolvedValue({
+      tool_dir: "/fake/tools",
+      recordings_dir: "/fake/recordings",
+      db_path: "/fake/interviewer.db",
+      is_portable: false,
+    });
   });
 
   it("renders the heading", async () => {

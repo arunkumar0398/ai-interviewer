@@ -125,7 +125,10 @@ fn db_complete_session_nonexistent() {
 
     let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
     let result = db.complete_session("does-not-exist", 5);
-    assert!(result.is_ok(), "Completing nonexistent session should not error");
+    assert!(
+        result.is_ok(),
+        "Completing nonexistent session should not error"
+    );
 
     let _ = std::fs::remove_file(&db_path);
 }
@@ -140,7 +143,11 @@ fn db_get_rounds_empty_session() {
     db.create_session("empty-session", "Nobody").unwrap();
 
     let rounds = db.get_rounds("empty-session").unwrap();
-    assert_eq!(rounds.len(), 0, "Should return empty vec for session with no rounds");
+    assert_eq!(
+        rounds.len(),
+        0,
+        "Should return empty vec for session with no rounds"
+    );
 
     let _ = std::fs::remove_file(&db_path);
 }
@@ -153,7 +160,10 @@ fn db_get_session_nonexistent() {
 
     let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
     let result = db.get_session("ghost-session").unwrap();
-    assert!(result.is_none(), "Should return None for nonexistent session");
+    assert!(
+        result.is_none(),
+        "Should return None for nonexistent session"
+    );
 
     let _ = std::fs::remove_file(&db_path);
 }
@@ -173,7 +183,10 @@ fn db_sessions_ordered_by_recency() {
 
     let sessions = db.get_sessions().unwrap();
     assert_eq!(sessions.len(), 2);
-    assert_eq!(sessions[0].id, "second", "Most recent session should be first");
+    assert_eq!(
+        sessions[0].id, "second",
+        "Most recent session should be first"
+    );
     assert_eq!(sessions[1].id, "first");
 
     let _ = std::fs::remove_file(&db_path);
@@ -203,8 +216,34 @@ fn db_round_insert_returns_id() {
     let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
     db.create_session("id-session", "Test").unwrap();
 
-    let id1 = db.insert_round("id-session", 0, "Q1", "A1", "/tmp/r1.wav", "h1", 5000, 16000, 1, 160044).unwrap();
-    let id2 = db.insert_round("id-session", 1, "Q2", "A2", "/tmp/r2.wav", "h2", 6000, 16000, 1, 192044).unwrap();
+    let id1 = db
+        .insert_round(
+            "id-session",
+            0,
+            "Q1",
+            "A1",
+            "/tmp/r1.wav",
+            "h1",
+            5000,
+            16000,
+            1,
+            160044,
+        )
+        .unwrap();
+    let id2 = db
+        .insert_round(
+            "id-session",
+            1,
+            "Q2",
+            "A2",
+            "/tmp/r2.wav",
+            "h2",
+            6000,
+            16000,
+            1,
+            192044,
+        )
+        .unwrap();
 
     assert!(id2 > id1, "Second round ID should be greater than first");
     assert!(id1 > 0, "IDs should be positive");
@@ -261,7 +300,19 @@ fn db_large_transcription() {
 
     // 10KB transcription
     let long_text = "word ".repeat(2000);
-    db.insert_round("large-session", 0, "Q1", &long_text, "/tmp/r.wav", "h", 5000, 16000, 1, 160044).unwrap();
+    db.insert_round(
+        "large-session",
+        0,
+        "Q1",
+        &long_text,
+        "/tmp/r.wav",
+        "h",
+        5000,
+        16000,
+        1,
+        160044,
+    )
+    .unwrap();
 
     let rounds = db.get_rounds("large-session").unwrap();
     assert_eq!(rounds.len(), 1);

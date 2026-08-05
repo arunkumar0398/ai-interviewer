@@ -49,10 +49,8 @@ export default function DashboardPage() {
 
   const initDb = async () => {
     try {
-      const appDir = await invoke<string>("get_app_dir");
-      await invoke("init_database", {
-        dbPath: `${appDir}/interviews.db`,
-      });
+      // DB is initialized at Tauri startup — this confirms readiness
+      await invoke("get_app_config");
       setDbReady(true);
       loadSessions();
     } catch (e) {

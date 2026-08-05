@@ -2,27 +2,55 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-const PIPER_PATH: &str = r"D:\_Career\__ntingAcc-\_work\ai-interviewer-tools\piper\piper\piper.exe";
-const PIPER_MODEL: &str = r"D:\_Career\__ntingAcc-\_work\ai-interviewer-tools\piper-models\en_US-amy-medium.onnx";
-const WHISPER_PATH: &str = r"D:\_Career\__ntingAcc-\_work\ai-interviewer-tools\whisper\Release\whisper-cli.exe";
-const WHISPER_MODEL: &str = r"D:\_Career\__ntingAcc-\_work\ai-interviewer-tools\models\ggml-tiny.en.bin";
-const WORK_DIR: &str = r"D:\_Career\__ntingAcc-\_work\ai-interviewer-tools\spike";
+const DEFAULT_TOOLS_DIR: &str = r"D:\_Career\__ntingAcc-\_work\ai-interviewer-tools";
+
+fn resolve_tools_dir() -> PathBuf {
+    // 1. CLI arg
+    if let Some(arg) = std::env::args().nth(1) {
+        return PathBuf::from(arg);
+    }
+    // 2. Environment variable
+    if let Ok(val) = std::env::var("AI_INTERVIEWER_TOOLS") {
+        return PathBuf::from(val);
+    }
+    // 3. Default (development)
+    PathBuf::from(DEFAULT_TOOLS_DIR)
+}
 
 fn main() -> anyhow::Result<()> {
     println!("=== Audio Spike: Native Audio Roundtrip ===\n");
 
-    // Ensure work directory exists
-    std::fs::create_dir_all(WORK_DIR)?;
+    let tools = resolve_tools_dir();
+    println!("Tools directory: {}", tools.display());
 
-    let tts_output = PathBuf::from(WORK_DIR).join("question.wav");
+    let piper_bin = tools.join("piper").join("piper").join("piper.exe");
+    let piper_model = tools.join("piper-models").join("en_US-amy-medium.onnx");
+    let whisper_bin = tools.join("whisper").join("Release").join("main.exe");
+    let whisper_model = tools.join("models").join("ggml-tiny.en.bin");
+
+    // Validate
+    for (label, path) in [
+        ("Piper binary", &piper_bin),
+        ("Piper model", &piper_model),
+        ("Whisper binary", &whisper_bin),
+        ("Whisper model", &whisper_model),
+    ] {
+        if !path.exists() {
+            anyhow::bail!("{} not found at: {}", label, path.display());
+        }
+    }
+
+    let work_dir = tools.join("spike");
+    std::fs::create_dir_all(&work_dir)?;
+    let tts_output = work_dir.join("question.wav");
 
     // Step 1: Generate TTS via stdin
     let question = "Tell me about your experience with systems programming.";
     println!("[1/4] Generating TTS for: \"{}\"", question);
 
-    let mut child = Command::new(PIPER_PATH)
+    let mut child = Command::new(&piper_bin)
         .arg("--model")
-        .arg(PIPER_MODEL)
+        .arg(&piper_model)
         .arg("--output_file")
         .arg(&tts_output)
         .stdin(Stdio::piped())
@@ -30,7 +58,6 @@ fn main() -> anyhow::Result<()> {
         .stderr(Stdio::piped())
         .spawn()?;
 
-    // Write question to stdin
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(question.as_bytes())?;
         stdin.write_all(b"\n")?;
@@ -43,7 +70,6 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("Piper TTS failed: {}", stderr);
     }
 
-    // Check if WAV was created
     if !tts_output.exists() {
         anyhow::bail!("Piper did not create WAV file. Stderr: {}", stderr);
     }
@@ -77,16 +103,16 @@ fn main() -> anyhow::Result<()> {
     // Step 4: Transcribe with whisper
     println!("[4/4] Transcribing with whisper.cpp...");
 
-    let output = Command::new(WHISPER_PATH)
+    let output = Command::new(&whisper_bin)
         .arg("--model")
-        .arg(WHISPER_MODEL)
+        .arg(&whisper_model)
         .arg("--file")
         .arg(&tts_output)
         .arg("--language")
         .arg("en")
         .arg("-otxt")
         .arg("-of")
-        .arg(PathBuf::from(WORK_DIR).join("transcript"))
+        .arg(work_dir.join("transcript"))
         .output()?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -97,15 +123,13 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("Whisper transcription failed");
     }
 
-    // Read the transcription output
-    let txt_file = PathBuf::from(WORK_DIR).join("transcript.txt");
+    let txt_file = work_dir.join("transcript.txt");
     if txt_file.exists() {
         let transcript = std::fs::read_to_string(&txt_file)?;
         println!("\n=== TRANSCRIPT ===");
         println!("{}", transcript.trim());
         println!("==================\n");
 
-        // Verify it contains something meaningful
         if transcript.trim().len() > 5 {
             println!("SUCCESS: Audio roundtrip complete!");
             println!("  - Piper TTS generated WAV");
@@ -116,7 +140,7 @@ fn main() -> anyhow::Result<()> {
         }
     } else {
         println!("      Whisper output files:");
-        for entry in std::fs::read_dir(WORK_DIR)? {
+        for entry in std::fs::read_dir(&work_dir)? {
             let entry = entry?;
             println!("        {}", entry.file_name().to_string_lossy());
         }

@@ -7,6 +7,13 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: any[]) => mockInvoke(...args),
 }));
 
+const mockAppConfig = {
+  tool_dir: "/fake/tools",
+  recordings_dir: "/fake/recordings",
+  db_path: "/fake/interviewer.db",
+  is_portable: false,
+};
+
 describe("Interview Page", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -22,7 +29,7 @@ describe("Interview Page", () => {
     expect(screen.getByText("Checking tools installation...")).toBeInTheDocument();
   });
 
-  it("shows error when get_tools_dir fails", async () => {
+  it("shows error when get_app_config fails", async () => {
     mockInvoke.mockRejectedValueOnce(new Error("Command not found"));
     render(<InterviewPage />);
 
@@ -33,7 +40,7 @@ describe("Interview Page", () => {
   });
 
   it("shows error when tools are missing", async () => {
-    mockInvoke.mockResolvedValueOnce("/fake/tools"); // get_tools_dir
+    mockInvoke.mockResolvedValueOnce(mockAppConfig); // get_app_config
     mockInvoke.mockResolvedValueOnce({
       piper: false,
       whisper: false,
@@ -49,7 +56,7 @@ describe("Interview Page", () => {
   });
 
   it("shows tools status when all tools are present", async () => {
-    mockInvoke.mockResolvedValueOnce("/fake/tools"); // get_tools_dir
+    mockInvoke.mockResolvedValueOnce(mockAppConfig); // get_app_config
     mockInvoke.mockResolvedValueOnce({
       piper: true,
       whisper: true,
@@ -67,12 +74,12 @@ describe("Interview Page", () => {
   });
 
   it("shows device check section when tools are ready", async () => {
-    mockInvoke.mockResolvedValueOnce("/fake/tools");
+    mockInvoke.mockResolvedValueOnce(mockAppConfig); // get_app_config
     mockInvoke.mockResolvedValueOnce({
       piper: true,
       whisper: true,
       model: true,
-    });
+    }); // verify_tools_installation
 
     render(<InterviewPage />);
 
@@ -83,12 +90,12 @@ describe("Interview Page", () => {
   });
 
   it("renders all 5 questions from QUESTIONS constant", async () => {
-    mockInvoke.mockResolvedValueOnce("/fake/tools");
+    mockInvoke.mockResolvedValueOnce(mockAppConfig); // get_app_config
     mockInvoke.mockResolvedValueOnce({
       piper: true,
       whisper: true,
       model: true,
-    });
+    }); // verify_tools_installation
 
     render(<InterviewPage />);
 

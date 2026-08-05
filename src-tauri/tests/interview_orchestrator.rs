@@ -1,3 +1,21 @@
+use ai_interviewer_lib::paths::AppPaths;
+use std::path::PathBuf;
+
+/// Helper: build a fake AppPaths from a base directory for testing
+fn fake_app_paths(base: &std::path::Path) -> AppPaths {
+    AppPaths {
+        tool_dir: base.to_path_buf(),
+        piper_bin: base.join("piper").join("piper").join("piper.exe"),
+        piper_model: base.join("piper-models").join("en_US-amy-medium.onnx"),
+        whisper_bin: base.join("whisper").join("Release").join("main.exe"),
+        whisper_model: base.join("models").join("ggml-tiny.en.bin"),
+        db_path: base.join("interviewer.db"),
+        recordings_dir: base.join("recordings"),
+        temp_dir: base.join("temp"),
+        is_portable: false,
+    }
+}
+
 /// Test: Piper installation check fails gracefully when binary missing
 #[test]
 fn piper_verify_missing_binary() {
@@ -5,10 +23,15 @@ fn piper_verify_missing_binary() {
     let _ = std::fs::remove_dir_all(&fake_dir);
     std::fs::create_dir_all(&fake_dir).unwrap();
 
-    let result = ai_interviewer_lib::audio::tts_supervisor::verify_piper_installation(&fake_dir);
+    let paths = fake_app_paths(&fake_dir);
+    let result = ai_interviewer_lib::audio::tts_supervisor::verify_piper_installation(&paths);
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
-    assert!(err_msg.contains("not found"), "Error should mention not found: {}", err_msg);
+    assert!(
+        err_msg.contains("not found"),
+        "Error should mention not found: {}",
+        err_msg
+    );
 
     let _ = std::fs::remove_dir_all(&fake_dir);
 }
@@ -24,10 +47,15 @@ fn piper_verify_missing_model() {
     std::fs::create_dir_all(piper_bin.parent().unwrap()).unwrap();
     std::fs::write(&piper_bin, b"fake binary").unwrap();
 
-    let result = ai_interviewer_lib::audio::tts_supervisor::verify_piper_installation(&fake_dir);
+    let paths = fake_app_paths(&fake_dir);
+    let result = ai_interviewer_lib::audio::tts_supervisor::verify_piper_installation(&paths);
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
-    assert!(err_msg.contains("model"), "Error should mention model: {}", err_msg);
+    assert!(
+        err_msg.contains("model"),
+        "Error should mention model: {}",
+        err_msg
+    );
 
     let _ = std::fs::remove_dir_all(&fake_dir);
 }
@@ -45,7 +73,8 @@ fn piper_verify_all_present() {
     std::fs::write(&piper_bin, b"fake binary").unwrap();
     std::fs::write(&model_path, b"fake model").unwrap();
 
-    let result = ai_interviewer_lib::audio::tts_supervisor::verify_piper_installation(&fake_dir);
+    let paths = fake_app_paths(&fake_dir);
+    let result = ai_interviewer_lib::audio::tts_supervisor::verify_piper_installation(&paths);
     assert!(result.is_ok(), "Should succeed when both files exist");
 
     let _ = std::fs::remove_dir_all(&fake_dir);
@@ -137,10 +166,15 @@ fn interview_phase_serialization() {
 /// Test: Whisper binary existence check
 #[test]
 fn whisper_binary_check() {
-    let tools_dir = std::env::var("PIPER_BASE_DIR")
-        .map(std::path::PathBuf::from)
+    let tools_dir = std::env::var("AI_INTERVIEWER_TOOLS")
+        .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            std::path::PathBuf::from(r"D:\_Career\__ntingAcc-\_work\ai-interviewer-tools")
+            // Development fallback: check next to the exe
+            let exe_dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+                .unwrap_or_default();
+            exe_dir.join("tools")
         });
 
     let whisper_bin = tools_dir.join("whisper").join("Release").join("main.exe");
@@ -171,7 +205,8 @@ fn piper_supervisor_various_paths() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::create_dir_all(&dir);
 
-    let _supervisor = ai_interviewer_lib::audio::tts_supervisor::PiperSupervisor::new(&dir);
+    let paths = fake_app_paths(&dir);
+    let _supervisor = ai_interviewer_lib::audio::tts_supervisor::PiperSupervisor::new(&paths);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -180,29 +215,48 @@ fn piper_supervisor_various_paths() {
 #[test]
 fn interview_phase_all_variants_serialize() {
     // Unit variants serialize as strings
-    let idle = serde_json::to_value(&ai_interviewer_lib::interview::orchestrator::InterviewPhase::Idle).unwrap();
+    let idle =
+        serde_json::to_value(&ai_interviewer_lib::interview::orchestrator::InterviewPhase::Idle)
+            .unwrap();
     assert_eq!(idle, serde_json::Value::String("Idle".to_string()));
 
-    let recording = serde_json::to_value(&ai_interviewer_lib::interview::orchestrator::InterviewPhase::RecordingAnswer).unwrap();
-    assert_eq!(recording, serde_json::Value::String("RecordingAnswer".to_string()));
+    let recording = serde_json::to_value(
+        &ai_interviewer_lib::interview::orchestrator::InterviewPhase::RecordingAnswer,
+    )
+    .unwrap();
+    assert_eq!(
+        recording,
+        serde_json::Value::String("RecordingAnswer".to_string())
+    );
 
-    let processing = serde_json::to_value(&ai_interviewer_lib::interview::orchestrator::InterviewPhase::Processing).unwrap();
-    assert_eq!(processing, serde_json::Value::String("Processing".to_string()));
+    let processing = serde_json::to_value(
+        &ai_interviewer_lib::interview::orchestrator::InterviewPhase::Processing,
+    )
+    .unwrap();
+    assert_eq!(
+        processing,
+        serde_json::Value::String("Processing".to_string())
+    );
 
-    let complete = serde_json::to_value(&ai_interviewer_lib::interview::orchestrator::InterviewPhase::Complete).unwrap();
+    let complete = serde_json::to_value(
+        &ai_interviewer_lib::interview::orchestrator::InterviewPhase::Complete,
+    )
+    .unwrap();
     assert_eq!(complete, serde_json::Value::String("Complete".to_string()));
 
     // Struct variants serialize as { "VariantName": { ... } }
     let speaking = serde_json::to_value(
         ai_interviewer_lib::interview::orchestrator::InterviewPhase::SpeakingQuestion {
             question: "Tell me about yourself".to_string(),
-        }
-    ).unwrap();
+        },
+    )
+    .unwrap();
     assert!(speaking.get("SpeakingQuestion").is_some());
 
     let settling = serde_json::to_value(
-        ai_interviewer_lib::interview::orchestrator::InterviewPhase::Settling { duration_ms: 1500 }
-    ).unwrap();
+        ai_interviewer_lib::interview::orchestrator::InterviewPhase::Settling { duration_ms: 1500 },
+    )
+    .unwrap();
     assert!(settling.get("Settling").is_some());
 }
 

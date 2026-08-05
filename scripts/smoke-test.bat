@@ -17,7 +17,12 @@ echo.
 REM --- 1. Check tools exist ---
 echo [1/6] Checking tools directory...
 
-set TOOLS_DIR=D:\_Career\__ntingAcc-\_work\ai-interviewer-tools
+if defined AI_INTERVIEWER_TOOLS (
+    set "TOOLS_DIR=%AI_INTERVIEWER_TOOLS%"
+) else (
+    set "TOOLS_DIR=%~dp0..\..\ai-interviewer-tools"
+)
+echo   Using tools: %TOOLS_DIR%
 
 if exist "%TOOLS_DIR%\piper\piper\piper.exe" (
     echo   [PASS] Piper binary exists

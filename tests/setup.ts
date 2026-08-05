@@ -1,3 +1,4 @@
+import { vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 
 // Mock window.__TAURI__ for all tests
