@@ -73,9 +73,42 @@ jobs:
           New-Item -ItemType Directory -Path "portable" -Force | Out-Null
           Copy-Item -Path "out" -Destination "portable/out" -Recurse
           Copy-Item -Path "tools" -Destination "portable/tools" -Recurse
-          Copy-Item -Path "src-tauri/target/release/ai-interviewer.exe" -Destination "portable/" -ErrorAction SilentlyContinue
+          Copy-Item -Path "src-tauri/target/release/ai-interviewer.exe" -Destination "portable/"
+          Copy-Item -Path "LICENSE" -Destination "portable/"
+          Copy-Item -Path "README.md" -Destination "portable/"
+          Copy-Item -Path "resources/tool-manifest.json" -Destination "portable/"
           Compress-Archive -Path "portable/*" -DestinationPath $zipName
           echo "PORTABLE_ZIP=$zipName" >> $env:GITHUB_ENV
+
+      - name: Validate staged portable artifact
+        run: |
+          $zip = "${{ env.PORTABLE_ZIP }}"
+          if (-not (Test-Path $zip)) {
+            Write-Error "Portable ZIP not found: $zip"
+            exit 1
+          }
+          $size = (Get-Item $zip).Length
+          Write-Host "Portable ZIP: $zip ($size bytes)"
+          if ($size -lt 1MB) {
+            Write-Error "Portable ZIP suspiciously small ($size bytes)"
+            exit 1
+          }
+          # Verify it contains expected entries
+          $entries = Expand-Archive -Path $zip -DestinationPath "$env:TEMP\validate-check" -PassThru
+          $names = $entries | Select-Object -ExpandProperty FullName
+          if ($names -notmatch "ai-interviewer\.exe") {
+            Write-Error "Portable ZIP missing ai-interviewer.exe"
+            exit 1
+          }
+          if ($names -notmatch "LICENSE") {
+            Write-Error "Portable ZIP missing LICENSE"
+            exit 1
+          }
+          if ($names -notmatch "tool-manifest\.json") {
+            Write-Error "Portable ZIP missing tool-manifest.json"
+            exit 1
+          }
+          Write-Host "Portable artifact validated"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

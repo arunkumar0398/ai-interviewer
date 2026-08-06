@@ -44,8 +44,11 @@ if exist "%TOOLS_DIR%\piper\model.onnx" (
     set /a FAIL+=1
 )
 
-if exist "%TOOLS_DIR%\whisper\Release\main.exe" (
-    echo   [PASS] Whisper binary exists
+if exist "%TOOLS_DIR%\whisper\main.exe" (
+    echo   [PASS] Whisper binary exists (canonical)
+    set /a PASS+=1
+) else if exist "%TOOLS_DIR%\whisper\Release\main.exe" (
+    echo   [PASS] Whisper binary exists (legacy)
     set /a PASS+=1
 ) else (
     echo   [FAIL] Whisper binary missing

@@ -38,7 +38,6 @@ if (-not (Test-Path $ManifestPath)) {
 $manifest = Get-Content $ManifestPath -Raw | ConvertFrom-Json
 $pass = 0
 $fail = 0
-$skip = 0
 
 foreach ($tool in $manifest.tools.PSObject.Properties) {
     $name = $tool.Name
@@ -75,7 +74,7 @@ foreach ($tool in $manifest.tools.PSObject.Properties) {
             continue
         }
 
-        if ($config.sha256 -notlike "PLACEHOLDER_*") {
+        if ($config.sha256) {
             $hash = (Get-FileHash -Path $expectedPath -Algorithm SHA256).Hash.ToLower()
             if ($hash -eq $config.sha256.ToLower()) {
                 Write-Host "  [OK] Checksum verified: $($config.sha256)" -ForegroundColor Green
@@ -87,8 +86,8 @@ foreach ($tool in $manifest.tools.PSObject.Properties) {
                 $fail++
             }
         } else {
-            Write-Host "  [SKIP] Checksum is placeholder" -ForegroundColor Yellow
-            $skip++
+            Write-Host "  [FAIL] No sha256 defined in manifest" -ForegroundColor Red
+            $fail++
         }
     } else {
         Write-Host "  [FAIL] Unknown tool type: $toolType" -ForegroundColor Red
@@ -103,7 +102,6 @@ Write-Host "======================================" -ForegroundColor Cyan
 Write-Host " Results" -ForegroundColor Cyan
 Write-Host "======================================" -ForegroundColor Cyan
 Write-Host "  Passed:  $pass" -ForegroundColor Green
-Write-Host "  Skipped: $skip" -ForegroundColor Yellow
 if ($fail -gt 0) {
     Write-Host "  Failed:  $fail" -ForegroundColor Red
     exit 1

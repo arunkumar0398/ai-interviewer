@@ -13,17 +13,13 @@
 .PARAMETER ToolsDir
     Root directory for tools. Defaults to ./tools.
 
-.PARAMETER SkipChecksum
-    Skip SHA-256 verification (for development only).
-
 .EXAMPLE
     .\scripts\fetch-tools.ps1
     .\scripts\fetch-tools.ps1 -ManifestPath resources\tool-manifest.json -ToolsDir tools
 #>
 param(
     [string]$ManifestPath = "resources\tool-manifest.json",
-    [string]$ToolsDir = "tools",
-    [switch]$SkipChecksum
+    [string]$ToolsDir = "tools"
 )
 
 $ErrorActionPreference = "Stop"
@@ -54,10 +50,6 @@ function Test-FileChecksum {
         [string]$FilePath,
         [string]$ExpectedHash
     )
-    if ($SkipChecksum) {
-        Write-Status "Checksum verification skipped" "Yellow"
-        return $true
-    }
     $actual = Get-SHA256 -FilePath $FilePath
     if ($actual -eq $ExpectedHash.ToLower()) {
         return $true
@@ -115,8 +107,8 @@ foreach ($tool in $manifest.tools.PSObject.Properties) {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         Invoke-WebRequest -Uri $config.url -OutFile $downloadPath -UseBasicParsing
 
-        # Verify checksum
-        if ($config.sha256 -notlike "PLACEHOLDER_*") {
+        # Verify checksum — always required
+        if ($config.sha256) {
             if (Test-FileChecksum -FilePath $downloadPath -ExpectedHash $config.sha256) {
                 Write-Success "Checksum verified"
             } else {
@@ -126,7 +118,10 @@ foreach ($tool in $manifest.tools.PSObject.Properties) {
                 continue
             }
         } else {
-            Write-Status "Checksum placeholder — skipping verification" "Yellow"
+            Write-Fail "No sha256 defined in manifest — cannot verify"
+            $fail++
+            Write-Host ""
+            continue
         }
 
         # Install based on type
