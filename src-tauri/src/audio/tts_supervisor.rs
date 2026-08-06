@@ -23,9 +23,10 @@ pub struct PiperSupervisor {
 
 impl PiperSupervisor {
     pub fn new(paths: &crate::paths::AppPaths) -> Self {
+        let (piper_bin, model_path) = crate::paths::resolve_piper_paths(&paths.tool_dir);
         Self {
-            piper_bin: paths.piper_bin.clone(),
-            model_path: paths.piper_model.clone(),
+            piper_bin: piper_bin.unwrap_or_default(),
+            model_path: model_path.unwrap_or_default(),
             sample_rate: 22050,
             max_restarts: 3,
         }
@@ -207,11 +208,14 @@ fn play_raw_pcm(
 
 /// Verify that Piper binary exists and model file is present
 pub fn verify_piper_installation(paths: &crate::paths::AppPaths) -> anyhow::Result<()> {
-    if !paths.piper_bin.exists() {
-        anyhow::bail!("Piper binary not found at {}", paths.piper_bin.display());
+    let (piper_bin, piper_model) = crate::paths::resolve_piper_paths(&paths.tool_dir);
+    let piper_bin = piper_bin.ok_or_else(|| anyhow::anyhow!("Piper binary not found"))?;
+    let piper_model = piper_model.ok_or_else(|| anyhow::anyhow!("Piper model not found"))?;
+    if !piper_bin.exists() {
+        anyhow::bail!("Piper binary not found at {}", piper_bin.display());
     }
-    if !paths.piper_model.exists() {
-        anyhow::bail!("Piper model not found at {}", paths.piper_model.display());
+    if !piper_model.exists() {
+        anyhow::bail!("Piper model not found at {}", piper_model.display());
     }
     Ok(())
 }

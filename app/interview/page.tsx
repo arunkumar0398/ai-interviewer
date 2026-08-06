@@ -36,7 +36,10 @@ interface AppConfig {
   tool_dir: string;
   recordings_dir: string;
   db_path: string;
-  is_portable: boolean;
+  readiness: {
+    ok: boolean;
+    issues: Array<{ code: string; message: string; expected_path: string | null }>;
+  };
 }
 
 type InterviewPhase =
@@ -74,17 +77,16 @@ export default function InterviewPage() {
   useEffect(() => {
     const checkTools = async () => {
       try {
-        // Bootstrap readiness check — resolves paths, verifies tools exist
-        const _config = await invoke<AppConfig>("get_app_config");
-        const status = await invoke<ToolsStatus>("verify_tools_installation");
-        setToolsStatus(status);
+        const config = await invoke<AppConfig>("get_app_config");
 
-        if (status.piper && status.whisper && status.model) {
+        if (config.readiness.ok) {
+          setToolsStatus({ piper: true, whisper: true, model: true });
           setPhase("device-check");
         } else {
-          setError(
-            `Missing tools: ${!status.piper ? "Piper TTS " : ""}${!status.whisper ? "Whisper " : ""}${!status.model ? "Model " : ""}`
-          );
+          const missing = config.readiness.issues
+            .map((i) => i.message)
+            .join(", ");
+          setError(`Missing tools: ${missing}`);
           setPhase("error");
         }
       } catch (e) {

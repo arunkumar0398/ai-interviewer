@@ -165,8 +165,10 @@ async fn transcribe_wav(
     paths: &crate::paths::AppPaths,
     wav_path: &std::path::Path,
 ) -> anyhow::Result<String> {
-    let whisper_bin = &paths.whisper_bin;
-    let model_path = &paths.whisper_model;
+    let whisper_bin = crate::paths::resolve_whisper_path(&paths.tool_dir)
+        .ok_or_else(|| anyhow::anyhow!("Whisper binary not found"))?;
+    let model_path = crate::paths::resolve_whisper_model_path(&paths.tool_dir)
+        .ok_or_else(|| anyhow::anyhow!("Whisper model not found"))?;
 
     if !whisper_bin.exists() {
         anyhow::bail!("Whisper binary not found at {}", whisper_bin.display());

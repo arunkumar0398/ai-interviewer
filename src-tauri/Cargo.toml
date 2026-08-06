@@ -30,3 +30,6 @@ spike = []
 [lib]
 name = "ai_interviewer_lib"
 crate-type = ["lib", "cdylib", "staticlib"]
+
+[dev-dependencies]
+tempfile = "3"

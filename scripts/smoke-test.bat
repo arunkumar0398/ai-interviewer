@@ -24,23 +24,31 @@ if defined AI_INTERVIEWER_TOOLS (
 )
 echo   Using tools: %TOOLS_DIR%
 
-if exist "%TOOLS_DIR%\piper\piper\piper.exe" (
-    echo   [PASS] Piper binary exists
+REM Check both canonical and legacy piper binary locations
+if exist "%TOOLS_DIR%\piper\piper.exe" (
+    echo   [PASS] Piper binary exists (canonical)
+    set /a PASS+=1
+) else if exist "%TOOLS_DIR%\piper\piper\piper.exe" (
+    echo   [PASS] Piper binary exists (legacy)
     set /a PASS+=1
 ) else (
-    echo   [FAIL] Piper binary missing: %TOOLS_DIR%\piper\piper\piper.exe
+    echo   [FAIL] Piper binary missing
     set /a FAIL+=1
 )
 
-if exist "%TOOLS_DIR%\piper-models\en_US-amy-medium.onnx" (
-    echo   [PASS] Piper model exists
+REM Check both canonical and legacy piper model locations
+if exist "%TOOLS_DIR%\piper\model.onnx" (
+    echo   [PASS] Piper model exists (canonical)
+    set /a PASS+=1
+) else if exist "%TOOLS_DIR%\piper-models\en_US-amy-medium.onnx" (
+    echo   [PASS] Piper model exists (legacy)
     set /a PASS+=1
 ) else (
     echo   [FAIL] Piper model missing
     set /a FAIL+=1
 )
 
-if exist "%TOOLS_DIR%\whisper\Release\main.exe" (
+if exist "%TOOLS_DIR%\whisper.cpp\main.exe" (
     echo   [PASS] Whisper binary exists
     set /a PASS+=1
 ) else (
@@ -48,7 +56,7 @@ if exist "%TOOLS_DIR%\whisper\Release\main.exe" (
     set /a FAIL+=1
 )
 
-if exist "%TOOLS_DIR%\models\ggml-tiny.en.bin" (
+if exist "%TOOLS_DIR%\whisper.cpp\models\ggml-tiny.en.bin" (
     echo   [PASS] Whisper model exists
     set /a PASS+=1
 ) else (

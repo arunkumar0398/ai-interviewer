@@ -2,8 +2,6 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-const DEFAULT_TOOLS_DIR: &str = r"D:\_Career\__ntingAcc-\_work\ai-interviewer-tools";
-
 fn resolve_tools_dir() -> PathBuf {
     // 1. CLI arg
     if let Some(arg) = std::env::args().nth(1) {
@@ -13,8 +11,30 @@ fn resolve_tools_dir() -> PathBuf {
     if let Ok(val) = std::env::var("AI_INTERVIEWER_TOOLS") {
         return PathBuf::from(val);
     }
-    // 3. Default (development)
-    PathBuf::from(DEFAULT_TOOLS_DIR)
+    // 3. Next to the executable
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let p = exe_dir.join("tools");
+            if p.exists() {
+                return p;
+            }
+        }
+    }
+    // 4. Dev fallback: workspace root / tools
+    #[cfg(debug_assertions)]
+    {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let dev = std::path::PathBuf::from(manifest_dir)
+            .parent()
+            .expect("workspace root")
+            .join("tools");
+        if dev.exists() {
+            return dev;
+        }
+    }
+    panic!(
+        "No tools directory found. Set AI_INTERVIEWER_TOOLS or place tools/ next to the binary."
+    );
 }
 
 fn main() -> anyhow::Result<()> {
@@ -23,22 +43,20 @@ fn main() -> anyhow::Result<()> {
     let tools = resolve_tools_dir();
     println!("Tools directory: {}", tools.display());
 
-    let piper_bin = tools.join("piper").join("piper").join("piper.exe");
-    let piper_model = tools.join("piper-models").join("en_US-amy-medium.onnx");
-    let whisper_bin = tools.join("whisper").join("Release").join("main.exe");
-    let whisper_model = tools.join("models").join("ggml-tiny.en.bin");
+    // Use shared path resolution (supports both canonical and legacy layouts)
+    let (piper_bin, piper_model) = ai_interviewer::paths::resolve_piper_paths(&tools);
+    let whisper_bin = ai_interviewer::paths::resolve_whisper_path(&tools);
+    let whisper_model = ai_interviewer::paths::resolve_whisper_model_path(&tools);
 
-    // Validate
-    for (label, path) in [
-        ("Piper binary", &piper_bin),
-        ("Piper model", &piper_model),
-        ("Whisper binary", &whisper_bin),
-        ("Whisper model", &whisper_model),
-    ] {
-        if !path.exists() {
-            anyhow::bail!("{} not found at: {}", label, path.display());
-        }
-    }
+    let piper_bin = piper_bin.expect("Piper binary not found");
+    let piper_model = piper_model.expect("Piper model not found");
+    let whisper_bin = whisper_bin.expect("Whisper binary not found");
+    let whisper_model = whisper_model.expect("Whisper model not found");
+
+    println!("  Piper binary:  {}", piper_bin.display());
+    println!("  Piper model:   {}", piper_model.display());
+    println!("  Whisper binary:{}", whisper_bin.display());
+    println!("  Whisper model: {}", whisper_model.display());
 
     let work_dir = tools.join("spike");
     std::fs::create_dir_all(&work_dir)?;

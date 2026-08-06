@@ -169,15 +169,19 @@ pub async fn generate_tts_with_paths(
     output_path: PathBuf,
     paths: &crate::paths::AppPaths,
 ) -> anyhow::Result<()> {
-    if !paths.piper_bin.exists() {
-        anyhow::bail!("Piper binary not found at: {}", paths.piper_bin.display());
+    let (piper_bin, piper_model) = crate::paths::resolve_piper_paths(&paths.tool_dir);
+    let piper_bin = piper_bin.ok_or_else(|| anyhow::anyhow!("Piper binary not found"))?;
+    let piper_model = piper_model.ok_or_else(|| anyhow::anyhow!("Piper model not found"))?;
+
+    if !piper_bin.exists() {
+        anyhow::bail!("Piper binary not found at: {}", piper_bin.display());
     }
-    if !paths.piper_model.exists() {
-        anyhow::bail!("Piper model not found at: {}", paths.piper_model.display());
+    if !piper_model.exists() {
+        anyhow::bail!("Piper model not found at: {}", piper_model.display());
     }
 
-    let piper_str = paths.piper_bin.to_string_lossy().to_string();
-    let model_str = paths.piper_model.to_string_lossy().to_string();
+    let piper_str = piper_bin.to_string_lossy().to_string();
+    let model_str = piper_model.to_string_lossy().to_string();
 
     generate_tts(text, output_path, Some(&piper_str), Some(&model_str)).await
 }

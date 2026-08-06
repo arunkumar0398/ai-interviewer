@@ -230,16 +230,6 @@ async fn stop_interview_round(state: State<'_, Arc<RecordingState>>) -> Result<S
     }
 }
 
-#[tauri::command]
-fn verify_tools_installation(paths: State<'_, PathsState>) -> serde_json::Value {
-    let p = &paths.paths;
-    serde_json::json!({
-        "piper": p.piper_bin.exists(),
-        "whisper": p.whisper_bin.exists(),
-        "model": p.whisper_model.exists(),
-    })
-}
-
 // --- Tools Commands ---
 
 /// Return the resolved tool directory.  Prefer `get_app_config` instead.
@@ -331,13 +321,13 @@ pub fn run() {
             let paths = resolve_app_paths(app.handle())?;
 
             // 2. Initialize database at startup
-            let database = db::Database::open(&paths.db_path).map_err(|e| {
+            let database = db::Database::open(&paths.paths.db_path).map_err(|e| {
                 eprintln!("[startup] Database init failed: {}", e);
                 e
             })?;
 
             // 3. Manage all states
-            app.manage(PathsState { paths });
+            app.manage(paths);
             app.manage(Arc::new(RecordingState {
                 handle: Mutex::new(None),
             }));
@@ -357,7 +347,6 @@ pub fn run() {
             check_audio_devices,
             run_interview_round,
             stop_interview_round,
-            verify_tools_installation,
             get_tools_dir,
             create_session,
             insert_round,

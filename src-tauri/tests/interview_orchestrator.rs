@@ -1,18 +1,15 @@
-use ai_interviewer_lib::paths::AppPaths;
+use ai_interviewer_lib::paths::{AppPaths, ToolDirectorySource};
 use std::path::PathBuf;
 
 /// Helper: build a fake AppPaths from a base directory for testing
 fn fake_app_paths(base: &std::path::Path) -> AppPaths {
     AppPaths {
         tool_dir: base.to_path_buf(),
-        piper_bin: base.join("piper").join("piper").join("piper.exe"),
-        piper_model: base.join("piper-models").join("en_US-amy-medium.onnx"),
-        whisper_bin: base.join("whisper").join("Release").join("main.exe"),
-        whisper_model: base.join("models").join("ggml-tiny.en.bin"),
-        db_path: base.join("interviewer.db"),
+        db_path: base.join("interviews.db"),
         recordings_dir: base.join("recordings"),
         temp_dir: base.join("temp"),
         is_portable: false,
+        tool_directory_source: ToolDirectorySource::DevFallback,
     }
 }
 

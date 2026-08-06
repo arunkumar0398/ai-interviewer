@@ -11,7 +11,23 @@ const mockAppConfig = {
   tool_dir: "/fake/tools",
   recordings_dir: "/fake/recordings",
   db_path: "/fake/interviewer.db",
-  is_portable: false,
+  readiness: {
+    ok: true,
+    issues: [],
+  },
+};
+
+const mockAppConfigWithMissingTools = {
+  tool_dir: "/fake/tools",
+  recordings_dir: "/fake/recordings",
+  db_path: "/fake/interviewer.db",
+  readiness: {
+    ok: false,
+    issues: [
+      { code: "PIPER_BINARY_MISSING", message: "Piper binary not found", expected_path: "/fake/tools/piper/piper.exe" },
+      { code: "WHISPER_BINARY_MISSING", message: "Whisper binary not found", expected_path: "/fake/tools/whisper.cpp/main.exe" },
+    ],
+  },
 };
 
 describe("Interview Page", () => {
@@ -40,12 +56,7 @@ describe("Interview Page", () => {
   });
 
   it("shows error when tools are missing", async () => {
-    mockInvoke.mockResolvedValueOnce(mockAppConfig); // get_app_config
-    mockInvoke.mockResolvedValueOnce({
-      piper: false,
-      whisper: false,
-      model: false,
-    }); // verify_tools_installation
+    mockInvoke.mockResolvedValueOnce(mockAppConfigWithMissingTools); // get_app_config
 
     render(<InterviewPage />);
 
@@ -57,29 +68,16 @@ describe("Interview Page", () => {
 
   it("shows tools status when all tools are present", async () => {
     mockInvoke.mockResolvedValueOnce(mockAppConfig); // get_app_config
-    mockInvoke.mockResolvedValueOnce({
-      piper: true,
-      whisper: true,
-      model: true,
-    }); // verify_tools_installation
 
     render(<InterviewPage />);
 
     await waitFor(() => {
-      expect(screen.getByText("Tools Status")).toBeInTheDocument();
+      expect(screen.getByText("Device Check")).toBeInTheDocument();
     });
-    expect(screen.getByText("Piper TTS")).toBeInTheDocument();
-    expect(screen.getByText("Whisper")).toBeInTheDocument();
-    expect(screen.getByText("Whisper Model")).toBeInTheDocument();
   });
 
   it("shows device check section when tools are ready", async () => {
     mockInvoke.mockResolvedValueOnce(mockAppConfig); // get_app_config
-    mockInvoke.mockResolvedValueOnce({
-      piper: true,
-      whisper: true,
-      model: true,
-    }); // verify_tools_installation
 
     render(<InterviewPage />);
 
@@ -91,11 +89,6 @@ describe("Interview Page", () => {
 
   it("renders all 5 questions from QUESTIONS constant", async () => {
     mockInvoke.mockResolvedValueOnce(mockAppConfig); // get_app_config
-    mockInvoke.mockResolvedValueOnce({
-      piper: true,
-      whisper: true,
-      model: true,
-    }); // verify_tools_installation
 
     render(<InterviewPage />);
 
