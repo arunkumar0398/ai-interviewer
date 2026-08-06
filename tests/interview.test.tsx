@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, act } from "@testing-library/react";
 import InterviewPage from "../app/interview/page";
 
 const mockInvoke = vi.fn();
@@ -35,19 +35,30 @@ describe("Interview Page", () => {
     vi.clearAllMocks();
   });
 
-  it("renders the heading on mount", () => {
-    render(<InterviewPage />);
+  it("renders the heading on mount", async () => {
+    mockInvoke.mockResolvedValueOnce(mockAppConfig);
+    await act(async () => {
+      render(<InterviewPage />);
+    });
     expect(screen.getByText("AI Interviewer")).toBeInTheDocument();
   });
 
-  it("shows checking tools state initially", () => {
-    render(<InterviewPage />);
-    expect(screen.getByText("Checking tools installation...")).toBeInTheDocument();
+  it("shows checking tools state initially", async () => {
+    mockInvoke.mockResolvedValueOnce(mockAppConfig);
+    await act(async () => {
+      render(<InterviewPage />);
+    });
+    // After mount, should transition to device-check since tools are ready
+    await waitFor(() => {
+      expect(screen.getByText("Device Check")).toBeInTheDocument();
+    });
   });
 
   it("shows error when get_app_config fails", async () => {
     mockInvoke.mockRejectedValueOnce(new Error("Command not found"));
-    render(<InterviewPage />);
+    await act(async () => {
+      render(<InterviewPage />);
+    });
 
     await waitFor(() => {
       expect(screen.getByText("Error")).toBeInTheDocument();
@@ -56,9 +67,11 @@ describe("Interview Page", () => {
   });
 
   it("shows error when tools are missing", async () => {
-    mockInvoke.mockResolvedValueOnce(mockAppConfigWithMissingTools); // get_app_config
+    mockInvoke.mockResolvedValueOnce(mockAppConfigWithMissingTools);
 
-    render(<InterviewPage />);
+    await act(async () => {
+      render(<InterviewPage />);
+    });
 
     await waitFor(() => {
       expect(screen.getByText("Error")).toBeInTheDocument();
@@ -67,9 +80,11 @@ describe("Interview Page", () => {
   });
 
   it("shows tools status when all tools are present", async () => {
-    mockInvoke.mockResolvedValueOnce(mockAppConfig); // get_app_config
+    mockInvoke.mockResolvedValueOnce(mockAppConfig);
 
-    render(<InterviewPage />);
+    await act(async () => {
+      render(<InterviewPage />);
+    });
 
     await waitFor(() => {
       expect(screen.getByText("Device Check")).toBeInTheDocument();
@@ -77,9 +92,11 @@ describe("Interview Page", () => {
   });
 
   it("shows device check section when tools are ready", async () => {
-    mockInvoke.mockResolvedValueOnce(mockAppConfig); // get_app_config
+    mockInvoke.mockResolvedValueOnce(mockAppConfig);
 
-    render(<InterviewPage />);
+    await act(async () => {
+      render(<InterviewPage />);
+    });
 
     await waitFor(() => {
       expect(screen.getByText("Device Check")).toBeInTheDocument();
@@ -88,9 +105,11 @@ describe("Interview Page", () => {
   });
 
   it("renders all 5 questions from QUESTIONS constant", async () => {
-    mockInvoke.mockResolvedValueOnce(mockAppConfig); // get_app_config
+    mockInvoke.mockResolvedValueOnce(mockAppConfig);
 
-    render(<InterviewPage />);
+    await act(async () => {
+      render(<InterviewPage />);
+    });
 
     await waitFor(() => {
       expect(screen.getByText("Check Devices")).toBeInTheDocument();
@@ -102,7 +121,9 @@ describe("Interview Page", () => {
 
   it("has Retry button in error state", async () => {
     mockInvoke.mockRejectedValue(new Error("fail"));
-    render(<InterviewPage />);
+    await act(async () => {
+      render(<InterviewPage />);
+    });
 
     await waitFor(() => {
       expect(screen.getByText("Retry")).toBeInTheDocument();

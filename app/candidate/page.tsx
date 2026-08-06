@@ -1,15 +1,12 @@
 "use client";
 
 import { useState, useCallback } from "react";
-import { invoke } from "@tauri-apps/api/core";
 
 type CandidatePhase = "waiting" | "listening" | "recording" | "done";
 
 export default function CandidatePage() {
   const [phase, setPhase] = useState<CandidatePhase>("waiting");
-  const [currentQuestion, setCurrentQuestion] = useState("");
-  const [round, setRound] = useState(0);
-  const [error, setError] = useState<string | null>(null);
+  const [round] = useState(0);
 
   // Candidate can manually trigger "ready" to signal the recruiter
   const handleReady = useCallback(() => {
@@ -112,12 +109,6 @@ export default function CandidatePage() {
             >
               Ready for next question
             </button>
-          </div>
-        )}
-
-        {error && (
-          <div className="w-full max-w-sm p-3 bg-red-50 border border-red-200 rounded text-red-700 text-sm text-center">
-            {error}
           </div>
         )}
       </main>

@@ -35,7 +35,7 @@ jobs:
         run: npm ci
 
       - name: Lint
-        run: npm run lint
+        run: npm run lint -- --max-warnings=0
 
       - name: Type check
         run: npx tsc --noEmit
@@ -48,7 +48,7 @@ jobs:
 
   rust:
     name: Rust Quality
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     timeout-minutes: 20
     defaults:
       run:
