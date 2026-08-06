@@ -101,7 +101,74 @@ pub struct ToolDirOptions {
     pub allow_dev_fallback: bool,
 }
 
+/// Validate that a string is a valid UUID v4 identifier.
+///
+/// Rejects empty strings, path traversal sequences (`..`, `/`, `\`),
+/// and any string that doesn't match the UUID v4 format.
+pub fn validate_uuid(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("Identifier must not be empty".into());
+    }
+    if id.contains("..") || id.contains('/') || id.contains('\\') {
+        return Err("Identifier contains invalid path characters".into());
+    }
+    uuid::Uuid::parse_str(id)
+        .map(|_| ())
+        .map_err(|e| format!("Invalid UUID: {e}"))
+}
+
+/// Validate that an identifier is safe for use as a directory or file name
+/// component. This is a lighter check than `validate_uuid` for contexts
+/// where UUID format is not required but traversal must still be blocked.
+pub fn validate_path_component(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("Identifier must not be empty".into());
+    }
+    if id == "." || id == ".." {
+        return Err("Identifier must not be '.' or '..'".into());
+    }
+    if id.contains('/') || id.contains('\\') || id.contains('\0') {
+        return Err("Identifier contains invalid path characters".into());
+    }
+    Ok(())
+}
+
 impl AppPaths {
+    /// Return the recordings directory for a specific session.
+    ///
+    /// Validates that the session ID is a UUID to prevent path traversal.
+    pub fn session_recordings_dir(&self, session_id: &str) -> Result<PathBuf, String> {
+        validate_uuid(session_id)?;
+        let dir = self.recordings_dir.join(session_id);
+        // Defense-in-depth: verify the resolved path is still under recordings_dir
+        let canonical = self
+            .recordings_dir
+            .canonicalize()
+            .unwrap_or_else(|_| self.recordings_dir.clone());
+        let resolved = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        if !resolved.starts_with(&canonical) {
+            return Err("Session path escapes recordings directory".into());
+        }
+        Ok(dir)
+    }
+
+    /// Return the temp directory for a specific session.
+    ///
+    /// Validates that the session ID is a UUID to prevent path traversal.
+    pub fn session_temp_dir(&self, session_id: &str) -> Result<PathBuf, String> {
+        validate_uuid(session_id)?;
+        let dir = self.temp_dir.join(session_id);
+        let canonical = self
+            .temp_dir
+            .canonicalize()
+            .unwrap_or_else(|_| self.temp_dir.clone());
+        let resolved = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        if !resolved.starts_with(&canonical) {
+            return Err("Session path escapes temp directory".into());
+        }
+        Ok(dir)
+    }
+
     /// Build paths from an explicit tool directory (used by tests and the
     /// audio spike binary).
     pub fn from_tool_dir(tool_dir: PathBuf, data_dir: PathBuf) -> Self {
@@ -742,5 +809,101 @@ mod tests {
         paths.ensure_directories().unwrap();
         assert!(paths.recordings_dir.exists());
         assert!(paths.temp_dir.exists());
+    }
+
+    #[test]
+    fn validate_uuid_accepts_valid_v4() {
+        assert!(validate_uuid("550e8400-e29b-41d4-a716-446655440000").is_ok());
+        assert!(validate_uuid("6ba7b810-9dad-11d1-80b4-00c04fd430c8").is_ok());
+    }
+
+    #[test]
+    fn validate_uuid_rejects_empty() {
+        assert!(validate_uuid("").is_err());
+    }
+
+    #[test]
+    fn validate_uuid_rejects_traversal() {
+        assert!(validate_uuid("../etc/passwd").is_err());
+        assert!(validate_uuid("..\\windows\\system32").is_err());
+        assert!(validate_uuid("abc/def").is_err());
+        assert!(validate_uuid("abc\\def").is_err());
+    }
+
+    #[test]
+    fn validate_uuid_rejects_non_uuid() {
+        assert!(validate_uuid("not-a-uuid").is_err());
+        assert!(validate_uuid("12345").is_err());
+        assert!(validate_uuid("abcdefghijklmnopqrstuvwxyz").is_err());
+    }
+
+    #[test]
+    fn validate_path_component_rejects_dotdot() {
+        assert!(validate_path_component("..").is_err());
+        assert!(validate_path_component(".").is_err());
+    }
+
+    #[test]
+    fn validate_path_component_rejects_slashes() {
+        assert!(validate_path_component("a/b").is_err());
+        assert!(validate_path_component("a\\b").is_err());
+        assert!(validate_path_component("a\0b").is_err());
+    }
+
+    #[test]
+    fn validate_path_component_accepts_normal() {
+        assert!(validate_path_component("my-session").is_ok());
+        assert!(validate_path_component("abc123").is_ok());
+    }
+
+    #[test]
+    fn session_recordings_dir_rejects_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("tools");
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&tool).unwrap();
+        let paths = AppPaths::from_tool_dir(tool, data);
+
+        // Traversal should be rejected
+        assert!(paths.session_recordings_dir("../etc/passwd").is_err());
+        assert!(paths.session_recordings_dir("../../../root").is_err());
+    }
+
+    #[test]
+    fn session_recordings_dir_rejects_non_uuid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("tools");
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&tool).unwrap();
+        let paths = AppPaths::from_tool_dir(tool, data);
+
+        assert!(paths.session_recordings_dir("not-a-uuid").is_err());
+        assert!(paths.session_recordings_dir("").is_err());
+    }
+
+    #[test]
+    fn session_recordings_dir_accepts_valid_uuid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("tools");
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&tool).unwrap();
+        let paths = AppPaths::from_tool_dir(tool, data);
+
+        let result = paths.session_recordings_dir("550e8400-e29b-41d4-a716-446655440000");
+        assert!(result.is_ok());
+        assert!(result
+            .unwrap()
+            .ends_with("550e8400-e29b-41d4-a716-446655440000"));
+    }
+
+    #[test]
+    fn session_temp_dir_rejects_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("tools");
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&tool).unwrap();
+        let paths = AppPaths::from_tool_dir(tool, data);
+
+        assert!(paths.session_temp_dir("../etc/passwd").is_err());
     }
 }

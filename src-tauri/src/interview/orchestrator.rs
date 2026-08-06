@@ -56,6 +56,10 @@ pub async fn run_interview_round(
     tts_event_tx: mpsc::Sender<TtsEvent>,
     stop_flag: Arc<AtomicBool>,
 ) -> anyhow::Result<(AudioMetadata, String)> {
+    // Validate UUIDs before any filesystem operations
+    crate::paths::validate_uuid(session_id).map_err(|e| anyhow::anyhow!(e))?;
+    crate::paths::validate_uuid(round_id).map_err(|e| anyhow::anyhow!(e))?;
+
     let piper = PiperSupervisor::new(paths);
 
     // Phase 1: Speak the question

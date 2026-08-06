@@ -34,6 +34,10 @@ async fn start_recording(
     state: State<'_, Arc<RecordingState>>,
     paths: State<'_, PathsState>,
 ) -> Result<RecordingResult, String> {
+    // Validate UUIDs before any filesystem operations
+    paths::validate_uuid(&session_id)?;
+    paths::validate_uuid(&round_id)?;
+
     // Reject concurrent recordings — only one at a time.
     {
         let guard = state.handle.lock().await;
@@ -189,6 +193,10 @@ async fn run_interview_round(
     state: State<'_, Arc<RecordingState>>,
     paths: State<'_, PathsState>,
 ) -> Result<InterviewRoundResult, String> {
+    // Validate UUIDs before any filesystem operations
+    paths::validate_uuid(&session_id)?;
+    paths::validate_uuid(&round_id)?;
+
     // Reject concurrent recordings — only one at a time.
     {
         let guard = state.handle.lock().await;
@@ -272,6 +280,7 @@ async fn create_session(
     candidate_name: String,
     state: State<'_, Arc<DbState>>,
 ) -> Result<(), String> {
+    paths::validate_uuid(&session_id)?;
     let guard = state.db.lock().await;
     let db = guard.as_ref().ok_or("Database not initialized")?;
     db.create_session(&session_id, &candidate_name)
@@ -293,6 +302,7 @@ async fn insert_round(
     file_size_bytes: u64,
     state: State<'_, Arc<DbState>>,
 ) -> Result<i64, String> {
+    paths::validate_uuid(&session_id)?;
     let guard = state.db.lock().await;
     let db = guard.as_ref().ok_or("Database not initialized")?;
     db.insert_round(
@@ -316,6 +326,7 @@ async fn complete_session(
     total_rounds: i32,
     state: State<'_, Arc<DbState>>,
 ) -> Result<(), String> {
+    paths::validate_uuid(&session_id)?;
     let guard = state.db.lock().await;
     let db = guard.as_ref().ok_or("Database not initialized")?;
     db.complete_session(&session_id, total_rounds)
@@ -334,6 +345,7 @@ async fn get_rounds(
     session_id: String,
     state: State<'_, Arc<DbState>>,
 ) -> Result<Vec<db::InterviewRound>, String> {
+    paths::validate_uuid(&session_id)?;
     let guard = state.db.lock().await;
     let db = guard.as_ref().ok_or("Database not initialized")?;
     db.get_rounds(&session_id).map_err(|e| e.to_string())
