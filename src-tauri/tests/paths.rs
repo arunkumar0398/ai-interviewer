@@ -1,27 +1,28 @@
 use ai_interviewer_lib::paths::{
-    resolve_piper_paths, resolve_whisper_model_path, AppPaths, ToolDirectorySource,
+    resolve_piper_paths, resolve_whisper_model_path, AppPaths, ToolDirOptions, ToolDirectorySource,
 };
 use std::fs;
 
 // ---------------------------------------------------------------------------
-// resolve_tool_dir integration tests
+// resolve_tool_dir_with_options integration tests
 // ---------------------------------------------------------------------------
 
-/// Test: env var override takes priority when directory exists
+/// Test: env override takes priority when directory exists
 #[test]
 fn resolve_tool_dir_env_var_priority() {
     let tmp = tempfile::tempdir().unwrap();
     let fake_tools = tmp.path().join("env_tools");
     fs::create_dir_all(&fake_tools).unwrap();
 
-    // Set env var to point to our fake tools dir
-    std::env::set_var("AI_INTERVIEWER_TOOLS", fake_tools.to_str().unwrap());
+    let opts = ToolDirOptions {
+        env_override: Some(fake_tools.to_str().unwrap().to_string()),
+        allow_dev_fallback: false,
+    };
 
-    let (resolved, source, portable) =
-        ai_interviewer_lib::paths::resolve_tool_dir(tmp.path().join("exe_dir").as_path());
-
-    // Clean up env var immediately
-    std::env::remove_var("AI_INTERVIEWER_TOOLS");
+    let (resolved, source, portable) = ai_interviewer_lib::paths::resolve_tool_dir_with_options(
+        tmp.path().join("exe_dir").as_path(),
+        &opts,
+    );
 
     assert_eq!(resolved, fake_tools);
     assert_eq!(
@@ -33,21 +34,22 @@ fn resolve_tool_dir_env_var_priority() {
     assert!(!portable);
 }
 
-/// Test: env var pointing to non-existent dir is ignored
+/// Test: env override pointing to non-existent dir is ignored
 #[test]
 fn resolve_tool_dir_env_var_nonexistent_falls_through() {
     let tmp = tempfile::tempdir().unwrap();
     let fake_env = tmp.path().join("nonexistent_tools");
-    // Don't create it
 
-    std::env::set_var("AI_INTERVIEWER_TOOLS", fake_env.to_str().unwrap());
+    let opts = ToolDirOptions {
+        env_override: Some(fake_env.to_str().unwrap().to_string()),
+        allow_dev_fallback: false,
+    };
 
     let exe_dir = tmp.path().join("exe_dir");
     fs::create_dir_all(&exe_dir).unwrap();
 
-    let (_resolved, _source, _portable) = ai_interviewer_lib::paths::resolve_tool_dir(&exe_dir);
-
-    std::env::remove_var("AI_INTERVIEWER_TOOLS");
+    let (_resolved, _source, _portable) =
+        ai_interviewer_lib::paths::resolve_tool_dir_with_options(&exe_dir, &opts);
 
     // Should fall through to Unresolved (no tools dir exists next to exe either)
     // The resolved path should be exe_dir/tools
@@ -61,14 +63,17 @@ fn resolve_tool_dir_portable_layout() {
     let tools_dir = exe_dir.join("tools");
     fs::create_dir_all(&tools_dir).unwrap();
 
-    // Make sure env var is not set
-    std::env::remove_var("AI_INTERVIEWER_TOOLS");
+    let opts = ToolDirOptions {
+        env_override: None,
+        allow_dev_fallback: false,
+    };
 
     // Ensure no bundled resources dir
     let resources_dir = exe_dir.join("resources").join("tools");
     fs::remove_dir_all(&resources_dir).ok();
 
-    let (resolved, source, portable) = ai_interviewer_lib::paths::resolve_tool_dir(&exe_dir);
+    let (resolved, source, portable) =
+        ai_interviewer_lib::paths::resolve_tool_dir_with_options(&exe_dir, &opts);
 
     assert_eq!(resolved, tools_dir);
     assert!(matches!(source, ToolDirectorySource::Portable { .. }));
@@ -82,13 +87,17 @@ fn resolve_tool_dir_unresolved() {
     let exe_dir = tmp.path().join("exe");
     fs::create_dir_all(&exe_dir).unwrap();
 
-    std::env::remove_var("AI_INTERVIEWER_TOOLS");
+    let opts = ToolDirOptions {
+        env_override: None,
+        allow_dev_fallback: false,
+    };
 
     // Remove any existing resources/tools
     let resources_dir = exe_dir.join("resources").join("tools");
     fs::remove_dir_all(&resources_dir).ok();
 
-    let (resolved, source, portable) = ai_interviewer_lib::paths::resolve_tool_dir(&exe_dir);
+    let (resolved, source, portable) =
+        ai_interviewer_lib::paths::resolve_tool_dir_with_options(&exe_dir, &opts);
 
     assert!(resolved.ends_with("tools"));
     assert_eq!(source, ToolDirectorySource::Unresolved);

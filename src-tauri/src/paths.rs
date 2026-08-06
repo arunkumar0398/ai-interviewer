@@ -92,6 +92,15 @@ pub struct PathResolutionInput {
     pub app_data_dir: PathBuf,
 }
 
+/// Options for testable tool directory resolution. Replaces `set_var` in tests.
+#[derive(Debug, Clone, Default)]
+pub struct ToolDirOptions {
+    /// Override the env var value. `None` means do not check env var.
+    pub env_override: Option<String>,
+    /// Whether to allow the dev fallback (default: false in tests).
+    pub allow_dev_fallback: bool,
+}
+
 impl AppPaths {
     /// Build paths from an explicit tool directory (used by tests and the
     /// audio spike binary).
@@ -301,6 +310,62 @@ pub fn resolve_tool_dir(exe_dir: &Path) -> (PathBuf, ToolDirectorySource, bool) 
 
     // Nothing found — return the exe_dir/tools path as a best-effort default
     // so the caller gets a valid PathBuf while readiness flags the issue.
+    (
+        exe_dir.join("tools"),
+        ToolDirectorySource::Unresolved,
+        false,
+    )
+}
+
+/// Testable version of `resolve_tool_dir` that accepts injected options
+/// instead of reading from the environment.
+pub fn resolve_tool_dir_with_options(
+    exe_dir: &Path,
+    options: &ToolDirOptions,
+) -> (PathBuf, ToolDirectorySource, bool) {
+    // 1. Explicit env override
+    if let Some(ref val) = options.env_override {
+        let p = PathBuf::from(val);
+        if p.exists() {
+            return (
+                p.clone(),
+                ToolDirectorySource::EnvVar {
+                    value: val.clone(),
+                },
+                false,
+            );
+        }
+    }
+
+    // 2. Tauri bundled resources
+    let bundled = exe_dir.join("resources").join("tools");
+    if bundled.exists() {
+        return (bundled, ToolDirectorySource::Bundled, false);
+    }
+
+    // 3. Portable layout next to the exe
+    let portable = exe_dir.join("tools");
+    if portable.exists() {
+        return (
+            portable.clone(),
+            ToolDirectorySource::Portable {
+                exe_dir: exe_dir.display().to_string(),
+            },
+            true,
+        );
+    }
+
+    // 4. Dev fallback
+    if options.allow_dev_fallback {
+        #[cfg(debug_assertions)]
+        {
+            let dev = dev_tools_dir();
+            if dev.exists() {
+                return (dev, ToolDirectorySource::DevFallback, false);
+            }
+        }
+    }
+
     (
         exe_dir.join("tools"),
         ToolDirectorySource::Unresolved,
