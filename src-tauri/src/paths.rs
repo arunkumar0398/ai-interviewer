@@ -222,7 +222,7 @@ impl AppPaths {
         let (tool_dir, tool_directory_source, is_portable) = resolve_tool_dir(&input.exe_dir);
 
         let data_dir = if is_portable {
-            input.exe_dir.clone()
+            input.exe_dir.join("data")
         } else {
             input.app_data_dir.clone()
         };
@@ -467,15 +467,18 @@ pub fn resolve_tool_dir_with_options(
     )
 }
 
-/// Canonical data directory next to the exe (portable) or in %LOCALAPPDATA%.
+/// Canonical data directory: `data/` subdirectory (portable) or %LOCALAPPDATA%.
+///
+/// In portable mode, user data lives in `exe_dir/data/` so that tool binaries
+/// (`exe_dir/tools/`) can be replaced without risking user data.
 fn compute_data_dir(exe_dir: &Path, is_portable: bool) -> PathBuf {
     if is_portable {
-        return exe_dir.to_path_buf();
+        return exe_dir.join("data");
     }
     if let Ok(local) = env::var("LOCALAPPDATA") {
         return PathBuf::from(local).join("ai-interviewer");
     }
-    exe_dir.to_path_buf()
+    exe_dir.join("data")
 }
 
 /// Resolve the database file path.  Prefers `interviews.db` (canonical).
@@ -664,6 +667,31 @@ mod tests {
         assert_eq!(paths.recordings_dir, data.join("recordings"));
         assert_eq!(paths.temp_dir, data.join("temp"));
         assert!(!paths.is_portable);
+    }
+
+    #[test]
+    fn portable_data_dir_is_subdirectory_of_exe_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe_dir = tmp.path();
+        // Simulate portable layout: exe_dir/tools exists
+        let tools_dir = exe_dir.join("tools");
+        fs::create_dir_all(&tools_dir).unwrap();
+
+        let opts = ToolDirOptions {
+            env_override: None,
+            allow_dev_fallback: false,
+        };
+        let (tool_dir, _, is_portable) = resolve_tool_dir_with_options(exe_dir, &opts);
+        assert!(is_portable);
+        assert_eq!(tool_dir, tools_dir);
+
+        // data_dir should be exe_dir/data, not exe_dir itself
+        let data_dir = compute_data_dir(exe_dir, is_portable);
+        assert_eq!(data_dir, exe_dir.join("data"));
+        assert_eq!(
+            data_dir.join("recordings"),
+            exe_dir.join("data").join("recordings")
+        );
     }
 
     #[test]
