@@ -22,14 +22,22 @@ pub struct PiperSupervisor {
 }
 
 impl PiperSupervisor {
-    pub fn new(paths: &crate::paths::AppPaths) -> Self {
+    pub fn new(paths: &crate::paths::AppPaths) -> anyhow::Result<Self> {
         let (piper_bin, model_path) = crate::paths::resolve_piper_paths(&paths.tool_dir);
-        Self {
-            piper_bin: piper_bin.unwrap_or_default(),
-            model_path: model_path.unwrap_or_default(),
+        let piper_bin = piper_bin.ok_or_else(|| anyhow::anyhow!("Piper binary not found"))?;
+        let model_path = model_path.ok_or_else(|| anyhow::anyhow!("Piper model not found"))?;
+        if !piper_bin.exists() {
+            anyhow::bail!("Piper binary not found at {}", piper_bin.display());
+        }
+        if !model_path.exists() {
+            anyhow::bail!("Piper model not found at {}", model_path.display());
+        }
+        Ok(Self {
+            piper_bin,
+            model_path,
             sample_rate: 22050,
             max_restarts: 3,
-        }
+        })
     }
 
     /// Speak text through Piper TTS. Blocks until finished or stop_flag is set.

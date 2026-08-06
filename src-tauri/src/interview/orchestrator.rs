@@ -58,7 +58,7 @@ pub async fn run_interview_round(
     tts_event_tx: mpsc::Sender<TtsEvent>,
     stop_flag: Arc<AtomicBool>,
 ) -> anyhow::Result<(AudioMetadata, String)> {
-    let piper = PiperSupervisor::new(paths);
+    let piper = PiperSupervisor::new(paths)?;
 
     // Phase 1: Speak the question
     let _ = tts_event_tx.try_send(TtsEvent::Speaking {
@@ -112,7 +112,7 @@ pub async fn run_interview_round(
         }
     });
 
-    let result = capture::record_to_wav(
+    let record_result = capture::record_to_wav(
         wav_path.clone(),
         16000, // 16kHz for whisper compatibility
         1,     // mono
@@ -124,37 +124,30 @@ pub async fn run_interview_round(
     auto_stop_handle.abort();
     main_monitor.abort();
 
-    match result {
-        Ok(()) => {}
+    let record_result = match record_result {
+        Ok(r) => r,
         Err(e) => {
             let _ = event_tx.try_send(CaptureEvent::Error {
                 message: format!("Recording failed: {}", e),
             });
             return Err(e);
         }
-    }
+    };
 
     if stop_flag.load(Ordering::SeqCst) {
         anyhow::bail!("Interview stopped during recording");
     }
 
-    // Phase 4: Compute audio metadata and checksum
-    let file_size = std::fs::metadata(&wav_path)?.len();
-    let sha256 = sha256_file(&wav_path)?;
-
-    // Compute duration from file size (16kHz mono 16-bit)
-    let duration_ms = {
-        let data_bytes = file_size.saturating_sub(44); // WAV header ~44 bytes
-        (data_bytes * 1000) / (16000 * 2) // bytes / (sample_rate * bytes_per_sample)
-    };
+    // Phase 4: Compute audio metadata and checksum from RecordResult
+    let sha256 = sha256_file(&record_result.file_path)?;
 
     let metadata = AudioMetadata {
-        file_path: wav_path.to_string_lossy().to_string(),
+        file_path: record_result.file_path.to_string_lossy().to_string(),
         sha256,
-        duration_ms,
+        duration_ms: record_result.duration_ms,
         sample_rate: 16000,
         channels: 1,
-        file_size_bytes: file_size,
+        file_size_bytes: record_result.file_size_bytes,
     };
 
     // Phase 5: Transcribe with whisper — temp file isolated to temp/<session_id>/<round_id>.txt

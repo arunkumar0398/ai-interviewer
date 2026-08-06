@@ -210,9 +210,11 @@ async fn list_audio_devices() -> Result<Vec<String>, String> {
 // --- Phase 2 Commands ---
 
 #[tauri::command]
-async fn check_audio_devices() -> interview::device_check::DeviceCheckResult {
+async fn check_audio_devices(
+    paths: State<'_, PathsState>,
+) -> Result<interview::device_check::DeviceCheckResult, String> {
     let (tx, _rx) = mpsc::channel(32);
-    interview::device_check::run_device_check(tx).await
+    Ok(interview::device_check::run_device_check(paths.paths.temp_dir.clone(), tx).await)
 }
 
 /// Result of a single interview round

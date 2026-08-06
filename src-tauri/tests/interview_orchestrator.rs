@@ -81,7 +81,9 @@ fn piper_verify_all_present() {
 #[tokio::test]
 async fn device_check_handles_no_devices() {
     let (tx, _rx) = tokio::sync::mpsc::channel(32);
-    let result = ai_interviewer_lib::interview::device_check::run_device_check(tx).await;
+    let temp_dir = std::env::temp_dir().join("ai_interviewer_test_device_check");
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let result = ai_interviewer_lib::interview::device_check::run_device_check(temp_dir, tx).await;
 
     // Should return a result, even if devices aren't found
     // On CI/headless, both will be false

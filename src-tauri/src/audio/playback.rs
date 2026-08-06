@@ -173,11 +173,17 @@ pub async fn generate_tts_with_paths(
     let piper_bin = piper_bin.ok_or_else(|| anyhow::anyhow!("Piper binary not found"))?;
     let piper_model = piper_model.ok_or_else(|| anyhow::anyhow!("Piper model not found"))?;
 
+    // Validate paths exist before spawning process
     if !piper_bin.exists() {
         anyhow::bail!("Piper binary not found at: {}", piper_bin.display());
     }
     if !piper_model.exists() {
         anyhow::bail!("Piper model not found at: {}", piper_model.display());
+    }
+
+    // Ensure output directory exists
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
 
     let piper_str = piper_bin.to_string_lossy().to_string();

@@ -3,6 +3,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+/// Result of a successful recording
+#[derive(Debug, Clone)]
+pub struct RecordResult {
+    pub file_path: std::path::PathBuf,
+    pub duration_ms: u64,
+    pub file_size_bytes: u64,
+}
+
 /// Audio capture events sent to the UI
 #[derive(Debug, Clone, serde::Serialize)]
 pub enum CaptureEvent {
@@ -27,18 +35,19 @@ impl RecordingHandle {
 /// Start recording from the default microphone to a WAV file using cpal (WASAPI on Windows).
 /// Writes to a temp file first, then renames on success for crash recovery.
 /// Periodically flushes the writer so partial data survives a crash.
+/// Returns `RecordResult` with file path, duration, and size on success.
 pub async fn record_to_wav(
     output_path: PathBuf,
     sample_rate: u32,
     channels: u16,
     event_tx: mpsc::Sender<CaptureEvent>,
     stop_flag: Arc<AtomicBool>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<RecordResult> {
     let sr = sample_rate;
     let ch = channels;
     let temp_path = output_path.with_extension("wav.tmp");
 
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || -> anyhow::Result<RecordResult> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
         let host = cpal::default_host();
@@ -120,16 +129,19 @@ pub async fn record_to_wav(
         std::fs::rename(&temp_path, &output_path)?;
 
         let duration_ms = (total_frames * 1000) / sr as u64;
+        let file_size_bytes = std::fs::metadata(&output_path)?.len();
         let _ = event_tx.try_send(CaptureEvent::Stopped {
             file_path: output_path.to_string_lossy().to_string(),
             duration_ms,
         });
 
-        Ok(())
+        Ok(RecordResult {
+            file_path: output_path,
+            duration_ms,
+            file_size_bytes,
+        })
     })
-    .await??;
-
-    Ok(())
+    .await?
 }
 
 /// List available audio input devices
@@ -166,9 +178,10 @@ pub async fn record_test_clip(
     sample_rate: u32,
     channels: u16,
     duration_secs: u32,
+    temp_dir: PathBuf,
     event_tx: mpsc::Sender<CaptureEvent>,
 ) -> anyhow::Result<PathBuf> {
-    let tmp_path = std::env::temp_dir().join(format!("device_test_{}.wav", std::process::id()));
+    let tmp_path = temp_dir.join(format!("device_test_{}.wav", std::process::id()));
     let path_clone = tmp_path.clone();
 
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {

@@ -1,6 +1,7 @@
 use crate::audio::capture::{
     list_input_devices, list_output_devices, record_test_clip, CaptureEvent,
 };
+use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 /// Device check result
@@ -16,7 +17,10 @@ pub struct DeviceCheckResult {
 
 /// Verify microphone and speaker devices are available and functional.
 /// Records a short test clip to verify mic actually captures audio.
-pub async fn run_device_check(event_tx: mpsc::Sender<CaptureEvent>) -> DeviceCheckResult {
+pub async fn run_device_check(
+    temp_dir: PathBuf,
+    event_tx: mpsc::Sender<CaptureEvent>,
+) -> DeviceCheckResult {
     let mut errors = Vec::new();
 
     // Check input devices
@@ -53,7 +57,7 @@ pub async fn run_device_check(event_tx: mpsc::Sender<CaptureEvent>) -> DeviceChe
 
     // Test mic recording (2 second clip)
     let mic_test_ok = if mic_available {
-        match record_test_clip(16000, 1, 2, event_tx.clone()).await {
+        match record_test_clip(16000, 1, 2, temp_dir, event_tx.clone()).await {
             Ok(path) => {
                 // Check file has reasonable size (at least 1 second of 16kHz 16-bit mono)
                 let metadata = std::fs::metadata(&path);
