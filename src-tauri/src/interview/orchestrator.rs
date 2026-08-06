@@ -50,7 +50,8 @@ fn sha256_file(path: &Path) -> anyhow::Result<String> {
 pub async fn run_interview_round(
     question: &str,
     paths: &crate::paths::AppPaths,
-    round_index: usize,
+    session_id: &str,
+    round_id: &str,
     event_tx: mpsc::Sender<CaptureEvent>,
     tts_event_tx: mpsc::Sender<TtsEvent>,
     stop_flag: Arc<AtomicBool>,
@@ -78,10 +79,10 @@ pub async fn run_interview_round(
         anyhow::bail!("Interview stopped during settle");
     }
 
-    // Phase 3: Record the answer
-    let wav_path = paths
-        .recordings_dir
-        .join(format!("round_{}_answer.wav", round_index));
+    // Phase 3: Record the answer — isolated to recordings/<session_id>/<round_id>.wav
+    let session_dir = paths.recordings_dir.join(session_id);
+    std::fs::create_dir_all(&session_dir)?;
+    let wav_path = session_dir.join(format!("{}.wav", round_id));
 
     let _record_stop = stop_flag.clone();
     let record_event_tx = event_tx.clone();
@@ -154,16 +155,18 @@ pub async fn run_interview_round(
         file_size_bytes: file_size,
     };
 
-    // Phase 5: Transcribe with whisper
-    let transcription = transcribe_wav(paths, &wav_path).await?;
+    // Phase 5: Transcribe with whisper — temp file isolated to temp/<session_id>/<round_id>.txt
+    let transcription = transcribe_wav(paths, &wav_path, session_id, round_id).await?;
 
     Ok((metadata, transcription))
 }
 
-/// Transcribe a WAV file using whisper.cpp
+/// Transcribe a WAV file using whisper.cpp — temp output isolated to temp/<session_id>/<round_id>.txt
 async fn transcribe_wav(
     paths: &crate::paths::AppPaths,
     wav_path: &std::path::Path,
+    session_id: &str,
+    round_id: &str,
 ) -> anyhow::Result<String> {
     let whisper_bin = crate::paths::resolve_whisper_path(&paths.tool_dir)
         .ok_or_else(|| anyhow::anyhow!("Whisper binary not found"))?;
@@ -177,18 +180,13 @@ async fn transcribe_wav(
         anyhow::bail!("Whisper model not found at {}", model_path.display());
     }
 
-    let stem = wav_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("whisper_out")
-        .to_string();
-
     // Clone only what's needed for the blocking task
     let whisper_bin = whisper_bin.clone();
     let model_path = model_path.clone();
     let wav_path = wav_path.to_path_buf();
-    let output_dir = paths.temp_dir.clone();
-    let stem_clone = stem.clone();
+    let output_dir = paths.temp_dir.join(session_id);
+    std::fs::create_dir_all(&output_dir)?;
+    let stem_clone = round_id.to_string();
 
     tokio::task::spawn_blocking(move || {
         let output = std::process::Command::new(&whisper_bin)

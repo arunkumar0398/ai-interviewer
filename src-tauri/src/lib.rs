@@ -28,14 +28,19 @@ struct RecordingResult {
 
 #[tauri::command]
 async fn start_recording(
-    filename: String,
+    session_id: String,
+    round_id: String,
     sample_rate: Option<u32>,
     state: State<'_, Arc<RecordingState>>,
     paths: State<'_, PathsState>,
 ) -> Result<RecordingResult, String> {
     let (tx, mut rx) = mpsc::channel(32);
     let sr = sample_rate.unwrap_or(16000);
-    let path = paths.paths.recordings_dir.join(&filename);
+
+    // Backend generates path: recordings/<session_id>/<round_id>.wav
+    let session_dir = paths.paths.recordings_dir.join(&session_id);
+    std::fs::create_dir_all(&session_dir).map_err(|e| e.to_string())?;
+    let path = session_dir.join(format!("{}.wav", round_id));
 
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handle = audio::capture::RecordingHandle {
@@ -126,7 +131,7 @@ async fn play_audio(file_path: String) -> Result<String, String> {
 #[tauri::command]
 async fn generate_tts(
     text: String,
-    output_path: String,
+    request_id: String,
     paths: State<'_, PathsState>,
 ) -> Result<String, String> {
     if text.trim().is_empty() {
@@ -136,11 +141,12 @@ async fn generate_tts(
         return Err("Text too long (max 10,000 characters)".to_string());
     }
 
-    let path = std::path::PathBuf::from(&output_path);
-    audio::playback::generate_tts_with_paths(&text, path, &paths.paths)
+    // Backend generates path: temp/<request_id>.txt (Whisper reads this as intermediate)
+    let output_path = paths.paths.temp_dir.join(format!("{}.txt", request_id));
+    audio::playback::generate_tts_with_paths(&text, output_path.clone(), &paths.paths)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(output_path)
+    Ok(output_path.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -168,7 +174,8 @@ struct InterviewRoundResult {
 #[tauri::command]
 async fn run_interview_round(
     question: String,
-    round_index: usize,
+    session_id: String,
+    round_id: String,
     state: State<'_, Arc<RecordingState>>,
     paths: State<'_, PathsState>,
 ) -> Result<InterviewRoundResult, String> {
@@ -194,7 +201,8 @@ async fn run_interview_round(
         interview::orchestrator::run_interview_round(
             &question,
             &paths_clone,
-            round_index,
+            &session_id,
+            &round_id,
             event_tx_clone,
             tts_event_tx_clone,
             stop_clone,

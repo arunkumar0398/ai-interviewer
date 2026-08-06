@@ -15,6 +15,7 @@ hound = "3.5"
 cpal = "0.15"
 sha2 = "0.10"
 rusqlite = { version = "0.31", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

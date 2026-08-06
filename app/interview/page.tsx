@@ -132,9 +132,13 @@ export default function InterviewPage() {
     setPhase("speaking-question");
 
     try {
+      // Backend generates UUID-based session/round IDs for file isolation
+      const sessionId = crypto.randomUUID();
+      const roundId = crypto.randomUUID();
       const result = await invoke<InterviewRoundResult>("run_interview_round", {
         question,
-        roundIndex: currentRound,
+        sessionId,
+        roundId,
       });
 
       setRoundResults((prev) => [...prev, result]);

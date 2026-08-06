@@ -29,9 +29,9 @@ export default function Home() {
 
     try {
       setRecordingState("recording");
-      const outputPath = `recording_${Date.now()}.wav`;
       const result = await invoke<RecordingResult>("start_recording", {
-        outputPath,
+        sessionId: "test-session",
+        roundId: `recording_${Date.now()}`,
         sampleRate: 16000,
       });
       setResult(result);
