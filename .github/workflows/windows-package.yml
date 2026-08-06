@@ -14,11 +14,11 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  package:
-    name: Build & Package (Windows)
+  build:
+    name: Build Portable Package
     runs-on: windows-latest
     timeout-minutes: 30
     defaults:
@@ -44,7 +44,7 @@ jobs:
         run: npm ci
 
       - name: Lint
-        run: npm run lint
+        run: npm run lint -- --max-warnings=0
 
       - name: Type check
         run: npx tsc --noEmit
@@ -57,7 +57,7 @@ jobs:
 
       - name: Fetch tool binaries
         run: |
-          pwsh scripts/fetch-tools.ps1 -ManifestPath resources/tool-manifest.json -OutputDir .
+          pwsh scripts/fetch-tools.ps1 -ManifestPath resources/tool-manifest.json -ToolsDir tools
 
       - name: Verify tool binaries
         run: |
@@ -67,7 +67,6 @@ jobs:
         run: npx tauri build
 
       - name: Create portable package
-        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
         run: |
           $version = (Get-Content src-tauri/tauri.conf.json | ConvertFrom-Json).version
           $zipName = "ai-interviewer-$version-windows-x64-portable.zip"
@@ -78,16 +77,28 @@ jobs:
           Compress-Archive -Path "portable/*" -DestinationPath $zipName
           echo "PORTABLE_ZIP=$zipName" >> $env:GITHUB_ENV
 
-      - name: Upload portable ZIP
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: ${{ env.PORTABLE_ZIP }}
-
       - name: Upload artifact
-        if: github.event_name != 'release'
         uses: actions/upload-artifact@v4
         with:
           name: windows-portable
           path: ${{ env.PORTABLE_ZIP }}
           retention-days: 7
+
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-portable
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ai-interviewer-*.zip

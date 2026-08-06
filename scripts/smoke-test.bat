@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================
-REM  AI Interviewer - Smoke Test (L4)
+REM  AI Interviewer - Smoke Test
 REM  Verifies: file existence, exe launch, Rust tests, frontend tests
 REM  Run: scripts\smoke-test.bat
 REM ============================================================
@@ -17,11 +17,7 @@ echo.
 REM --- 1. Check tools exist ---
 echo [1/7] Checking tools directory...
 
-if defined AI_INTERVIEWER_TOOLS (
-    set "TOOLS_DIR=%AI_INTERVIEWER_TOOLS%"
-) else (
-    set "TOOLS_DIR=%~dp0..\..\ai-interviewer-tools"
-)
+set "TOOLS_DIR=%~dp0..\tools"
 echo   Using tools: %TOOLS_DIR%
 
 REM Check both canonical and legacy piper binary locations

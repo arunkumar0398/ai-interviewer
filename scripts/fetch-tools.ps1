@@ -5,24 +5,24 @@
 
 .DESCRIPTION
     Fetches tool binaries defined in tool-manifest.json, verifies SHA-256
-    checksums, and extracts them to the correct directory layout.
+    checksums, and extracts/copies them to the tools directory.
 
 .PARAMETER ManifestPath
     Path to the tool manifest JSON file. Defaults to resources/tool-manifest.json.
 
-.PARAMETER OutputDir
-    Root directory for extracted tools. Defaults to the repository root.
+.PARAMETER ToolsDir
+    Root directory for tools. Defaults to ./tools.
 
 .PARAMETER SkipChecksum
     Skip SHA-256 verification (for development only).
 
 .EXAMPLE
     .\scripts\fetch-tools.ps1
-    .\scripts\fetch-tools.ps1 -ManifestPath resources\tool-manifest.json -OutputDir .
+    .\scripts\fetch-tools.ps1 -ManifestPath resources\tool-manifest.json -ToolsDir tools
 #>
 param(
     [string]$ManifestPath = "resources\tool-manifest.json",
-    [string]$OutputDir = ".",
+    [string]$ToolsDir = "tools",
     [switch]$SkipChecksum
 )
 
@@ -86,7 +86,7 @@ if (-not (Test-Path $ManifestPath)) {
 
 $manifest = Get-Content $ManifestPath -Raw | ConvertFrom-Json
 Write-Status "Manifest: $ManifestPath"
-Write-Status "Output:   $OutputDir"
+Write-Status "Tools:    $ToolsDir"
 Write-Host ""
 
 $tempDir = Join-Path $env:TEMP "ai-interviewer-tools-$(Get-Random)"
@@ -98,14 +98,16 @@ $fail = 0
 foreach ($tool in $manifest.tools.PSObject.Properties) {
     $name = $tool.Name
     $config = $tool.Value
+    $toolType = $config.type
 
     Write-Host "[$name]" -ForegroundColor Yellow
+    Write-Status "Type:    $toolType"
     Write-Status "Version: $($config.version)"
     Write-Status "URL:     $($config.url)"
 
     $filename = Split-Path $config.url -Leaf
     $downloadPath = Join-Path $tempDir $filename
-    $extractTo = Join-Path $OutputDir $config.extract_to
+    $destination = Join-Path $ToolsDir $config.destination
 
     try {
         # Download
@@ -127,14 +129,23 @@ foreach ($tool in $manifest.tools.PSObject.Properties) {
             Write-Status "Checksum placeholder — skipping verification" "Yellow"
         }
 
-        # Extract
-        Write-Status "Extracting to $extractTo..."
-        New-Item -ItemType Directory -Path $extractTo -Force | Out-Null
-
-        if ($filename -like "*.zip") {
-            Expand-Archive -Path $downloadPath -DestinationPath $extractTo -Force
-        } elseif ($filename -like "*.onnx" -or $filename -like "*.bin") {
-            Copy-Item -Path $downloadPath -Destination $extractTo -Force
+        # Install based on type
+        if ($toolType -eq "archive") {
+            Write-Status "Extracting archive to $destination..."
+            New-Item -ItemType Directory -Path $destination -Force | Out-Null
+            Expand-Archive -Path $downloadPath -DestinationPath $destination -Force
+        } elseif ($toolType -eq "file") {
+            Write-Status "Copying file to $destination..."
+            $destDir = Split-Path $destination -Parent
+            if ($destDir) {
+                New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+            }
+            Copy-Item -Path $downloadPath -Destination $destination -Force
+        } else {
+            Write-Fail "Unknown tool type: $toolType"
+            $fail++
+            Write-Host ""
+            continue
         }
 
         Write-Success "Installed"

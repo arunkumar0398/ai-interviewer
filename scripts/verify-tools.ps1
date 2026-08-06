@@ -4,14 +4,14 @@
     Verifies tool binaries match expected SHA-256 checksums.
 
 .DESCRIPTION
-    Reads the tool manifest and verifies each tool binary exists and matches
-    its expected checksum. Used in CI and before releases.
+    Reads the tool manifest and verifies each tool exists at its destination
+    and matches its expected checksum. Used in CI and before releases.
 
 .PARAMETER ManifestPath
     Path to the tool manifest JSON file.
 
 .PARAMETER ToolsDir
-    Path to the tools directory to verify.
+    Path to the tools root directory to verify.
 
 .EXAMPLE
     .\scripts\verify-tools.ps1
@@ -43,46 +43,56 @@ $skip = 0
 foreach ($tool in $manifest.tools.PSObject.Properties) {
     $name = $tool.Name
     $config = $tool.Value
+    $toolType = $config.type
 
-    $expectedPath = Join-Path $ToolsDir $config.extract_to
+    $expectedPath = Join-Path $ToolsDir $config.destination
 
     Write-Host "[$name]" -ForegroundColor Yellow
+    Write-Host "  Type:    $toolType"
 
-    if (-not (Test-Path $expectedPath)) {
-        # For directories, check if any files exist inside
-        if (Test-Path $expectedPath -PathType Container) {
-            $files = Get-ChildItem -Path $expectedPath -Recurse -File
-            if ($files.Count -eq 0) {
-                Write-Host "  [FAIL] Directory exists but is empty: $expectedPath" -ForegroundColor Red
-                $fail++
-                Write-Host ""
-                continue
-            }
+    if ($toolType -eq "archive") {
+        # For archives, check if the destination directory exists and has files
+        if (-not (Test-Path $expectedPath -PathType Container)) {
+            Write-Host "  [FAIL] Directory not found: $expectedPath" -ForegroundColor Red
+            $fail++
+            Write-Host ""
+            continue
+        }
+        $files = Get-ChildItem -Path $expectedPath -Recurse -File
+        if ($files.Count -eq 0) {
+            Write-Host "  [FAIL] Directory exists but is empty: $expectedPath" -ForegroundColor Red
+            $fail++
+        } else {
             Write-Host "  [OK] Directory exists with $($files.Count) file(s)" -ForegroundColor Green
             $pass++
-        } else {
-            Write-Host "  [FAIL] Not found: $expectedPath" -ForegroundColor Red
-            $fail++
         }
-        Write-Host ""
-        continue
-    }
-
-    # Check checksum if not a placeholder
-    if ($config.sha256 -notlike "PLACEHOLDER_*") {
-        $hash = (Get-FileHash -Path $expectedPath -Algorithm SHA256).Hash.ToLower()
-        if ($hash -eq $config.sha256.ToLower()) {
-            Write-Host "  [OK] Checksum verified: $($config.sha256)" -ForegroundColor Green
-            $pass++
-        } else {
-            Write-Host "  [FAIL] Checksum mismatch" -ForegroundColor Red
-            Write-Host "    Expected: $($config.sha256)" -ForegroundColor Red
-            Write-Host "    Actual:   $hash" -ForegroundColor Red
+    } elseif ($toolType -eq "file") {
+        # For files, check if the specific file exists and verify checksum
+        if (-not (Test-Path $expectedPath -PathType Leaf)) {
+            Write-Host "  [FAIL] File not found: $expectedPath" -ForegroundColor Red
             $fail++
+            Write-Host ""
+            continue
+        }
+
+        if ($config.sha256 -notlike "PLACEHOLDER_*") {
+            $hash = (Get-FileHash -Path $expectedPath -Algorithm SHA256).Hash.ToLower()
+            if ($hash -eq $config.sha256.ToLower()) {
+                Write-Host "  [OK] Checksum verified: $($config.sha256)" -ForegroundColor Green
+                $pass++
+            } else {
+                Write-Host "  [FAIL] Checksum mismatch" -ForegroundColor Red
+                Write-Host "    Expected: $($config.sha256)" -ForegroundColor Red
+                Write-Host "    Actual:   $hash" -ForegroundColor Red
+                $fail++
+            }
+        } else {
+            Write-Host "  [SKIP] Checksum is placeholder" -ForegroundColor Yellow
+            $skip++
         }
     } else {
-        Write-Host "  [SKIP] Checksum is placeholder" -ForegroundColor Yellow
-        $skip++
+        Write-Host "  [FAIL] Unknown tool type: $toolType" -ForegroundColor Red
+        $fail++
     }
 
     Write-Host ""
