@@ -44,9 +44,9 @@ fn main() -> anyhow::Result<()> {
     println!("Tools directory: {}", tools.display());
 
     // Use shared path resolution (supports both canonical and legacy layouts)
-    let (piper_bin, piper_model) = ai_interviewer::paths::resolve_piper_paths(&tools);
-    let whisper_bin = ai_interviewer::paths::resolve_whisper_path(&tools);
-    let whisper_model = ai_interviewer::paths::resolve_whisper_model_path(&tools);
+    let (piper_bin, piper_model) = ai_interviewer_lib::paths::resolve_piper_paths(&tools);
+    let whisper_bin = ai_interviewer_lib::paths::resolve_whisper_path(&tools);
+    let whisper_model = ai_interviewer_lib::paths::resolve_whisper_model_path(&tools);
 
     let piper_bin = piper_bin.expect("Piper binary not found");
     let piper_model = piper_model.expect("Piper model not found");

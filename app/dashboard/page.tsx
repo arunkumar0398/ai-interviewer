@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import Link from "next/link";
 
 interface InterviewSession {
   id: string;
@@ -43,21 +44,6 @@ export default function DashboardPage() {
   const [dbReady, setDbReady] = useState(false);
   const [questions, setQuestions] = useState<string[]>(QUESTIONS);
 
-  useEffect(() => {
-    initDb();
-  }, []);
-
-  const initDb = async () => {
-    try {
-      // DB is initialized at Tauri startup — this confirms readiness
-      await invoke("get_app_config");
-      setDbReady(true);
-      loadSessions();
-    } catch (e) {
-      console.error("Failed to init DB:", e);
-    }
-  };
-
   const loadSessions = async () => {
     try {
       const data = await invoke<InterviewSession[]>("get_sessions");
@@ -66,6 +52,19 @@ export default function DashboardPage() {
       console.error("Failed to load sessions:", e);
     }
   };
+
+  useEffect(() => {
+    const initDb = async () => {
+      try {
+        await invoke("get_app_config");
+        setDbReady(true);
+        await loadSessions();
+      } catch (e) {
+        console.error("Failed to init DB:", e);
+      }
+    };
+    initDb();
+  }, []);
 
   const loadRounds = async (sessionId: string) => {
     try {
@@ -115,12 +114,12 @@ export default function DashboardPage() {
           <h1 className="text-3xl font-bold text-gray-900">
             Recruiter Dashboard
           </h1>
-          <a
+          <Link
             href="/"
             className="text-blue-600 hover:text-blue-800 text-sm font-medium"
           >
             &larr; Back to Home
-          </a>
+          </Link>
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -156,9 +155,9 @@ export default function DashboardPage() {
                   </p>
                   <p className="text-xs text-gray-500 mt-1">
                     Go to{" "}
-                    <a href="/interview" className="text-blue-600 underline">
+                    <Link href="/interview" className="text-blue-600 underline">
                       /interview
-                    </a>{" "}
+                    </Link>{" "}
                     to run the interview
                   </p>
                 </div>

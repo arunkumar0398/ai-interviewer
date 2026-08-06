@@ -206,7 +206,7 @@ async fn transcribe_wav(
             anyhow::bail!("Whisper failed: {}", stderr);
         }
 
-        let txt_path = output_dir.join(format!("{}.txt", &stem_clone));
+        let txt_path = output_dir.join(format!("{}.txt", stem_clone));
         let text = std::fs::read_to_string(&txt_path)?;
         let _ = std::fs::remove_file(&txt_path); // cleanup
 

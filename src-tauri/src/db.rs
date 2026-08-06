@@ -103,6 +103,7 @@ impl Database {
     }
 
     /// Insert a completed interview round
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_round(
         &self,
         session_id: &str,

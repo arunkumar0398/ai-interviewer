@@ -4,7 +4,7 @@ import Home from "../app/page";
 
 // Mock next/link since it uses router internally
 vi.mock("next/link", () => ({
-  default: ({ children, href, ...props }: any) => (
+  default: ({ children, href, ...props }: { children: React.ReactNode; href: string; [key: string]: unknown }) => (
     <a href={href} {...props}>
       {children}
     </a>
@@ -14,7 +14,7 @@ vi.mock("next/link", () => ({
 // Mock Tauri invoke
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
-  invoke: (...args: any[]) => mockInvoke(...args),
+  invoke: (...args: unknown[]) => mockInvoke(...args),
 }));
 
 describe("Home Page", () => {

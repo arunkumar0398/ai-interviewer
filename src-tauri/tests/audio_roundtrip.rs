@@ -408,7 +408,7 @@ fn wav_duration_formula_matches_file() {
 
     // Should be approximately 3000ms (within 100ms tolerance for header variations)
     assert!(
-        duration_ms >= 2900 && duration_ms <= 3100,
+        (2900..=3100).contains(&duration_ms),
         "Duration should be ~3000ms, got {}ms (file_size={})",
         duration_ms,
         file_size

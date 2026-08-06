@@ -4,7 +4,7 @@ import CandidatePage from "../app/candidate/page";
 
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
-  invoke: (...args: any[]) => mockInvoke(...args),
+  invoke: (...args: unknown[]) => mockInvoke(...args),
 }));
 
 describe("Candidate Page", () => {

@@ -4,7 +4,7 @@ import InterviewPage from "../app/interview/page";
 
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
-  invoke: (...args: any[]) => mockInvoke(...args),
+  invoke: (...args: unknown[]) => mockInvoke(...args),
 }));
 
 const mockAppConfig = {

@@ -279,6 +279,7 @@ async fn create_session(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn insert_round(
     session_id: String,
     round_index: i32,

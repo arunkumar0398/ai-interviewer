@@ -122,8 +122,7 @@ impl AppPaths {
 
     /// Resolve paths from injected inputs (testable without env vars).
     pub fn resolve_from_input(input: PathResolutionInput) -> Self {
-        let (tool_dir, tool_directory_source, is_portable) =
-            resolve_tool_dir(&input.exe_dir);
+        let (tool_dir, tool_directory_source, is_portable) = resolve_tool_dir(&input.exe_dir);
 
         let data_dir = if is_portable {
             input.exe_dir.clone()
@@ -329,9 +328,7 @@ pub fn resolve_tool_dir_with_options(
         if p.exists() {
             return (
                 p.clone(),
-                ToolDirectorySource::EnvVar {
-                    value: val.clone(),
-                },
+                ToolDirectorySource::EnvVar { value: val.clone() },
                 false,
             );
         }
