@@ -34,6 +34,14 @@ async fn start_recording(
     state: State<'_, Arc<RecordingState>>,
     paths: State<'_, PathsState>,
 ) -> Result<RecordingResult, String> {
+    // Reject concurrent recordings — only one at a time.
+    {
+        let guard = state.handle.lock().await;
+        if guard.is_some() {
+            return Err("A recording is already in progress".to_string());
+        }
+    }
+
     let (tx, mut rx) = mpsc::channel(32);
     let sr = sample_rate.unwrap_or(16000);
 
@@ -181,6 +189,14 @@ async fn run_interview_round(
     state: State<'_, Arc<RecordingState>>,
     paths: State<'_, PathsState>,
 ) -> Result<InterviewRoundResult, String> {
+    // Reject concurrent recordings — only one at a time.
+    {
+        let guard = state.handle.lock().await;
+        if guard.is_some() {
+            return Err("A recording is already in progress".to_string());
+        }
+    }
+
     let (event_tx, _event_rx) = mpsc::channel(32);
     let (tts_event_tx, _tts_event_rx) = mpsc::channel(32);
 

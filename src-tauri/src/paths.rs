@@ -1,6 +1,35 @@
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::{Path, PathBuf};
+use tauri::Manager;
+
+/// Error type for database path resolution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum DatabasePathError {
+    /// Legacy database exists but could not be renamed to canonical path.
+    MigrationFailed {
+        legacy: String,
+        canonical: String,
+        error: String,
+    },
+}
+
+impl std::fmt::Display for DatabasePathError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MigrationFailed {
+                legacy,
+                canonical,
+                error,
+            } => write!(
+                f,
+                "Failed to migrate database from {legacy} to {canonical}: {error}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DatabasePathError {}
 
 /// Describes how the tool directory was resolved.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -55,13 +84,21 @@ pub struct AppConfig {
     pub readiness: AppReadiness,
 }
 
+/// Input for testable path resolution. Allows injecting directories without
+/// relying on env vars or exe location.
+#[derive(Debug, Clone)]
+pub struct PathResolutionInput {
+    pub exe_dir: PathBuf,
+    pub app_data_dir: PathBuf,
+}
+
 impl AppPaths {
     /// Build paths from an explicit tool directory (used by tests and the
     /// audio spike binary).
     pub fn from_tool_dir(tool_dir: PathBuf, data_dir: PathBuf) -> Self {
         let recordings_dir = data_dir.join("recordings");
         let temp_dir = data_dir.join("temp");
-        let db_path = resolve_database_path(&data_dir);
+        let db_path = resolve_database_path_legacy(&data_dir);
         let tool_directory_source = ToolDirectorySource::DevFallback;
 
         Self {
@@ -70,6 +107,34 @@ impl AppPaths {
             recordings_dir,
             temp_dir,
             is_portable: false,
+            tool_directory_source,
+        }
+    }
+
+    /// Resolve paths from injected inputs (testable without env vars).
+    pub fn resolve_from_input(input: PathResolutionInput) -> Self {
+        let (tool_dir, tool_directory_source, is_portable) =
+            resolve_tool_dir(&input.exe_dir);
+
+        let data_dir = if is_portable {
+            input.exe_dir.clone()
+        } else {
+            input.app_data_dir.clone()
+        };
+
+        let recordings_dir = data_dir.join("recordings");
+        let temp_dir = data_dir.join("temp");
+        let db_path = resolve_database_path(&data_dir).unwrap_or_else(|e| {
+            // Fatal: log and panic — caller must handle this before construction.
+            panic!("Database path resolution failed: {e}");
+        });
+
+        Self {
+            tool_dir,
+            db_path,
+            recordings_dir,
+            temp_dir,
+            is_portable,
             tool_directory_source,
         }
     }
@@ -86,7 +151,9 @@ impl AppPaths {
         let data_dir = compute_data_dir(&exe_dir, is_portable);
         let recordings_dir = data_dir.join("recordings");
         let temp_dir = data_dir.join("temp");
-        let db_path = resolve_database_path(&data_dir);
+        let db_path = resolve_database_path(&data_dir).unwrap_or_else(|e| {
+            panic!("Database path resolution failed: {e}");
+        });
 
         Self {
             tool_dir,
@@ -253,19 +320,37 @@ fn compute_data_dir(exe_dir: &Path, is_portable: bool) -> PathBuf {
 }
 
 /// Resolve the database file path.  Prefers `interviews.db` (canonical).
-/// Migrates from `interviewer.db` when the canonical file does not exist yet.
-fn resolve_database_path(data_dir: &Path) -> PathBuf {
+/// When the legacy `interviewer.db` exists but canonical does not, attempts
+/// to rename (move) the legacy file to the canonical path.
+///
+/// Returns `Err(DatabasePathError::MigrationFailed)` if the rename fails.
+fn resolve_database_path(data_dir: &Path) -> Result<PathBuf, DatabasePathError> {
     let canonical = data_dir.join("interviews.db");
     let legacy = data_dir.join("interviewer.db");
 
     if canonical.exists() {
-        return canonical;
+        return Ok(canonical);
     }
     if legacy.exists() {
-        return legacy;
+        match std::fs::rename(&legacy, &canonical) {
+            Ok(()) => return Ok(canonical),
+            Err(e) => {
+                return Err(DatabasePathError::MigrationFailed {
+                    legacy: legacy.display().to_string(),
+                    canonical: canonical.display().to_string(),
+                    error: e.to_string(),
+                });
+            }
+        }
     }
     // Neither exists — use canonical name for new databases.
-    canonical
+    Ok(canonical)
+}
+
+/// Legacy version of `resolve_database_path` that silently falls back.
+/// Used only by `from_tool_dir` for backward-compatible test construction.
+fn resolve_database_path_legacy(data_dir: &Path) -> PathBuf {
+    resolve_database_path(data_dir).unwrap_or_else(|_| data_dir.join("interviews.db"))
 }
 
 /// Resolve Piper binary and model paths, supporting both canonical and legacy
@@ -373,8 +458,24 @@ pub struct PathsState {
 }
 
 /// Resolve paths at application startup.
-pub fn resolve_app_paths(_app: &tauri::AppHandle) -> Result<PathsState, String> {
-    let app_paths = AppPaths::resolve();
+///
+/// `app_data_dir()` is the authoritative storage root — failure is fatal.
+pub fn resolve_app_paths(app: &tauri::AppHandle) -> Result<PathsState, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Tauri app_data_dir() failed (fatal): {e}"))?;
+
+    let exe_dir = env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let input = PathResolutionInput {
+        exe_dir,
+        app_data_dir,
+    };
+    let app_paths = AppPaths::resolve_from_input(input);
     app_paths.ensure_directories()?;
     Ok(PathsState { paths: app_paths })
 }
@@ -473,28 +574,28 @@ mod tests {
         fs::write(tmp.path().join("interviews.db"), b"").unwrap();
         fs::write(tmp.path().join("interviewer.db"), b"").unwrap();
         assert_eq!(
-            resolve_database_path(tmp.path()),
+            resolve_database_path(tmp.path()).unwrap(),
             tmp.path().join("interviews.db")
         );
     }
 
     #[test]
-    fn resolve_database_path_falls_back_to_legacy() {
+    fn resolve_database_path_migrates_legacy() {
         let tmp = tempfile::tempdir().unwrap();
 
-        // Only legacy exists
-        fs::write(tmp.path().join("interviewer.db"), b"").unwrap();
-        assert_eq!(
-            resolve_database_path(tmp.path()),
-            tmp.path().join("interviewer.db")
-        );
+        // Only legacy exists — should rename to canonical
+        fs::write(tmp.path().join("interviewer.db"), b"legacy").unwrap();
+        let result = resolve_database_path(tmp.path());
+        assert_eq!(result.unwrap(), tmp.path().join("interviews.db"));
+        // Legacy should no longer exist after migration
+        assert!(!tmp.path().join("interviewer.db").exists());
     }
 
     #[test]
     fn resolve_database_path_uses_canonical_when_neither_exists() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(
-            resolve_database_path(tmp.path()),
+            resolve_database_path(tmp.path()).unwrap(),
             tmp.path().join("interviews.db")
         );
     }

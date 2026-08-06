@@ -134,7 +134,7 @@ fn app_paths_database_canonical_when_new() {
     assert_eq!(paths.db_path, data.join("interviews.db"));
 }
 
-/// Test: database path falls back to legacy when only legacy exists
+/// Test: database path migrates legacy to canonical when only legacy exists
 #[test]
 fn app_paths_database_legacy_fallback() {
     let tmp = tempfile::tempdir().unwrap();
@@ -146,8 +146,11 @@ fn app_paths_database_legacy_fallback() {
     fs::write(data.join("interviewer.db"), b"legacy").unwrap();
 
     let paths = AppPaths::from_tool_dir(tool, data.clone());
-    assert!(paths.db_path.ends_with("interviewer.db"));
-    assert_eq!(paths.db_path, data.join("interviewer.db"));
+    // After migration, the canonical path is used and legacy is renamed
+    assert!(paths.db_path.ends_with("interviews.db"));
+    assert_eq!(paths.db_path, data.join("interviews.db"));
+    // Legacy file no longer exists after migration
+    assert!(!data.join("interviewer.db").exists());
 }
 
 /// Test: database path prefers canonical when both exist
