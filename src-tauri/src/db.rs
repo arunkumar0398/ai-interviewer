@@ -38,6 +38,16 @@ impl Database {
     /// Open or create database at the given path
     pub fn open(db_path: &Path) -> SqlResult<Self> {
         let conn = Connection::open(db_path)?;
+
+        // Enable WAL mode for better concurrent read performance
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+
+        // Busy timeout: wait up to 5 seconds for locked database
+        conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+
+        // Enforce foreign key constraints
+        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+
         let db = Self {
             conn: Mutex::new(conn),
         };
@@ -72,7 +82,7 @@ impl Database {
                 channels INTEGER NOT NULL DEFAULT 1,
                 file_size_bytes INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                FOREIGN KEY (session_id) REFERENCES sessions(id)
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
             );
 
             CREATE INDEX IF NOT EXISTS idx_rounds_session ON rounds(session_id);
@@ -80,6 +90,25 @@ impl Database {
         )?;
 
         Ok(())
+    }
+
+    /// Execute a closure within a transaction. Rolls back on error.
+    pub fn in_transaction<F, R>(&self, f: F) -> SqlResult<R>
+    where
+        F: FnOnce(&Connection) -> SqlResult<R>,
+    {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        match f(&conn) {
+            Ok(result) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(result)
+            }
+            Err(e) => {
+                conn.execute_batch("ROLLBACK")?;
+                Err(e)
+            }
+        }
     }
 
     /// Create a new interview session

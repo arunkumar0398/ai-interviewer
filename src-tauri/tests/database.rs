@@ -320,3 +320,87 @@ fn db_large_transcription() {
 
     let _ = std::fs::remove_file(&db_path);
 }
+
+// ============================================================
+// DB robustness: WAL, foreign keys, transaction wrapper
+// ============================================================
+
+/// Test: WAL mode is enabled after open
+#[test]
+fn db_wal_mode_enabled() {
+    let db_path = std::env::temp_dir().join("test_wal_mode.db");
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+
+    let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
+    db.create_session("wal-session", "WalTest").unwrap();
+
+    // Check WAL mode via pragma (read-only connection through the same file)
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal", "WAL mode should be enabled");
+
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+}
+
+/// Test: Transaction commits on success
+#[test]
+fn db_transaction_commits() {
+    let db_path = std::env::temp_dir().join("test_txn_commit.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
+
+    let result = db.in_transaction(|conn| {
+        conn.execute(
+            "INSERT INTO sessions (id, candidate_name) VALUES (?1, ?2)",
+            rusqlite::params!["txn-session", "Txn User"],
+        )?;
+        Ok(())
+    });
+    assert!(result.is_ok(), "Transaction should commit");
+
+    let sessions = db.get_sessions().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, "txn-session");
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// Test: Transaction rolls back on error
+#[test]
+fn db_transaction_rollback() {
+    let db_path = std::env::temp_dir().join("test_txn_rollback.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
+
+    // First insert succeeds outside transaction
+    db.create_session("pre-existing", "Before").unwrap();
+
+    // Transaction fails — should rollback
+    let result: Result<(), rusqlite::Error> = db.in_transaction(|conn| {
+        conn.execute(
+            "INSERT INTO sessions (id, candidate_name) VALUES (?1, ?2)",
+            rusqlite::params!["txn-fail", "During"],
+        )?;
+        // Force an error (duplicate PK)
+        Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some("UNIQUE constraint failed".into()),
+        ))
+    });
+    assert!(result.is_err(), "Transaction should rollback on error");
+
+    // Only pre-existing session should remain
+    let sessions = db.get_sessions().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, "pre-existing");
+
+    let _ = std::fs::remove_file(&db_path);
+}
