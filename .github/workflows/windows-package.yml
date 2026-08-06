@@ -66,12 +66,16 @@ jobs:
       - name: Build Tauri app
         run: npx tauri build
 
-      - name: Create portable ZIP
+      - name: Create portable package
         if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
         run: |
           $version = (Get-Content src-tauri/tauri.conf.json | ConvertFrom-Json).version
           $zipName = "ai-interviewer-$version-windows-x64-portable.zip"
-          Compress-Archive -Path out, tools, src-tauri/target/release/bundle -DestinationPath $zipName
+          New-Item -ItemType Directory -Path "portable" -Force | Out-Null
+          Copy-Item -Path "out" -Destination "portable/out" -Recurse
+          Copy-Item -Path "tools" -Destination "portable/tools" -Recurse
+          Copy-Item -Path "src-tauri/target/release/ai-interviewer.exe" -Destination "portable/" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "portable/*" -DestinationPath $zipName
           echo "PORTABLE_ZIP=$zipName" >> $env:GITHUB_ENV
 
       - name: Upload portable ZIP
