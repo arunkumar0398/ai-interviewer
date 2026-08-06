@@ -47,17 +47,12 @@ async fn clear_active_recording(state: &RecordingState) {
 
 #[tauri::command]
 async fn start_recording(
-    session_id: String,
-    round_id: String,
+    session_id: uuid::Uuid,
+    round_id: uuid::Uuid,
     sample_rate: Option<u32>,
     state: State<'_, Arc<RecordingState>>,
     paths: State<'_, PathsState>,
 ) -> Result<RecordingResult, String> {
-    let session_id =
-        uuid::Uuid::parse_str(&session_id).map_err(|e| format!("Invalid session UUID: {e}"))?;
-    let round_id =
-        uuid::Uuid::parse_str(&round_id).map_err(|e| format!("Invalid round UUID: {e}"))?;
-
     let (tx, mut rx) = mpsc::channel(32);
     let sr = sample_rate.unwrap_or(16000);
 
@@ -130,15 +125,10 @@ async fn stop_recording(state: State<'_, Arc<RecordingState>>) -> Result<String,
 
 #[tauri::command]
 async fn play_round_audio(
-    session_id: String,
-    round_id: String,
+    session_id: uuid::Uuid,
+    round_id: uuid::Uuid,
     paths: State<'_, PathsState>,
 ) -> Result<String, String> {
-    let session_id =
-        uuid::Uuid::parse_str(&session_id).map_err(|e| format!("Invalid session UUID: {e}"))?;
-    let round_id =
-        uuid::Uuid::parse_str(&round_id).map_err(|e| format!("Invalid round UUID: {e}"))?;
-
     let file_path = paths.paths.round_audio_path(session_id, round_id);
 
     if !file_path.exists() {
@@ -180,7 +170,7 @@ async fn play_round_audio(
 #[tauri::command]
 async fn generate_tts(
     text: String,
-    request_id: String,
+    request_id: uuid::Uuid,
     paths: State<'_, PathsState>,
 ) -> Result<String, String> {
     if text.trim().is_empty() {
@@ -190,10 +180,10 @@ async fn generate_tts(
         return Err("Text too long (max 10,000 characters)".to_string());
     }
 
-    // Backend generates path: temp/tts/<request_id>.wav
-    let tts_dir = paths.paths.temp_dir.join("tts");
-    std::fs::create_dir_all(&tts_dir).map_err(|e| e.to_string())?;
-    let output_path = tts_dir.join(format!("{}.wav", request_id));
+    let output_path = paths.paths.tts_output_path(request_id);
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
     audio::playback::generate_tts_with_paths(&text, output_path.clone(), &paths.paths)
         .await
         .map_err(|e| e.to_string())?;
@@ -227,16 +217,11 @@ struct InterviewRoundResult {
 #[tauri::command]
 async fn run_interview_round(
     question: String,
-    session_id: String,
-    round_id: String,
+    session_id: uuid::Uuid,
+    round_id: uuid::Uuid,
     state: State<'_, Arc<RecordingState>>,
     paths: State<'_, PathsState>,
 ) -> Result<InterviewRoundResult, String> {
-    let session_id =
-        uuid::Uuid::parse_str(&session_id).map_err(|e| format!("Invalid session UUID: {e}"))?;
-    let round_id =
-        uuid::Uuid::parse_str(&round_id).map_err(|e| format!("Invalid round UUID: {e}"))?;
-
     let (event_tx, _event_rx) = mpsc::channel(32);
     let (tts_event_tx, _tts_event_rx) = mpsc::channel(32);
 
@@ -305,12 +290,10 @@ fn get_tools_dir(paths: State<'_, PathsState>) -> String {
 
 #[tauri::command]
 async fn create_session(
-    session_id: String,
+    session_id: uuid::Uuid,
     candidate_name: String,
     state: State<'_, Arc<DbState>>,
 ) -> Result<(), String> {
-    let session_id =
-        uuid::Uuid::parse_str(&session_id).map_err(|e| format!("Invalid session UUID: {e}"))?;
     let guard = state.db.lock().await;
     let db = guard.as_ref().ok_or("Database not initialized")?;
     db.create_session(&session_id.hyphenated().to_string(), &candidate_name)
@@ -320,7 +303,7 @@ async fn create_session(
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn insert_round(
-    session_id: String,
+    session_id: uuid::Uuid,
     round_index: i32,
     question: String,
     transcription: String,
@@ -332,8 +315,6 @@ async fn insert_round(
     file_size_bytes: u64,
     state: State<'_, Arc<DbState>>,
 ) -> Result<i64, String> {
-    let session_id =
-        uuid::Uuid::parse_str(&session_id).map_err(|e| format!("Invalid session UUID: {e}"))?;
     let guard = state.db.lock().await;
     let db = guard.as_ref().ok_or("Database not initialized")?;
     db.insert_round(
@@ -353,12 +334,10 @@ async fn insert_round(
 
 #[tauri::command]
 async fn complete_session(
-    session_id: String,
+    session_id: uuid::Uuid,
     total_rounds: i32,
     state: State<'_, Arc<DbState>>,
 ) -> Result<(), String> {
-    let session_id =
-        uuid::Uuid::parse_str(&session_id).map_err(|e| format!("Invalid session UUID: {e}"))?;
     let guard = state.db.lock().await;
     let db = guard.as_ref().ok_or("Database not initialized")?;
     db.complete_session(&session_id.hyphenated().to_string(), total_rounds)
@@ -374,11 +353,9 @@ async fn get_sessions(state: State<'_, Arc<DbState>>) -> Result<Vec<db::Intervie
 
 #[tauri::command]
 async fn get_rounds(
-    session_id: String,
+    session_id: uuid::Uuid,
     state: State<'_, Arc<DbState>>,
 ) -> Result<Vec<db::InterviewRound>, String> {
-    let session_id =
-        uuid::Uuid::parse_str(&session_id).map_err(|e| format!("Invalid session UUID: {e}"))?;
     let guard = state.db.lock().await;
     let db = guard.as_ref().ok_or("Database not initialized")?;
     db.get_rounds(&session_id.hyphenated().to_string())

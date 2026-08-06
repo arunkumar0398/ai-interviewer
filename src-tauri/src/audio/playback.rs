@@ -169,9 +169,13 @@ pub async fn generate_tts_with_paths(
     output_path: PathBuf,
     paths: &crate::paths::AppPaths,
 ) -> anyhow::Result<()> {
-    let (piper_bin, piper_model) = crate::paths::resolve_piper_paths(&paths.tool_dir);
-    let piper_bin = piper_bin.ok_or_else(|| anyhow::anyhow!("Piper binary not found"))?;
-    let piper_model = piper_model.ok_or_else(|| anyhow::anyhow!("Piper model not found"))?;
+    let tools = crate::paths::resolve_tools(&paths.tool_dir);
+    let piper_bin = tools
+        .piper_bin
+        .ok_or_else(|| anyhow::anyhow!("Piper binary not found"))?;
+    let piper_model = tools
+        .piper_model
+        .ok_or_else(|| anyhow::anyhow!("Piper model not found"))?;
 
     // Validate paths exist before spawning process
     if !piper_bin.exists() {

@@ -453,52 +453,100 @@ fn resolve_database_path(data_dir: &Path) -> Result<PathBuf, DatabasePathError> 
     Ok(canonical)
 }
 
-/// Resolve Piper binary and model paths, supporting both canonical and legacy
-/// layouts.  Returns `None` for any component that is not found.
+/// Fully-resolved paths to all external tools.
+#[derive(Debug, Clone)]
+pub struct ResolvedTools {
+    pub piper_bin: Option<PathBuf>,
+    pub piper_model: Option<PathBuf>,
+    pub whisper_bin: Option<PathBuf>,
+    pub whisper_model: Option<PathBuf>,
+}
+
+impl ResolvedTools {
+    /// All critical tool paths are present.
+    pub fn ready(&self) -> bool {
+        self.piper_bin.is_some()
+            && self.piper_model.is_some()
+            && self.whisper_bin.is_some()
+            && self.whisper_model.is_some()
+    }
+}
+
+/// Resolve all tool paths in a single call.  Supports both canonical and
+/// legacy layouts.  Returns a `ResolvedTools` where each field is `None`
+/// if that component was not found.
+pub fn resolve_tools(tool_dir: &Path) -> ResolvedTools {
+    // Piper binary — canonical then legacy
+    let piper_bin = {
+        let canonical = tool_dir.join("piper").join("piper.exe");
+        let legacy = tool_dir.join("piper").join("piper").join("piper.exe");
+        if canonical.exists() {
+            Some(canonical)
+        } else if legacy.exists() {
+            Some(legacy)
+        } else {
+            None
+        }
+    };
+
+    // Piper model — canonical then legacy
+    let piper_model = {
+        let canonical = tool_dir.join("piper").join("model.onnx");
+        let legacy = tool_dir.join("piper-models").join("en_US-amy-medium.onnx");
+        if canonical.exists() {
+            Some(canonical)
+        } else if legacy.exists() {
+            Some(legacy)
+        } else {
+            None
+        }
+    };
+
+    // Whisper binary
+    let whisper_bin = {
+        let p = tool_dir.join("whisper").join("Release").join("main.exe");
+        if p.exists() {
+            Some(p)
+        } else {
+            None
+        }
+    };
+
+    // Whisper model
+    let whisper_model = {
+        let p = tool_dir.join("models").join("ggml-tiny.en.bin");
+        if p.exists() {
+            Some(p)
+        } else {
+            None
+        }
+    };
+
+    ResolvedTools {
+        piper_bin,
+        piper_model,
+        whisper_bin,
+        whisper_model,
+    }
+}
+
+/// Backward-compatible wrapper that returns just the Piper paths.
+/// Prefer `resolve_tools` for new code.
 pub fn resolve_piper_paths(tool_dir: &Path) -> (Option<PathBuf>, Option<PathBuf>) {
-    // Binary
-    let bin_canonical = tool_dir.join("piper").join("piper.exe");
-    let bin_legacy = tool_dir.join("piper").join("piper").join("piper.exe");
-    let bin = if bin_canonical.exists() {
-        Some(bin_canonical)
-    } else if bin_legacy.exists() {
-        Some(bin_legacy)
-    } else {
-        None
-    };
-
-    // Model
-    let model_canonical = tool_dir.join("piper").join("model.onnx");
-    let model_legacy = tool_dir.join("piper-models").join("en_US-amy-medium.onnx");
-    let model = if model_canonical.exists() {
-        Some(model_canonical)
-    } else if model_legacy.exists() {
-        Some(model_legacy)
-    } else {
-        None
-    };
-
-    (bin, model)
+    let tools = resolve_tools(tool_dir);
+    (tools.piper_bin, tools.piper_model)
 }
 
-/// Resolve Whisper binary path.
+/// Backward-compatible wrapper that returns just the Whisper binary path.
+/// Prefer `resolve_tools` for new code.
 pub fn resolve_whisper_path(tool_dir: &Path) -> Option<PathBuf> {
-    let p = tool_dir.join("whisper").join("Release").join("main.exe");
-    if p.exists() {
-        Some(p)
-    } else {
-        None
-    }
+    resolve_tools(tool_dir).whisper_bin
 }
 
-/// Resolve Whisper model path.
+/// Backward-compatible wrapper that returns just the Whisper model path.
+/// Prefer `resolve_tools` for new code.
 pub fn resolve_whisper_model_path(tool_dir: &Path) -> Option<PathBuf> {
-    let p = tool_dir.join("models").join("ggml-tiny.en.bin");
-    if p.exists() {
-        Some(p)
-    } else {
-        None
-    }
+    resolve_tools(tool_dir).whisper_model
 }
 
 /// Dev-only: resolve `tools` directory from the workspace root.
@@ -523,11 +571,17 @@ pub struct PathsState {
 /// Resolve paths at application startup.
 ///
 /// `app_data_dir()` is the authoritative storage root — failure is fatal.
+/// Uses Tauri's `resource_dir()` for bundled tool lookup in production.
 pub fn resolve_app_paths(app: &tauri::AppHandle) -> Result<PathsState, String> {
     let app_data_dir = app
         .path()
         .app_data_dir()
         .map_err(|e| format!("Tauri app_data_dir() failed (fatal): {e}"))?;
+
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("Tauri resource_dir() failed: {e}"))?;
 
     let exe_dir = env::current_exe()
         .ok()
@@ -537,7 +591,7 @@ pub fn resolve_app_paths(app: &tauri::AppHandle) -> Result<PathsState, String> {
     let input = PathResolutionInput {
         exe_dir,
         app_data_dir,
-        resource_dir: None,
+        resource_dir: Some(resource_dir),
     };
     let app_paths =
         AppPaths::resolve_from_input(input).map_err(|e| format!("Path resolution failed: {e}"))?;
@@ -847,5 +901,80 @@ mod tests {
         let path_str = result.to_string_lossy().to_string();
         assert!(path_str.contains("tts"));
         assert!(path_str.ends_with(".wav"));
+    }
+
+    #[test]
+    fn resolve_tools_canonical_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("tools");
+
+        // Canonical piper layout
+        fs::create_dir_all(tool.join("piper")).unwrap();
+        fs::write(tool.join("piper").join("piper.exe"), b"").unwrap();
+        fs::write(tool.join("piper").join("model.onnx"), b"").unwrap();
+        // Whisper
+        fs::create_dir_all(tool.join("whisper").join("Release")).unwrap();
+        fs::write(tool.join("whisper").join("Release").join("main.exe"), b"").unwrap();
+        // Whisper model
+        fs::create_dir_all(tool.join("models")).unwrap();
+        fs::write(tool.join("models").join("ggml-tiny.en.bin"), b"").unwrap();
+
+        let tools = resolve_tools(&tool);
+        assert!(tools.ready());
+        assert_eq!(tools.piper_bin, Some(tool.join("piper").join("piper.exe")));
+        assert_eq!(
+            tools.piper_model,
+            Some(tool.join("piper").join("model.onnx"))
+        );
+        assert_eq!(
+            tools.whisper_bin,
+            Some(tool.join("whisper").join("Release").join("main.exe"))
+        );
+        assert_eq!(
+            tools.whisper_model,
+            Some(tool.join("models").join("ggml-tiny.en.bin"))
+        );
+    }
+
+    #[test]
+    fn resolve_tools_legacy_piper_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("tools");
+
+        // Legacy piper layout
+        fs::create_dir_all(tool.join("piper").join("piper")).unwrap();
+        fs::write(tool.join("piper").join("piper").join("piper.exe"), b"").unwrap();
+        fs::create_dir_all(tool.join("piper-models")).unwrap();
+        fs::write(tool.join("piper-models").join("en_US-amy-medium.onnx"), b"").unwrap();
+        // Whisper
+        fs::create_dir_all(tool.join("whisper").join("Release")).unwrap();
+        fs::write(tool.join("whisper").join("Release").join("main.exe"), b"").unwrap();
+        fs::create_dir_all(tool.join("models")).unwrap();
+        fs::write(tool.join("models").join("ggml-tiny.en.bin"), b"").unwrap();
+
+        let tools = resolve_tools(&tool);
+        assert!(tools.ready());
+        assert_eq!(
+            tools.piper_bin,
+            Some(tool.join("piper").join("piper").join("piper.exe"))
+        );
+        assert_eq!(
+            tools.piper_model,
+            Some(tool.join("piper-models").join("en_US-amy-medium.onnx"))
+        );
+    }
+
+    #[test]
+    fn resolve_tools_missing_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("tools");
+        fs::create_dir_all(&tool).unwrap();
+
+        let tools = resolve_tools(&tool);
+        assert!(!tools.ready());
+        assert!(tools.piper_bin.is_none());
+        assert!(tools.piper_model.is_none());
+        assert!(tools.whisper_bin.is_none());
+        assert!(tools.whisper_model.is_none());
     }
 }

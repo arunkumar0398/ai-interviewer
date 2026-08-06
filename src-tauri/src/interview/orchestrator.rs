@@ -163,9 +163,12 @@ async fn transcribe_wav(
     session_id: Uuid,
     round_id: Uuid,
 ) -> anyhow::Result<String> {
-    let whisper_bin = crate::paths::resolve_whisper_path(&paths.tool_dir)
+    let tools = crate::paths::resolve_tools(&paths.tool_dir);
+    let whisper_bin = tools
+        .whisper_bin
         .ok_or_else(|| anyhow::anyhow!("Whisper binary not found"))?;
-    let model_path = crate::paths::resolve_whisper_model_path(&paths.tool_dir)
+    let model_path = tools
+        .whisper_model
         .ok_or_else(|| anyhow::anyhow!("Whisper model not found"))?;
 
     if !whisper_bin.exists() {
