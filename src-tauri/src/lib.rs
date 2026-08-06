@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tauri::{Manager, State};
 use tokio::sync::{mpsc, Mutex};
 
-use paths::{get_app_config, resolve_app_paths, PathsState};
+use paths::{get_app_config, resolve_app_paths, uuid_to_path, PathsState};
 
 /// Holds the current recording handle so stop_recording can cancel it
 struct RecordingState {
@@ -53,17 +53,18 @@ async fn start_recording(
     state: State<'_, Arc<RecordingState>>,
     paths: State<'_, PathsState>,
 ) -> Result<RecordingResult, String> {
-    // Validate UUIDs before any filesystem operations
-    paths::validate_uuid(&session_id)?;
-    paths::validate_uuid(&round_id)?;
+    let session_id =
+        uuid::Uuid::parse_str(&session_id).map_err(|e| format!("Invalid session UUID: {e}"))?;
+    let round_id =
+        uuid::Uuid::parse_str(&round_id).map_err(|e| format!("Invalid round UUID: {e}"))?;
 
     let (tx, mut rx) = mpsc::channel(32);
     let sr = sample_rate.unwrap_or(16000);
 
     // Backend generates path: recordings/<session_id>/<round_id>.wav
-    let session_dir = paths.paths.recordings_dir.join(&session_id);
+    let session_dir = paths.paths.session_recordings_dir(session_id);
     std::fs::create_dir_all(&session_dir).map_err(|e| e.to_string())?;
-    let path = session_dir.join(format!("{}.wav", round_id));
+    let path = session_dir.join(format!("{}.wav", uuid_to_path(&round_id)));
 
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handle = audio::capture::RecordingHandle {
@@ -133,10 +134,12 @@ async fn play_round_audio(
     round_id: String,
     paths: State<'_, PathsState>,
 ) -> Result<String, String> {
-    paths::validate_uuid(&session_id)?;
-    paths::validate_uuid(&round_id)?;
+    let session_id =
+        uuid::Uuid::parse_str(&session_id).map_err(|e| format!("Invalid session UUID: {e}"))?;
+    let round_id =
+        uuid::Uuid::parse_str(&round_id).map_err(|e| format!("Invalid round UUID: {e}"))?;
 
-    let file_path = paths.paths.round_audio_path(&session_id, &round_id)?;
+    let file_path = paths.paths.round_audio_path(session_id, round_id);
 
     if !file_path.exists() {
         return Err(format!(
@@ -227,9 +230,10 @@ async fn run_interview_round(
     state: State<'_, Arc<RecordingState>>,
     paths: State<'_, PathsState>,
 ) -> Result<InterviewRoundResult, String> {
-    // Validate UUIDs before any filesystem operations
-    paths::validate_uuid(&session_id)?;
-    paths::validate_uuid(&round_id)?;
+    let session_id =
+        uuid::Uuid::parse_str(&session_id).map_err(|e| format!("Invalid session UUID: {e}"))?;
+    let round_id =
+        uuid::Uuid::parse_str(&round_id).map_err(|e| format!("Invalid round UUID: {e}"))?;
 
     let (event_tx, _event_rx) = mpsc::channel(32);
     let (tts_event_tx, _tts_event_rx) = mpsc::channel(32);
@@ -252,8 +256,8 @@ async fn run_interview_round(
         interview::orchestrator::run_interview_round(
             &question,
             &paths_clone,
-            &session_id,
-            &round_id,
+            session_id,
+            round_id,
             event_tx_clone,
             tts_event_tx_clone,
             stop_clone,
@@ -303,10 +307,11 @@ async fn create_session(
     candidate_name: String,
     state: State<'_, Arc<DbState>>,
 ) -> Result<(), String> {
-    paths::validate_uuid(&session_id)?;
+    let session_id =
+        uuid::Uuid::parse_str(&session_id).map_err(|e| format!("Invalid session UUID: {e}"))?;
     let guard = state.db.lock().await;
     let db = guard.as_ref().ok_or("Database not initialized")?;
-    db.create_session(&session_id, &candidate_name)
+    db.create_session(&session_id.hyphenated().to_string(), &candidate_name)
         .map_err(|e| e.to_string())
 }
 
@@ -325,11 +330,12 @@ async fn insert_round(
     file_size_bytes: u64,
     state: State<'_, Arc<DbState>>,
 ) -> Result<i64, String> {
-    paths::validate_uuid(&session_id)?;
+    let session_id =
+        uuid::Uuid::parse_str(&session_id).map_err(|e| format!("Invalid session UUID: {e}"))?;
     let guard = state.db.lock().await;
     let db = guard.as_ref().ok_or("Database not initialized")?;
     db.insert_round(
-        &session_id,
+        &session_id.hyphenated().to_string(),
         round_index,
         &question,
         &transcription,
@@ -349,10 +355,11 @@ async fn complete_session(
     total_rounds: i32,
     state: State<'_, Arc<DbState>>,
 ) -> Result<(), String> {
-    paths::validate_uuid(&session_id)?;
+    let session_id =
+        uuid::Uuid::parse_str(&session_id).map_err(|e| format!("Invalid session UUID: {e}"))?;
     let guard = state.db.lock().await;
     let db = guard.as_ref().ok_or("Database not initialized")?;
-    db.complete_session(&session_id, total_rounds)
+    db.complete_session(&session_id.hyphenated().to_string(), total_rounds)
         .map_err(|e| e.to_string())
 }
 
@@ -368,10 +375,12 @@ async fn get_rounds(
     session_id: String,
     state: State<'_, Arc<DbState>>,
 ) -> Result<Vec<db::InterviewRound>, String> {
-    paths::validate_uuid(&session_id)?;
+    let session_id =
+        uuid::Uuid::parse_str(&session_id).map_err(|e| format!("Invalid session UUID: {e}"))?;
     let guard = state.db.lock().await;
     let db = guard.as_ref().ok_or("Database not initialized")?;
-    db.get_rounds(&session_id).map_err(|e| e.to_string())
+    db.get_rounds(&session_id.hyphenated().to_string())
+        .map_err(|e| e.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

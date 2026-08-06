@@ -1,5 +1,6 @@
 use ai_interviewer_lib::paths::AppPaths;
 use tempfile::tempdir;
+use uuid::Uuid;
 
 fn make_test_paths() -> AppPaths {
     let tmp = tempdir().unwrap();
@@ -16,43 +17,33 @@ fn make_test_paths() -> AppPaths {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn contract_start_recording_rejects_non_uuid_session() {
+fn contract_session_recordings_dir_returns_path() {
     let paths = make_test_paths();
-    let result = paths.session_recordings_dir("not-a-uuid");
-    assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("Invalid UUID"));
+    let session_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+    let result = paths.session_recordings_dir(session_id);
+    assert!(result
+        .to_string_lossy()
+        .contains("550e8400-e29b-41d4-a716-446655440000"));
 }
 
 #[test]
-fn contract_start_recording_rejects_non_uuid_round() {
+fn contract_round_audio_path_returns_path() {
     let paths = make_test_paths();
-    let result = paths.round_audio_path("550e8400-e29b-41d4-a716-446655440000", "not-a-uuid");
-    assert!(result.is_err());
-}
-
-#[test]
-fn contract_start_recording_rejects_traversal_session() {
-    let paths = make_test_paths();
-    let result = paths.session_recordings_dir("../../../etc/passwd");
-    assert!(result.is_err());
-}
-
-#[test]
-fn contract_start_recording_rejects_traversal_round() {
-    let paths = make_test_paths();
-    let result = paths.round_audio_path("550e8400-e29b-41d4-a716-446655440000", "../etc/passwd");
-    assert!(result.is_err());
+    let session_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+    let round_id = Uuid::parse_str("660e8400-e29b-41d4-a716-446655440001").unwrap();
+    let result = paths.round_audio_path(session_id, round_id);
+    let path_str = result.to_string_lossy().to_string();
+    assert!(path_str.contains("550e8400"));
+    assert!(path_str.contains("660e8400"));
 }
 
 #[test]
 fn contract_play_round_audio_rejects_nonexistent_file() {
     let paths = make_test_paths();
-    let path = paths.round_audio_path(
-        "550e8400-e29b-41d4-a716-446655440000",
-        "660e8400-e29b-41d4-a716-446655440001",
-    );
-    assert!(path.is_ok());
-    assert!(!path.unwrap().exists());
+    let session_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+    let round_id = Uuid::parse_str("660e8400-e29b-41d4-a716-446655440001").unwrap();
+    let path = paths.round_audio_path(session_id, round_id);
+    assert!(!path.exists());
 }
 
 #[test]
@@ -68,30 +59,6 @@ fn contract_generate_tts_rejects_empty_text() {
 fn contract_get_tools_dir_returns_tool_path() {
     let paths = make_test_paths();
     assert!(paths.tool_dir.exists() || !paths.tool_dir.to_string_lossy().is_empty());
-}
-
-#[test]
-fn contract_create_session_validates_uuid() {
-    let _result = ai_interviewer_lib::paths::validate_uuid("not-a-uuid");
-    assert!(_result.is_err());
-}
-
-#[test]
-fn contract_create_session_accepts_valid_uuid() {
-    let result = ai_interviewer_lib::paths::validate_uuid("550e8400-e29b-41d4-a716-446655440000");
-    assert!(result.is_ok());
-}
-
-#[test]
-fn contract_insert_round_validates_session_uuid() {
-    let result = ai_interviewer_lib::paths::validate_uuid("bad-uuid");
-    assert!(result.is_err());
-}
-
-#[test]
-fn contract_complete_session_validates_uuid() {
-    let result = ai_interviewer_lib::paths::validate_uuid("");
-    assert!(result.is_err());
 }
 
 #[test]
@@ -143,6 +110,7 @@ fn contract_path_resolution_portable_exe_dir_subdir() {
     let input = ai_interviewer_lib::paths::PathResolutionInput {
         exe_dir,
         app_data_dir,
+        resource_dir: None,
     };
     let paths = AppPaths::resolve_from_input(input).unwrap();
     assert!(paths.recordings_dir.starts_with(tmp.path()));

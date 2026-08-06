@@ -1,10 +1,12 @@
 use crate::audio::capture::{self, CaptureEvent};
 use crate::audio::tts_supervisor::{PiperSupervisor, TtsEvent};
+use crate::paths::uuid_to_path;
 use sha2::Digest;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 /// Interview phase states
 #[derive(Debug, Clone, serde::Serialize)]
@@ -50,16 +52,12 @@ fn sha256_file(path: &Path) -> anyhow::Result<String> {
 pub async fn run_interview_round(
     question: &str,
     paths: &crate::paths::AppPaths,
-    session_id: &str,
-    round_id: &str,
+    session_id: Uuid,
+    round_id: Uuid,
     event_tx: mpsc::Sender<CaptureEvent>,
     tts_event_tx: mpsc::Sender<TtsEvent>,
     stop_flag: Arc<AtomicBool>,
 ) -> anyhow::Result<(AudioMetadata, String)> {
-    // Validate UUIDs before any filesystem operations
-    crate::paths::validate_uuid(session_id).map_err(|e| anyhow::anyhow!(e))?;
-    crate::paths::validate_uuid(round_id).map_err(|e| anyhow::anyhow!(e))?;
-
     let piper = PiperSupervisor::new(paths);
 
     // Phase 1: Speak the question
@@ -84,9 +82,9 @@ pub async fn run_interview_round(
     }
 
     // Phase 3: Record the answer — isolated to recordings/<session_id>/<round_id>.wav
-    let session_dir = paths.recordings_dir.join(session_id);
+    let session_dir = paths.session_recordings_dir(session_id);
     std::fs::create_dir_all(&session_dir)?;
-    let wav_path = session_dir.join(format!("{}.wav", round_id));
+    let wav_path = session_dir.join(format!("{}.wav", uuid_to_path(&round_id)));
 
     let _record_stop = stop_flag.clone();
     let record_event_tx = event_tx.clone();
@@ -169,8 +167,8 @@ pub async fn run_interview_round(
 async fn transcribe_wav(
     paths: &crate::paths::AppPaths,
     wav_path: &std::path::Path,
-    session_id: &str,
-    round_id: &str,
+    session_id: Uuid,
+    round_id: Uuid,
 ) -> anyhow::Result<String> {
     let whisper_bin = crate::paths::resolve_whisper_path(&paths.tool_dir)
         .ok_or_else(|| anyhow::anyhow!("Whisper binary not found"))?;
@@ -188,9 +186,9 @@ async fn transcribe_wav(
     let whisper_bin = whisper_bin.clone();
     let model_path = model_path.clone();
     let wav_path = wav_path.to_path_buf();
-    let output_dir = paths.temp_dir.join(session_id);
+    let output_dir = paths.temp_dir.join(session_id.hyphenated().to_string());
     std::fs::create_dir_all(&output_dir)?;
-    let stem_clone = round_id.to_string();
+    let stem_clone = uuid_to_path(&round_id);
 
     tokio::task::spawn_blocking(move || {
         let output = std::process::Command::new(&whisper_bin)
