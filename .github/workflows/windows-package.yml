@@ -1,0 +1,68 @@
+name: Windows Offline Package
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Build & Package (Windows)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: frontend/src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Fetch tool binaries
+        run: |
+          pwsh scripts/fetch-tools.ps1 -ManifestPath resources/tool-manifest.json -OutputDir .
+
+      - name: Verify tool binaries
+        run: |
+          pwsh scripts/verify-tools.ps1 -ManifestPath resources/tool-manifest.json -ToolsDir tools
+
+      - name: Build Tauri app
+        run: npx tauri build
+
+      - name: Create portable ZIP
+        run: |
+          $version = (Get-Content src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          $zipName = "ai-interviewer-$version-windows-x64-portable.zip"
+          Compress-Archive -Path out, tools, src-tauri/target/release/bundle -DestinationPath $zipName
+          echo "PORTABLE_ZIP=$zipName" >> $env:GITHUB_ENV
+
+      - name: Upload portable ZIP
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: frontend/${{ env.PORTABLE_ZIP }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-portable
+          path: frontend/${{ env.PORTABLE_ZIP }}
+          retention-days: 7
