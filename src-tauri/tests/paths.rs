@@ -493,3 +493,64 @@ fn session_temp_dir_accepts_valid_uuid() {
         .unwrap()
         .ends_with("6ba7b810-9dad-11d1-80b4-00c04fd430c8"));
 }
+
+#[test]
+fn round_audio_path_rejects_traversal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tool = tmp.path().join("tools");
+    let data = tmp.path().join("data");
+    fs::create_dir_all(&tool).unwrap();
+    let paths = AppPaths::from_tool_dir(tool, data);
+
+    assert!(paths
+        .round_audio_path("../etc/passwd", "550e8400-e29b-41d4-a716-446655440000")
+        .is_err());
+    assert!(paths
+        .round_audio_path("550e8400-e29b-41d4-a716-446655440000", "../../escape")
+        .is_err());
+}
+
+#[test]
+fn round_audio_path_accepts_valid_uuids() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tool = tmp.path().join("tools");
+    let data = tmp.path().join("data");
+    fs::create_dir_all(&tool).unwrap();
+    let paths = AppPaths::from_tool_dir(tool, data);
+
+    let result = paths.round_audio_path(
+        "550e8400-e29b-41d4-a716-446655440000",
+        "660e8400-e29b-41d4-a716-446655440001",
+    );
+    assert!(result.is_ok());
+    let path = result.unwrap();
+    assert!(path.to_string_lossy().contains("550e8400"));
+    assert!(path.to_string_lossy().contains("660e8400"));
+    assert!(path.to_string_lossy().ends_with(".wav"));
+}
+
+#[test]
+fn tts_output_path_rejects_traversal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tool = tmp.path().join("tools");
+    let data = tmp.path().join("data");
+    fs::create_dir_all(&tool).unwrap();
+    let paths = AppPaths::from_tool_dir(tool, data);
+
+    assert!(paths.tts_output_path("../escape").is_err());
+}
+
+#[test]
+fn tts_output_path_accepts_valid_uuid() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tool = tmp.path().join("tools");
+    let data = tmp.path().join("data");
+    fs::create_dir_all(&tool).unwrap();
+    let paths = AppPaths::from_tool_dir(tool, data);
+
+    let result = paths.tts_output_path("770e8400-e29b-41d4-a716-446655440002");
+    assert!(result.is_ok());
+    let path = result.unwrap();
+    assert!(path.to_string_lossy().contains("tts"));
+    assert!(path.to_string_lossy().ends_with(".wav"));
+}

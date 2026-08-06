@@ -169,6 +169,36 @@ impl AppPaths {
         Ok(dir)
     }
 
+    /// Return the WAV path for a specific round within a session.
+    ///
+    /// Validates both UUIDs and ensures the path stays under managed roots.
+    pub fn round_audio_path(&self, session_id: &str, round_id: &str) -> Result<PathBuf, String> {
+        validate_uuid(session_id)?;
+        validate_uuid(round_id)?;
+        let dir = self.session_recordings_dir(session_id)?;
+        let path = dir.join(format!("{round_id}.wav"));
+        // Defense-in-depth: verify canonical path stays under recordings
+        let canonical_root = self
+            .recordings_dir
+            .canonicalize()
+            .unwrap_or_else(|_| self.recordings_dir.clone());
+        let resolved = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if !resolved.starts_with(&canonical_root) {
+            return Err("Round audio path escapes recordings directory".into());
+        }
+        Ok(path)
+    }
+
+    /// Return the TTS output path for a specific request.
+    ///
+    /// Validates the UUID and ensures the path stays under managed roots.
+    pub fn tts_output_path(&self, request_id: &str) -> Result<PathBuf, String> {
+        validate_uuid(request_id)?;
+        let tts_dir = self.temp_dir.join("tts");
+        let path = tts_dir.join(format!("{request_id}.wav"));
+        Ok(path)
+    }
+
     /// Build paths from an explicit tool directory (used by tests and the
     /// audio spike binary).
     pub fn from_tool_dir(tool_dir: PathBuf, data_dir: PathBuf) -> Self {
@@ -905,5 +935,66 @@ mod tests {
         let paths = AppPaths::from_tool_dir(tool, data);
 
         assert!(paths.session_temp_dir("../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn round_audio_path_rejects_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("tools");
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&tool).unwrap();
+        let paths = AppPaths::from_tool_dir(tool, data);
+
+        assert!(paths
+            .round_audio_path("../etc/passwd", "550e8400-e29b-41d4-a716-446655440000")
+            .is_err());
+        assert!(paths
+            .round_audio_path("550e8400-e29b-41d4-a716-446655440000", "../../escape")
+            .is_err());
+    }
+
+    #[test]
+    fn round_audio_path_accepts_valid_uuids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("tools");
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&tool).unwrap();
+        let paths = AppPaths::from_tool_dir(tool, data);
+
+        let result = paths.round_audio_path(
+            "550e8400-e29b-41d4-a716-446655440000",
+            "660e8400-e29b-41d4-a716-446655440001",
+        );
+        assert!(result.is_ok());
+        let path = result.unwrap();
+        assert!(path.to_string_lossy().contains("550e8400"));
+        assert!(path.to_string_lossy().contains("660e8400"));
+        assert!(path.to_string_lossy().ends_with(".wav"));
+    }
+
+    #[test]
+    fn tts_output_path_rejects_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("tools");
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&tool).unwrap();
+        let paths = AppPaths::from_tool_dir(tool, data);
+
+        assert!(paths.tts_output_path("../escape").is_err());
+    }
+
+    #[test]
+    fn tts_output_path_accepts_valid_uuid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("tools");
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&tool).unwrap();
+        let paths = AppPaths::from_tool_dir(tool, data);
+
+        let result = paths.tts_output_path("770e8400-e29b-41d4-a716-446655440002");
+        assert!(result.is_ok());
+        let path = result.unwrap();
+        assert!(path.to_string_lossy().contains("tts"));
+        assert!(path.to_string_lossy().ends_with(".wav"));
     }
 }

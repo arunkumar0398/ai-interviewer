@@ -26,6 +26,25 @@ struct RecordingResult {
     duration_ms: u64,
 }
 
+/// Atomically acquire the recording slot. Returns Err if already active.
+async fn acquire_recording(
+    state: &RecordingState,
+    handle: audio::capture::RecordingHandle,
+) -> Result<(), String> {
+    let mut guard = state.handle.lock().await;
+    if guard.is_some() {
+        return Err("A recording is already active".to_string());
+    }
+    *guard = Some(handle);
+    Ok(())
+}
+
+/// Clear the recording slot unconditionally.
+async fn clear_active_recording(state: &RecordingState) {
+    let mut guard = state.handle.lock().await;
+    *guard = None;
+}
+
 #[tauri::command]
 async fn start_recording(
     session_id: String,
@@ -37,14 +56,6 @@ async fn start_recording(
     // Validate UUIDs before any filesystem operations
     paths::validate_uuid(&session_id)?;
     paths::validate_uuid(&round_id)?;
-
-    // Reject concurrent recordings — only one at a time.
-    {
-        let guard = state.handle.lock().await;
-        if guard.is_some() {
-            return Err("A recording is already in progress".to_string());
-        }
-    }
 
     let (tx, mut rx) = mpsc::channel(32);
     let sr = sample_rate.unwrap_or(16000);
@@ -59,46 +70,48 @@ async fn start_recording(
         stop: stop_flag.clone(),
     };
 
-    {
-        let mut guard = state.handle.lock().await;
-        *guard = Some(handle);
-    }
+    // Atomic acquire — single lock, check-and-set
+    acquire_recording(&state, handle).await?;
 
     let path_clone = path.clone();
     let event_tx = tx.clone();
     let stop_clone = stop_flag.clone();
 
-    tokio::spawn(async move {
+    // Spawn worker; drop original tx so channel closes when worker finishes
+    let worker = tokio::spawn(async move {
         if let Err(e) = audio::capture::record_to_wav(path_clone, sr, 1, event_tx, stop_clone).await
         {
             eprintln!("Recording error: {}", e);
         }
     });
+    drop(tx);
 
+    // Wait for worker completion or channel events
+    let join_result = worker.await;
+    clear_active_recording(&state).await;
+
+    // Check for join failure (panic/cancellation)
+    join_result.map_err(|e| format!("Recording worker failed: {}", e))?;
+
+    // Drain remaining events from channel
     while let Some(event) = rx.recv().await {
         match event {
             audio::capture::CaptureEvent::Stopped {
                 file_path,
                 duration_ms,
             } => {
-                let mut guard = state.handle.lock().await;
-                *guard = None;
                 return Ok(RecordingResult {
                     path: file_path,
                     duration_ms,
                 });
             }
             audio::capture::CaptureEvent::Error { message } => {
-                let mut guard = state.handle.lock().await;
-                *guard = None;
                 return Err(message);
             }
             _ => continue,
         }
     }
 
-    let mut guard = state.handle.lock().await;
-    *guard = None;
     Err("Recording interrupted".to_string())
 }
 
@@ -115,15 +128,36 @@ async fn stop_recording(state: State<'_, Arc<RecordingState>>) -> Result<String,
 }
 
 #[tauri::command]
-async fn play_audio(file_path: String) -> Result<String, String> {
-    let (tx, mut rx) = mpsc::channel(32);
-    let path = std::path::PathBuf::from(&file_path);
+async fn play_round_audio(
+    session_id: String,
+    round_id: String,
+    paths: State<'_, PathsState>,
+) -> Result<String, String> {
+    paths::validate_uuid(&session_id)?;
+    paths::validate_uuid(&round_id)?;
 
-    tokio::spawn(async move {
-        if let Err(e) = audio::playback::play_wav(path, tx).await {
+    let file_path = paths.paths.round_audio_path(&session_id, &round_id)?;
+
+    if !file_path.exists() {
+        return Err(format!(
+            "No recording found for session {} round {}",
+            session_id, round_id
+        ));
+    }
+
+    let (tx, mut rx) = mpsc::channel(32);
+    let worker_tx = tx.clone();
+    let path = file_path;
+
+    let worker = tokio::spawn(async move {
+        if let Err(e) = audio::playback::play_wav(path, worker_tx).await {
             eprintln!("Playback error: {}", e);
         }
     });
+    drop(tx);
+
+    let join_result = worker.await;
+    join_result.map_err(|e| format!("Playback worker failed: {}", e))?;
 
     while let Some(event) = rx.recv().await {
         match event {
@@ -137,7 +171,7 @@ async fn play_audio(file_path: String) -> Result<String, String> {
         }
     }
 
-    Err("Playback interrupted".to_string())
+    Ok("Playback completed".to_string())
 }
 
 #[tauri::command]
@@ -197,33 +231,24 @@ async fn run_interview_round(
     paths::validate_uuid(&session_id)?;
     paths::validate_uuid(&round_id)?;
 
-    // Reject concurrent recordings — only one at a time.
-    {
-        let guard = state.handle.lock().await;
-        if guard.is_some() {
-            return Err("A recording is already in progress".to_string());
-        }
-    }
-
     let (event_tx, _event_rx) = mpsc::channel(32);
     let (tts_event_tx, _tts_event_rx) = mpsc::channel(32);
 
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    {
-        let recording_handle = audio::capture::RecordingHandle {
-            stop: stop_flag.clone(),
-        };
-        let mut guard = state.handle.lock().await;
-        *guard = Some(recording_handle);
-    }
+    // Atomic acquire — single lock, check-and-set
+    let recording_handle = audio::capture::RecordingHandle {
+        stop: stop_flag.clone(),
+    };
+    acquire_recording(&state, recording_handle).await?;
 
     let paths_clone = paths.paths.clone();
     let stop_clone = stop_flag.clone();
     let event_tx_clone = event_tx.clone();
     let tts_event_tx_clone = tts_event_tx.clone();
 
-    let result = tokio::spawn(async move {
+    // Spawn worker; guaranteed cleanup on all paths
+    let worker = tokio::spawn(async move {
         interview::orchestrator::run_interview_round(
             &question,
             &paths_clone,
@@ -234,14 +259,12 @@ async fn run_interview_round(
             stop_clone,
         )
         .await
-    })
-    .await
-    .map_err(|e| e.to_string())?;
+    });
 
-    {
-        let mut guard = state.handle.lock().await;
-        *guard = None;
-    }
+    let join_result = worker.await;
+    clear_active_recording(&state).await;
+
+    let result = join_result.map_err(|e| format!("Interview worker failed: {}", e))?;
 
     match result {
         Ok((metadata, transcription)) => Ok(InterviewRoundResult {
@@ -380,7 +403,7 @@ pub fn run() {
             get_app_config,
             start_recording,
             stop_recording,
-            play_audio,
+            play_round_audio,
             generate_tts,
             list_audio_devices,
             check_audio_devices,
