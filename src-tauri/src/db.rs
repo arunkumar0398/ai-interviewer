@@ -47,7 +47,7 @@ impl Database {
 
     /// Create tables if they don't exist
     fn initialize(&self) -> SqlResult<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
 
         conn.execute_batch(
             "
@@ -84,7 +84,7 @@ impl Database {
 
     /// Create a new interview session
     pub fn create_session(&self, session_id: &str, candidate_name: &str) -> SqlResult<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT INTO sessions (id, candidate_name) VALUES (?1, ?2)",
             params![session_id, candidate_name],
@@ -94,7 +94,7 @@ impl Database {
 
     /// Complete a session
     pub fn complete_session(&self, session_id: &str, total_rounds: i32) -> SqlResult<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "UPDATE sessions SET completed_at = datetime('now'), total_rounds = ?1 WHERE id = ?2",
             params![total_rounds, session_id],
@@ -117,7 +117,7 @@ impl Database {
         channels: u16,
         file_size_bytes: u64,
     ) -> SqlResult<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT INTO rounds (session_id, round_index, question, transcription, audio_path, sha256, duration_ms, sample_rate, channels, file_size_bytes)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -139,7 +139,7 @@ impl Database {
 
     /// Get all rounds for a session
     pub fn get_rounds(&self, session_id: &str) -> SqlResult<Vec<InterviewRound>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT id, session_id, round_index, question, transcription, audio_path, sha256, duration_ms, sample_rate, channels, file_size_bytes, created_at
              FROM rounds WHERE session_id = ?1 ORDER BY round_index",
@@ -169,7 +169,7 @@ impl Database {
 
     /// Get all sessions
     pub fn get_sessions(&self) -> SqlResult<Vec<InterviewSession>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT id, candidate_name, started_at, completed_at, total_rounds FROM sessions ORDER BY started_at DESC",
         )?;
@@ -191,7 +191,7 @@ impl Database {
 
     /// Get session by ID
     pub fn get_session(&self, session_id: &str) -> SqlResult<Option<InterviewSession>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT id, candidate_name, started_at, completed_at, total_rounds FROM sessions WHERE id = ?1",
         )?;

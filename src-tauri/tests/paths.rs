@@ -118,7 +118,7 @@ fn app_paths_from_tool_dir_layout() {
     fs::create_dir_all(&tool).unwrap();
     fs::create_dir_all(&data).unwrap();
 
-    let paths = AppPaths::from_tool_dir(tool.clone(), data.clone());
+    let paths = AppPaths::from_tool_dir(tool.clone(), data.clone()).unwrap();
     assert_eq!(paths.tool_dir, tool);
     assert!(paths.db_path.ends_with("interviews.db"));
     assert_eq!(paths.recordings_dir, data.join("recordings"));
@@ -139,7 +139,7 @@ fn app_paths_database_canonical_when_new() {
     fs::create_dir_all(&tool).unwrap();
     fs::create_dir_all(&data).unwrap();
 
-    let paths = AppPaths::from_tool_dir(tool, data.clone());
+    let paths = AppPaths::from_tool_dir(tool, data.clone()).unwrap();
     assert!(paths.db_path.ends_with("interviews.db"));
     assert_eq!(paths.db_path, data.join("interviews.db"));
 }
@@ -155,7 +155,7 @@ fn app_paths_database_legacy_fallback() {
     // Create only legacy db
     fs::write(data.join("interviewer.db"), b"legacy").unwrap();
 
-    let paths = AppPaths::from_tool_dir(tool, data.clone());
+    let paths = AppPaths::from_tool_dir(tool, data.clone()).unwrap();
     // After migration, the canonical path is used and legacy is renamed
     assert!(paths.db_path.ends_with("interviews.db"));
     assert_eq!(paths.db_path, data.join("interviews.db"));
@@ -174,7 +174,7 @@ fn app_paths_database_prefers_canonical() {
     fs::write(data.join("interviews.db"), b"canonical").unwrap();
     fs::write(data.join("interviewer.db"), b"legacy").unwrap();
 
-    let paths = AppPaths::from_tool_dir(tool, data.clone());
+    let paths = AppPaths::from_tool_dir(tool, data.clone()).unwrap();
     assert!(paths.db_path.ends_with("interviews.db"));
     assert_eq!(paths.db_path, data.join("interviews.db"));
 }
@@ -187,7 +187,7 @@ fn app_paths_ensure_directories_creates_all() {
     let data = tmp.path().join("data");
     fs::create_dir_all(&tool).unwrap();
 
-    let paths = AppPaths::from_tool_dir(tool, data);
+    let paths = AppPaths::from_tool_dir(tool, data).unwrap();
     assert!(!paths.recordings_dir.exists());
     assert!(!paths.temp_dir.exists());
 
@@ -205,7 +205,7 @@ fn app_paths_to_app_config_json() {
     fs::create_dir_all(&tool).unwrap();
     fs::create_dir_all(&data).unwrap();
 
-    let paths = AppPaths::from_tool_dir(tool, data);
+    let paths = AppPaths::from_tool_dir(tool, data).unwrap();
     let config = paths.to_app_config();
     let json = serde_json::to_value(&config).unwrap();
 
@@ -292,7 +292,7 @@ fn validate_readiness_all_missing() {
     let tool = tmp.path().join("tools");
     fs::create_dir_all(&tool).unwrap();
 
-    let paths = AppPaths::from_tool_dir(tool, tmp.path().join("data"));
+    let paths = AppPaths::from_tool_dir(tool, tmp.path().join("data")).unwrap();
     let readiness = paths.validate_readiness();
     assert!(!readiness.ready);
     // Should have at least: PIPER_BINARY_MISSING, WHISPER_BINARY_MISSING, PIPER_MODEL_MISSING, WHISPER_MODEL_MISSING
@@ -315,7 +315,7 @@ fn validate_readiness_partial() {
     fs::create_dir_all(tool.join("models")).unwrap();
     fs::write(tool.join("models").join("ggml-tiny.en.bin"), b"").unwrap();
 
-    let paths = AppPaths::from_tool_dir(tool, tmp.path().join("data"));
+    let paths = AppPaths::from_tool_dir(tool, tmp.path().join("data")).unwrap();
     let readiness = paths.validate_readiness();
     assert!(!readiness.ready);
     let codes: Vec<&str> = readiness.issues.iter().map(|i| i.code.as_str()).collect();
@@ -339,7 +339,7 @@ fn validate_readiness_canonical_all_present() {
     fs::create_dir_all(tool.join("models")).unwrap();
     fs::write(tool.join("models").join("ggml-tiny.en.bin"), b"").unwrap();
 
-    let paths = AppPaths::from_tool_dir(tool, tmp.path().join("data"));
+    let paths = AppPaths::from_tool_dir(tool, tmp.path().join("data")).unwrap();
     let readiness = paths.validate_readiness();
     assert!(readiness.ready);
     assert!(readiness.issues.is_empty());
@@ -363,7 +363,7 @@ fn validate_readiness_legacy_all_present() {
     fs::create_dir_all(tool.join("models")).unwrap();
     fs::write(tool.join("models").join("ggml-tiny.en.bin"), b"").unwrap();
 
-    let paths = AppPaths::from_tool_dir(tool, tmp.path().join("data"));
+    let paths = AppPaths::from_tool_dir(tool, tmp.path().join("data")).unwrap();
     let readiness = paths.validate_readiness();
     assert!(readiness.ready);
     assert!(readiness.issues.is_empty());
@@ -432,7 +432,7 @@ fn session_recordings_dir_rejects_traversal() {
     let tool = tmp.path().join("tools");
     let data = tmp.path().join("data");
     fs::create_dir_all(&tool).unwrap();
-    let paths = AppPaths::from_tool_dir(tool, data);
+    let paths = AppPaths::from_tool_dir(tool, data).unwrap();
 
     // Traversal attempts should be rejected
     assert!(paths.session_recordings_dir("../etc/passwd").is_err());
@@ -446,7 +446,7 @@ fn session_recordings_dir_rejects_non_uuid() {
     let tool = tmp.path().join("tools");
     let data = tmp.path().join("data");
     fs::create_dir_all(&tool).unwrap();
-    let paths = AppPaths::from_tool_dir(tool, data);
+    let paths = AppPaths::from_tool_dir(tool, data).unwrap();
 
     assert!(paths.session_recordings_dir("not-a-uuid").is_err());
     assert!(paths.session_recordings_dir("").is_err());
@@ -458,7 +458,7 @@ fn session_recordings_dir_accepts_valid_uuid() {
     let tool = tmp.path().join("tools");
     let data = tmp.path().join("data");
     fs::create_dir_all(&tool).unwrap();
-    let paths = AppPaths::from_tool_dir(tool, data);
+    let paths = AppPaths::from_tool_dir(tool, data).unwrap();
 
     let result = paths.session_recordings_dir("550e8400-e29b-41d4-a716-446655440000");
     assert!(result.is_ok());
@@ -473,7 +473,7 @@ fn session_temp_dir_rejects_traversal() {
     let tool = tmp.path().join("tools");
     let data = tmp.path().join("data");
     fs::create_dir_all(&tool).unwrap();
-    let paths = AppPaths::from_tool_dir(tool, data);
+    let paths = AppPaths::from_tool_dir(tool, data).unwrap();
 
     assert!(paths.session_temp_dir("../etc/passwd").is_err());
     assert!(paths.session_temp_dir("abc/def").is_err());
@@ -485,7 +485,7 @@ fn session_temp_dir_accepts_valid_uuid() {
     let tool = tmp.path().join("tools");
     let data = tmp.path().join("data");
     fs::create_dir_all(&tool).unwrap();
-    let paths = AppPaths::from_tool_dir(tool, data);
+    let paths = AppPaths::from_tool_dir(tool, data).unwrap();
 
     let result = paths.session_temp_dir("6ba7b810-9dad-11d1-80b4-00c04fd430c8");
     assert!(result.is_ok());
@@ -500,7 +500,7 @@ fn round_audio_path_rejects_traversal() {
     let tool = tmp.path().join("tools");
     let data = tmp.path().join("data");
     fs::create_dir_all(&tool).unwrap();
-    let paths = AppPaths::from_tool_dir(tool, data);
+    let paths = AppPaths::from_tool_dir(tool, data).unwrap();
 
     assert!(paths
         .round_audio_path("../etc/passwd", "550e8400-e29b-41d4-a716-446655440000")
@@ -516,7 +516,7 @@ fn round_audio_path_accepts_valid_uuids() {
     let tool = tmp.path().join("tools");
     let data = tmp.path().join("data");
     fs::create_dir_all(&tool).unwrap();
-    let paths = AppPaths::from_tool_dir(tool, data);
+    let paths = AppPaths::from_tool_dir(tool, data).unwrap();
 
     let result = paths.round_audio_path(
         "550e8400-e29b-41d4-a716-446655440000",
@@ -535,7 +535,7 @@ fn tts_output_path_rejects_traversal() {
     let tool = tmp.path().join("tools");
     let data = tmp.path().join("data");
     fs::create_dir_all(&tool).unwrap();
-    let paths = AppPaths::from_tool_dir(tool, data);
+    let paths = AppPaths::from_tool_dir(tool, data).unwrap();
 
     assert!(paths.tts_output_path("../escape").is_err());
 }
@@ -546,7 +546,7 @@ fn tts_output_path_accepts_valid_uuid() {
     let tool = tmp.path().join("tools");
     let data = tmp.path().join("data");
     fs::create_dir_all(&tool).unwrap();
-    let paths = AppPaths::from_tool_dir(tool, data);
+    let paths = AppPaths::from_tool_dir(tool, data).unwrap();
 
     let result = paths.tts_output_path("770e8400-e29b-41d4-a716-446655440002");
     assert!(result.is_ok());

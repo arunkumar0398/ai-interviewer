@@ -201,24 +201,24 @@ impl AppPaths {
 
     /// Build paths from an explicit tool directory (used by tests and the
     /// audio spike binary).
-    pub fn from_tool_dir(tool_dir: PathBuf, data_dir: PathBuf) -> Self {
+    pub fn from_tool_dir(tool_dir: PathBuf, data_dir: PathBuf) -> Result<Self, DatabasePathError> {
         let recordings_dir = data_dir.join("recordings");
         let temp_dir = data_dir.join("temp");
-        let db_path = resolve_database_path_legacy(&data_dir);
+        let db_path = resolve_database_path(&data_dir)?;
         let tool_directory_source = ToolDirectorySource::DevFallback;
 
-        Self {
+        Ok(Self {
             tool_dir,
             db_path,
             recordings_dir,
             temp_dir,
             is_portable: false,
             tool_directory_source,
-        }
+        })
     }
 
     /// Resolve paths from injected inputs (testable without env vars).
-    pub fn resolve_from_input(input: PathResolutionInput) -> Self {
+    pub fn resolve_from_input(input: PathResolutionInput) -> Result<Self, DatabasePathError> {
         let (tool_dir, tool_directory_source, is_portable) = resolve_tool_dir(&input.exe_dir);
 
         let data_dir = if is_portable {
@@ -229,23 +229,20 @@ impl AppPaths {
 
         let recordings_dir = data_dir.join("recordings");
         let temp_dir = data_dir.join("temp");
-        let db_path = resolve_database_path(&data_dir).unwrap_or_else(|e| {
-            // Fatal: log and panic — caller must handle this before construction.
-            panic!("Database path resolution failed: {e}");
-        });
+        let db_path = resolve_database_path(&data_dir)?;
 
-        Self {
+        Ok(Self {
             tool_dir,
             db_path,
             recordings_dir,
             temp_dir,
             is_portable,
             tool_directory_source,
-        }
+        })
     }
 
     /// Canonical constructor used at application startup.
-    pub fn resolve() -> Self {
+    pub fn resolve() -> Result<Self, DatabasePathError> {
         let exe_dir = env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()))
@@ -256,18 +253,16 @@ impl AppPaths {
         let data_dir = compute_data_dir(&exe_dir, is_portable);
         let recordings_dir = data_dir.join("recordings");
         let temp_dir = data_dir.join("temp");
-        let db_path = resolve_database_path(&data_dir).unwrap_or_else(|e| {
-            panic!("Database path resolution failed: {e}");
-        });
+        let db_path = resolve_database_path(&data_dir)?;
 
-        Self {
+        Ok(Self {
             tool_dir,
             db_path,
             recordings_dir,
             temp_dir,
             is_portable,
             tool_directory_source,
-        }
+        })
     }
 
     /// Produce the compact config sent to the frontend.
@@ -509,12 +504,6 @@ fn resolve_database_path(data_dir: &Path) -> Result<PathBuf, DatabasePathError> 
     Ok(canonical)
 }
 
-/// Legacy version of `resolve_database_path` that silently falls back.
-/// Used only by `from_tool_dir` for backward-compatible test construction.
-fn resolve_database_path_legacy(data_dir: &Path) -> PathBuf {
-    resolve_database_path(data_dir).unwrap_or_else(|_| data_dir.join("interviews.db"))
-}
-
 /// Resolve Piper binary and model paths, supporting both canonical and legacy
 /// layouts.  Returns `None` for any component that is not found.
 pub fn resolve_piper_paths(tool_dir: &Path) -> (Option<PathBuf>, Option<PathBuf>) {
@@ -637,7 +626,8 @@ pub fn resolve_app_paths(app: &tauri::AppHandle) -> Result<PathsState, String> {
         exe_dir,
         app_data_dir,
     };
-    let app_paths = AppPaths::resolve_from_input(input);
+    let app_paths =
+        AppPaths::resolve_from_input(input).map_err(|e| format!("Path resolution failed: {e}"))?;
     app_paths.ensure_directories()?;
     Ok(PathsState { paths: app_paths })
 }
@@ -661,7 +651,7 @@ mod tests {
         fs::create_dir_all(&tool).unwrap();
         fs::create_dir_all(&data).unwrap();
 
-        let paths = AppPaths::from_tool_dir(tool.clone(), data.clone());
+        let paths = AppPaths::from_tool_dir(tool.clone(), data.clone()).unwrap();
         assert_eq!(paths.tool_dir, tool);
         assert_eq!(paths.db_path, data.join("interviews.db"));
         assert_eq!(paths.recordings_dir, data.join("recordings"));
@@ -702,7 +692,7 @@ mod tests {
         fs::create_dir_all(&tool).unwrap();
         fs::create_dir_all(&data).unwrap();
 
-        let paths = AppPaths::from_tool_dir(tool, data);
+        let paths = AppPaths::from_tool_dir(tool, data).unwrap();
         let config = paths.to_app_config();
         assert!(!config.readiness.ready);
         assert!(!config.readiness.issues.is_empty());
@@ -727,7 +717,7 @@ mod tests {
         fs::create_dir_all(tool.join("models")).unwrap();
         fs::write(tool.join("models").join("ggml-tiny.en.bin"), b"").unwrap();
 
-        let paths = AppPaths::from_tool_dir(tool, tmp.path().join("data"));
+        let paths = AppPaths::from_tool_dir(tool, tmp.path().join("data")).unwrap();
         let readiness = paths.validate_readiness();
         assert!(readiness.ready);
         assert!(readiness.issues.is_empty());
@@ -744,7 +734,7 @@ mod tests {
         fs::create_dir_all(tool.join("models")).unwrap();
         fs::write(tool.join("models").join("ggml-tiny.en.bin"), b"").unwrap();
 
-        let paths = AppPaths::from_tool_dir(tool, tmp.path().join("data"));
+        let paths = AppPaths::from_tool_dir(tool, tmp.path().join("data")).unwrap();
         let readiness = paths.validate_readiness();
         assert!(!readiness.ready);
         assert!(readiness
@@ -863,7 +853,7 @@ mod tests {
         let data = tmp.path().join("data");
         fs::create_dir_all(&tool).unwrap();
 
-        let paths = AppPaths::from_tool_dir(tool, data);
+        let paths = AppPaths::from_tool_dir(tool, data).unwrap();
         paths.ensure_directories().unwrap();
         assert!(paths.recordings_dir.exists());
         assert!(paths.temp_dir.exists());
@@ -920,7 +910,7 @@ mod tests {
         let tool = tmp.path().join("tools");
         let data = tmp.path().join("data");
         fs::create_dir_all(&tool).unwrap();
-        let paths = AppPaths::from_tool_dir(tool, data);
+        let paths = AppPaths::from_tool_dir(tool, data).unwrap();
 
         // Traversal should be rejected
         assert!(paths.session_recordings_dir("../etc/passwd").is_err());
@@ -933,7 +923,7 @@ mod tests {
         let tool = tmp.path().join("tools");
         let data = tmp.path().join("data");
         fs::create_dir_all(&tool).unwrap();
-        let paths = AppPaths::from_tool_dir(tool, data);
+        let paths = AppPaths::from_tool_dir(tool, data).unwrap();
 
         assert!(paths.session_recordings_dir("not-a-uuid").is_err());
         assert!(paths.session_recordings_dir("").is_err());
@@ -945,7 +935,7 @@ mod tests {
         let tool = tmp.path().join("tools");
         let data = tmp.path().join("data");
         fs::create_dir_all(&tool).unwrap();
-        let paths = AppPaths::from_tool_dir(tool, data);
+        let paths = AppPaths::from_tool_dir(tool, data).unwrap();
 
         let result = paths.session_recordings_dir("550e8400-e29b-41d4-a716-446655440000");
         assert!(result.is_ok());
@@ -960,7 +950,7 @@ mod tests {
         let tool = tmp.path().join("tools");
         let data = tmp.path().join("data");
         fs::create_dir_all(&tool).unwrap();
-        let paths = AppPaths::from_tool_dir(tool, data);
+        let paths = AppPaths::from_tool_dir(tool, data).unwrap();
 
         assert!(paths.session_temp_dir("../etc/passwd").is_err());
     }
@@ -971,7 +961,7 @@ mod tests {
         let tool = tmp.path().join("tools");
         let data = tmp.path().join("data");
         fs::create_dir_all(&tool).unwrap();
-        let paths = AppPaths::from_tool_dir(tool, data);
+        let paths = AppPaths::from_tool_dir(tool, data).unwrap();
 
         assert!(paths
             .round_audio_path("../etc/passwd", "550e8400-e29b-41d4-a716-446655440000")
@@ -987,7 +977,7 @@ mod tests {
         let tool = tmp.path().join("tools");
         let data = tmp.path().join("data");
         fs::create_dir_all(&tool).unwrap();
-        let paths = AppPaths::from_tool_dir(tool, data);
+        let paths = AppPaths::from_tool_dir(tool, data).unwrap();
 
         let result = paths.round_audio_path(
             "550e8400-e29b-41d4-a716-446655440000",
@@ -1006,7 +996,7 @@ mod tests {
         let tool = tmp.path().join("tools");
         let data = tmp.path().join("data");
         fs::create_dir_all(&tool).unwrap();
-        let paths = AppPaths::from_tool_dir(tool, data);
+        let paths = AppPaths::from_tool_dir(tool, data).unwrap();
 
         assert!(paths.tts_output_path("../escape").is_err());
     }
@@ -1017,7 +1007,7 @@ mod tests {
         let tool = tmp.path().join("tools");
         let data = tmp.path().join("data");
         fs::create_dir_all(&tool).unwrap();
-        let paths = AppPaths::from_tool_dir(tool, data);
+        let paths = AppPaths::from_tool_dir(tool, data).unwrap();
 
         let result = paths.tts_output_path("770e8400-e29b-41d4-a716-446655440002");
         assert!(result.is_ok());
