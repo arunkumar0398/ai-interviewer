@@ -15,7 +15,7 @@ echo ======================================
 echo.
 
 REM --- 1. Check tools exist ---
-echo [1/6] Checking tools directory...
+echo [1/7] Checking tools directory...
 
 if defined AI_INTERVIEWER_TOOLS (
     set "TOOLS_DIR=%AI_INTERVIEWER_TOOLS%"
@@ -48,7 +48,7 @@ if exist "%TOOLS_DIR%\piper\model.onnx" (
     set /a FAIL+=1
 )
 
-if exist "%TOOLS_DIR%\whisper.cpp\main.exe" (
+if exist "%TOOLS_DIR%\whisper\Release\main.exe" (
     echo   [PASS] Whisper binary exists
     set /a PASS+=1
 ) else (
@@ -56,7 +56,7 @@ if exist "%TOOLS_DIR%\whisper.cpp\main.exe" (
     set /a FAIL+=1
 )
 
-if exist "%TOOLS_DIR%\whisper.cpp\models\ggml-tiny.en.bin" (
+if exist "%TOOLS_DIR%\models\ggml-tiny.en.bin" (
     echo   [PASS] Whisper model exists
     set /a PASS+=1
 ) else (
@@ -66,7 +66,7 @@ if exist "%TOOLS_DIR%\whisper.cpp\models\ggml-tiny.en.bin" (
 
 REM --- 2. Check installer output ---
 echo.
-echo [2/6] Checking build output...
+echo [2/7] Checking build output...
 
 set RELEASE_DIR=%~dp0..\src-tauri\target\release\bundle
 
@@ -88,7 +88,7 @@ if exist "%RELEASE_DIR%\msi\ai-interviewer_0.1.0_x64_en-US.msi" (
 
 REM --- 3. Check frontend build output ---
 echo.
-echo [3/6] Checking frontend build...
+echo [3/7] Checking frontend build...
 
 set OUT_DIR=%~dp0..\out
 
@@ -126,7 +126,7 @@ if exist "%OUT_DIR%\dashboard.html" (
 
 REM --- 4. Check key source files ---
 echo.
-echo [4/6] Checking key source files...
+echo [4/7] Checking key source files...
 
 set SRC=%~dp0..\src-tauri\src
 
@@ -174,7 +174,7 @@ if exist "%SRC%\interview\orchestrator.rs" (
 
 REM --- 5. Check test infrastructure ---
 echo.
-echo [5/6] Checking test infrastructure...
+echo [5/7] Checking test infrastructure...
 
 set TEST_DIR=%~dp0..\src-tauri\tests
 
@@ -208,15 +208,30 @@ for %%F in (home.test.tsx interview.test.tsx candidate.test.tsx dashboard.test.t
 
 REM --- 6. Run Rust tests ---
 echo.
-echo [6/6] Running Rust tests (cargo test)...
+echo [6/7] Running Rust tests (cargo test)...
 
 pushd "%~dp0..\src-tauri"
-cargo test 2>nul
+cargo test
 if %ERRORLEVEL% equ 0 (
     echo   [PASS] All Rust tests passed
     set /a PASS+=1
 ) else (
     echo   [FAIL] Rust tests failed
+    set /a FAIL+=1
+)
+popd
+
+REM --- 7. Run frontend tests ---
+echo.
+echo [7/7] Running frontend tests (vitest)...
+
+pushd "%~dp0.."
+npx vitest run
+if %ERRORLEVEL% equ 0 (
+    echo   [PASS] All frontend tests passed
+    set /a PASS+=1
+) else (
+    echo   [FAIL] Frontend tests failed
     set /a FAIL+=1
 )
 popd
