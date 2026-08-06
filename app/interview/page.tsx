@@ -37,7 +37,7 @@ interface AppConfig {
   recordings_dir: string;
   db_path: string;
   readiness: {
-    ok: boolean;
+    ready: boolean;
     issues: Array<{ code: string; message: string; expected_path: string | null }>;
   };
 }
@@ -73,13 +73,43 @@ export default function InterviewPage() {
   const [error, setError] = useState<string | null>(null);
   const [isStopping, setIsStopping] = useState(false);
 
-  // Check tools on mount
+  // Stable session ID for the entire interview flow (one session across all rounds)
+  const [sessionId] = useState(() => crypto.randomUUID());
+
+  // Reusable readiness check — called from retry
+  const checkTools = useCallback(async () => {
+    setPhase("checking-tools");
+    setError(null);
+
+    try {
+      const config = await invoke<AppConfig>("get_app_config");
+
+      if (config.readiness.ready) {
+        setToolsStatus({ piper: true, whisper: true, model: true });
+        setPhase("device-check");
+      } else {
+        const missing = config.readiness.issues
+          .map((i) => i.message)
+          .join(", ");
+        setError(`Missing tools: ${missing}`);
+        setPhase("error");
+      }
+    } catch (e) {
+      setError(String(e));
+      setPhase("error");
+    }
+  }, []);
+
+  // Check tools on mount — inline async to satisfy lint rule
   useEffect(() => {
-    const checkTools = async () => {
+    let cancelled = false;
+
+    async function init() {
       try {
         const config = await invoke<AppConfig>("get_app_config");
+        if (cancelled) return;
 
-        if (config.readiness.ok) {
+        if (config.readiness.ready) {
           setToolsStatus({ piper: true, whisper: true, model: true });
           setPhase("device-check");
         } else {
@@ -90,11 +120,14 @@ export default function InterviewPage() {
           setPhase("error");
         }
       } catch (e) {
+        if (cancelled) return;
         setError(String(e));
         setPhase("error");
       }
-    };
-    checkTools();
+    }
+
+    init();
+    return () => { cancelled = true; };
   }, []);
 
   // Run device check
@@ -132,8 +165,7 @@ export default function InterviewPage() {
     setPhase("speaking-question");
 
     try {
-      // Backend generates UUID-based session/round IDs for file isolation
-      const sessionId = crypto.randomUUID();
+      // Round ID is unique per round; session ID is stable across the interview
       const roundId = crypto.randomUUID();
       const result = await invoke<InterviewRoundResult>("run_interview_round", {
         question,
@@ -152,7 +184,7 @@ export default function InterviewPage() {
         setError(String(e));
       }
     }
-  }, [currentRound]);
+  }, [currentRound, sessionId]);
 
   // Stop current round
   const handleStop = useCallback(async () => {
@@ -362,10 +394,7 @@ export default function InterviewPage() {
             <p className="font-medium mb-1">Error</p>
             <p>{error}</p>
             <button
-              onClick={() => {
-                setPhase("device-check");
-                setError(null);
-              }}
+              onClick={checkTools}
               className="mt-3 px-3 py-1 bg-red-600 text-white rounded text-xs hover:bg-red-700"
             >
               Retry

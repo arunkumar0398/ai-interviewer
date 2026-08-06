@@ -10,9 +10,9 @@ vi.mock("@tauri-apps/api/core", () => ({
 const mockAppConfig = {
   tool_dir: "/fake/tools",
   recordings_dir: "/fake/recordings",
-  db_path: "/fake/interviewer.db",
+  db_path: "/fake/interviews.db",
   readiness: {
-    ok: true,
+    ready: true,
     issues: [],
   },
 };
@@ -20,12 +20,12 @@ const mockAppConfig = {
 const mockAppConfigWithMissingTools = {
   tool_dir: "/fake/tools",
   recordings_dir: "/fake/recordings",
-  db_path: "/fake/interviewer.db",
+  db_path: "/fake/interviews.db",
   readiness: {
-    ok: false,
+    ready: false,
     issues: [
       { code: "PIPER_BINARY_MISSING", message: "Piper binary not found", expected_path: "/fake/tools/piper/piper.exe" },
-      { code: "WHISPER_BINARY_MISSING", message: "Whisper binary not found", expected_path: "/fake/tools/whisper.cpp/main.exe" },
+      { code: "WHISPER_BINARY_MISSING", message: "Whisper binary not found", expected_path: "/fake/tools/whisper/Release/main.exe" },
     ],
   },
 };

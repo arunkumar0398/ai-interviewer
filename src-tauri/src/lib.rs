@@ -141,8 +141,10 @@ async fn generate_tts(
         return Err("Text too long (max 10,000 characters)".to_string());
     }
 
-    // Backend generates path: temp/<request_id>.txt (Whisper reads this as intermediate)
-    let output_path = paths.paths.temp_dir.join(format!("{}.txt", request_id));
+    // Backend generates path: temp/tts/<request_id>.wav
+    let tts_dir = paths.paths.temp_dir.join("tts");
+    std::fs::create_dir_all(&tts_dir).map_err(|e| e.to_string())?;
+    let output_path = tts_dir.join(format!("{}.wav", request_id));
     audio::playback::generate_tts_with_paths(&text, output_path.clone(), &paths.paths)
         .await
         .map_err(|e| e.to_string())?;
