@@ -78,7 +78,7 @@ export default function DashboardPage() {
 
   const startNewSession = async () => {
     if (!candidateName.trim()) return;
-    const sessionId = `session-${Date.now()}`;
+    const sessionId = crypto.randomUUID();
     try {
       await invoke("create_session", {
         sessionId,

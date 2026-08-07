@@ -30,8 +30,8 @@ export default function Home() {
     try {
       setRecordingState("recording");
       const result = await invoke<RecordingResult>("start_recording", {
-        sessionId: "test-session",
-        roundId: `recording_${Date.now()}`,
+        sessionId: crypto.randomUUID(),
+        roundId: crypto.randomUUID(),
         sampleRate: 16000,
       });
       setResult(result);
