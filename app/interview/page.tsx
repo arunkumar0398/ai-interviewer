@@ -1,7 +1,14 @@
 "use client";
 
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+
+interface PhaseEventPayload {
+  phase: string;
+  question: string | null;
+  duration_ms: number | null;
+}
 
 interface DeviceCheckResult {
   mic_available: boolean;
@@ -53,6 +60,12 @@ type InterviewPhase =
   | "showing-result"
   | "error";
 
+/** Which operation failed and should be retried. */
+type RetryTarget =
+  | { kind: "round"; question: string }
+  | { kind: "device-check" }
+  | { kind: "readiness" };
+
 const QUESTIONS = [
   "Tell me about yourself and your background.",
   "What are your strengths and weaknesses?",
@@ -72,35 +85,54 @@ export default function InterviewPage() {
   const [roundResults, setRoundResults] = useState<InterviewRoundResult[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [isStopping, setIsStopping] = useState(false);
+  const [retryTarget, setRetryTarget] = useState<RetryTarget | null>(null);
 
   // Stable session ID for the entire interview flow (one session across all rounds)
   const [sessionId] = useState(() => crypto.randomUUID());
+  const sessionIdRef = useRef(sessionId);
 
-  // Reusable readiness check — called from retry
-  const checkTools = useCallback(async () => {
-    setPhase("checking-tools");
-    setError(null);
+  // Keep ref in sync
+  useEffect(() => {
+    sessionIdRef.current = sessionId;
+  }, [sessionId]);
 
-    try {
-      const config = await invoke<AppConfig>("get_app_config");
+  // Subscribe to backend phase events — drives UI transitions automatically
+  useEffect(() => {
+    const unlisten = listen<PhaseEventPayload>("interview-phase", (event) => {
+      const { phase: backendPhase, question } = event.payload;
 
-      if (config.readiness.ready) {
-        setToolsStatus({ piper: true, whisper: true, model: true });
-        setPhase("device-check");
-      } else {
-        const missing = config.readiness.issues
-          .map((i) => i.message)
-          .join(", ");
-        setError(`Missing tools: ${missing}`);
-        setPhase("error");
+      // Map backend phase strings to frontend InterviewPhase
+      switch (backendPhase) {
+        case "speaking-question":
+          setPhase("speaking-question");
+          if (question) setCurrentQuestion(question);
+          break;
+        case "settling":
+          setPhase("settling");
+          break;
+        case "recording-answer":
+          setPhase("recording-answer");
+          break;
+        case "processing":
+          setPhase("processing");
+          break;
+        case "complete":
+          setPhase("showing-result");
+          break;
+        case "idle":
+          setPhase("ready");
+          break;
+        case "error":
+          setPhase("error");
+          if (question) setError(question);
+          break;
       }
-    } catch (e) {
-      setError(String(e));
-      setPhase("error");
-    }
+    });
+
+    return () => { unlisten.then((fn) => fn()); };
   }, []);
 
-  // Check tools on mount — inline async to satisfy lint rule
+  // Check tools on mount
   useEffect(() => {
     let cancelled = false;
 
@@ -117,11 +149,13 @@ export default function InterviewPage() {
             .map((i) => i.message)
             .join(", ");
           setError(`Missing tools: ${missing}`);
+          setRetryTarget({ kind: "readiness" });
           setPhase("error");
         }
       } catch (e) {
         if (cancelled) return;
         setError(String(e));
+        setRetryTarget({ kind: "readiness" });
         setPhase("error");
       }
     }
@@ -146,26 +180,36 @@ export default function InterviewPage() {
             ? result.errors.join("; ")
             : "Device check failed"
         );
+        setRetryTarget({ kind: "device-check" });
       }
     } catch (e) {
       setPhase("error");
       setError(String(e));
+      setRetryTarget({ kind: "device-check" });
     }
   }, []);
 
-  // Start interview round
+  // Start interview round — let backend phase events drive the UI
   const handleStartRound = useCallback(async () => {
     if (currentRound >= QUESTIONS.length) {
+      // All rounds done — finalize session on the backend
+      try {
+        await invoke("complete_session", {
+          sessionId,
+          totalRounds: currentRound,
+        });
+      } catch (e) {
+        console.error("complete_session failed:", e);
+      }
       setPhase("showing-result");
       return;
     }
 
     const question = QUESTIONS[currentRound];
     setCurrentQuestion(question);
-    setPhase("speaking-question");
+    setRetryTarget(null);
 
     try {
-      // Round ID is unique per round; session ID is stable across the interview
       const roundId = crypto.randomUUID();
       const result = await invoke<InterviewRoundResult>("run_interview_round", {
         question,
@@ -183,9 +227,69 @@ export default function InterviewPage() {
       } else {
         setPhase("error");
         setError(String(e));
+        setRetryTarget({ kind: "round", question });
       }
     }
   }, [currentRound, sessionId]);
+
+  // Retry handler — only redoes the failed operation
+  const handleRetry = useCallback(async () => {
+    if (!retryTarget) return;
+
+    setError(null);
+    setRetryTarget(null);
+
+    switch (retryTarget.kind) {
+      case "readiness": {
+        // Re-run tools check
+        try {
+          const config = await invoke<AppConfig>("get_app_config");
+          if (config.readiness.ready) {
+            setToolsStatus({ piper: true, whisper: true, model: true });
+            setPhase("device-check");
+          } else {
+            const missing = config.readiness.issues
+              .map((i) => i.message)
+              .join(", ");
+            setError(`Missing tools: ${missing}`);
+            setRetryTarget({ kind: "readiness" });
+            setPhase("error");
+          }
+        } catch (e) {
+          setError(String(e));
+          setRetryTarget({ kind: "readiness" });
+          setPhase("error");
+        }
+        break;
+      }
+      case "device-check": {
+        // Re-run device check only
+        await handleDeviceCheck();
+        break;
+      }
+      case "round": {
+        // Re-run the failed round via retry command
+        try {
+          const result = await invoke<InterviewRoundResult>(
+            "retry_interview_round",
+            {
+              question: retryTarget.question,
+              sessionId,
+              roundIndex: currentRound,
+            }
+          );
+          setRoundResults((prev) => [...prev, result]);
+          setCurrentRound((prev) => prev + 1);
+          setPhase("showing-result");
+        } catch (e) {
+          setError(String(e));
+          setRetryTarget({ kind: "round", question: retryTarget.question });
+          setPhase("error");
+        }
+        break;
+      }
+    }
+  }, [retryTarget, currentRound, sessionId, handleDeviceCheck]);
 
   // Stop current round
   const handleStop = useCallback(async () => {
@@ -394,12 +498,14 @@ export default function InterviewPage() {
           <div className="w-full max-w-md p-4 bg-red-50 border border-red-200 rounded text-red-700 text-sm">
             <p className="font-medium mb-1">Error</p>
             <p>{error}</p>
-            <button
-              onClick={checkTools}
-              className="mt-3 px-3 py-1 bg-red-600 text-white rounded text-xs hover:bg-red-700"
-            >
-              Retry
-            </button>
+            {retryTarget && (
+              <button
+                onClick={handleRetry}
+                className="mt-3 px-3 py-1 bg-red-600 text-white rounded text-xs hover:bg-red-700"
+              >
+                Retry
+              </button>
+            )}
           </div>
         )}
 
