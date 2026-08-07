@@ -3,6 +3,7 @@ pub mod db;
 pub mod interview;
 pub mod paths;
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
 use tokio::sync::{mpsc, Mutex};
@@ -43,6 +44,23 @@ async fn acquire_recording(
 async fn clear_active_recording(state: &RecordingState) {
     let mut guard = state.handle.lock().await;
     *guard = None;
+}
+
+/// Scope guard that clears RecordingState when dropped.
+/// Guarantees cleanup on all exit paths: success, error, panic, cancel, timeout.
+struct RecordingGuard {
+    state: Arc<RecordingState>,
+}
+
+impl Drop for RecordingGuard {
+    fn drop(&mut self) {
+        let state = self.state.clone();
+        // Spawn the async clear on the runtime; this runs even on panic.
+        // clone() ensures the Arc keeps the state alive past the guard's lifetime.
+        tokio::runtime::Handle::current().spawn(async move {
+            clear_active_recording(&state).await;
+        });
+    }
 }
 
 #[tauri::command]
@@ -169,6 +187,8 @@ async fn generate_tts(
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
+    // The inner generate_tts function owns process-level timeout enforcement
+    // (kill, wait/reap, cleanup). This outer timeout is only defense-in-depth.
     let tts_timeout = std::time::Duration::from_secs(30);
     tokio::time::timeout(
         tts_timeout,
@@ -236,6 +256,13 @@ async fn run_interview_round(
         stop: stop_flag.clone(),
     };
     acquire_recording(&state, recording_handle).await?;
+
+    // Safety-net guard: clears RecordingState on any early return, panic, or
+    // cancellation. Explicit clear_active_recording call at normal exit is
+    // still needed to avoid a redundant tokio::spawn.
+    let _recording_guard = RecordingGuard {
+        state: state.inner().clone(),
+    };
 
     let paths_clone = paths.paths.clone();
     let stop_clone = stop_flag.clone();
@@ -307,11 +334,64 @@ async fn run_interview_round(
         .await
     });
 
-    let join_result = worker.await;
+    // Full-round deadline + cooperative shutdown + abort fallback
+    const ROUND_TIMEOUT_SECS: u64 = 300;
+    const GRACE_SECS: u64 = 5;
+
+    let deadline =
+        tokio::time::Instant::now() + tokio::time::Duration::from_secs(ROUND_TIMEOUT_SECS);
+
+    let mut worker_future = std::pin::pin!(worker);
+    let mut timed_out = false;
+    tokio::select! {
+        _ = &mut worker_future => { /* normal completion */ }
+        _ = tokio::time::sleep_until(deadline) => {
+            timed_out = true;
+
+            // Deadline hit — signal cancellation
+            stop_flag.store(true, Ordering::SeqCst);
+            let _ = app.emit(
+                "interview-phase",
+                PhaseEventPayload {
+                    phase: "error".to_string(),
+                    question: Some(format!("Round timed out after {}s", ROUND_TIMEOUT_SECS)),
+                    duration_ms: None,
+                },
+            );
+
+            // Grace period: let workers observe stop_flag and exit cleanly
+            tokio::time::sleep(tokio::time::Duration::from_secs(GRACE_SECS)).await;
+
+            // Abort if still alive
+            worker_future.abort();
+            // Brief pause for abort to propagate
+            let _ = tokio::time::timeout(
+                tokio::time::Duration::from_secs(2),
+                std::future::pending::<()>(),
+            )
+            .await;
+
+            // Clean up temp files
+            let temp_dir = paths.paths.temp_dir.join(session_id.hyphenated().to_string());
+            let _ = std::fs::remove_dir_all(temp_dir);
+        }
+    }
+
     phase_relay.abort();
     clear_active_recording(&state).await;
 
-    let result = join_result.map_err(|e| format!("Interview worker failed: {}", e))?;
+    if timed_out {
+        return Err(format!(
+            "Round timed out after {}s — processes terminated, partial artifacts cleaned up",
+            ROUND_TIMEOUT_SECS
+        ));
+    }
+
+    // Retrieve the join result — worker_future was polled by &mut in select, still usable
+    let result = match worker_future.await {
+        Ok(inner) => inner.map_err(|e| e.to_string()),
+        Err(join_err) => Err(format!("Interview worker failed: {}", join_err)),
+    };
 
     match result {
         Ok((metadata, transcription)) => {

@@ -96,6 +96,10 @@ export default function InterviewPage() {
   type SessionInitState = "idle" | "creating" | "ready" | "error";
   const [sessionInitState, setSessionInitState] = useState<SessionInitState>("idle");
 
+  // Ref-based guard to prevent concurrent double-starts while session creation
+  // or round startup is in progress. Must outlive async callbacks.
+  const isStartingRound = useRef(false);
+
   // Keep ref in sync
   useEffect(() => {
     sessionIdRef.current = sessionId;
@@ -202,39 +206,37 @@ export default function InterviewPage() {
       return;
     }
 
-    // Backend-authoritative session lifecycle: create session before first round
-    if (sessionInitState === "idle") {
-      setSessionInitState("creating");
-      try {
-        await invoke("create_session", {
-          sessionId,
-          candidateName: "Candidate",
-        });
-        setSessionInitState("ready");
-      } catch (e) {
-        setSessionInitState("error");
-        setPhase("error");
-        setError(`Failed to create session: ${String(e)}`);
-        return;
-      }
-    }
-
-    // Gate round execution on session being ready
-    if (sessionInitState !== "ready" && sessionInitState !== "creating") {
-      return;
-    }
-    if (sessionInitState === "creating") {
-      return; // Wait for session creation to complete
-    }
-
-    const question = QUESTIONS[currentRound];
-    setCurrentQuestion(question);
-    setRetryTarget(null);
-
-    // isFinal: true when this is the last round
-    const isFinal = currentRound === QUESTIONS.length - 1;
+    // Prevent concurrent double-starts while session creation or round startup
+    if (isStartingRound.current) return;
+    isStartingRound.current = true;
 
     try {
+      // Backend-authoritative session lifecycle: create session before first round.
+      // After create_session succeeds, proceed immediately into round execution —
+      // no stale-state gate. The ref guard above prevents re-entry.
+      if (sessionInitState === "idle") {
+        setSessionInitState("creating");
+        try {
+          await invoke("create_session", {
+            sessionId,
+            candidateName: "Candidate",
+          });
+          setSessionInitState("ready");
+        } catch (e) {
+          setSessionInitState("error");
+          setPhase("error");
+          setError(`Failed to create session: ${String(e)}`);
+          return;
+        }
+      }
+
+      const question = QUESTIONS[currentRound];
+      setCurrentQuestion(question);
+      setRetryTarget(null);
+
+      // isFinal: true when this is the last round
+      const isFinal = currentRound === QUESTIONS.length - 1;
+
       const roundId = crypto.randomUUID();
       const result = await invoke<InterviewRoundResult>("run_interview_round", {
         question,
@@ -253,8 +255,10 @@ export default function InterviewPage() {
       } else {
         setPhase("error");
         setError(String(e));
-        setRetryTarget({ kind: "round", question });
+        setRetryTarget({ kind: "round", question: QUESTIONS[currentRound] });
       }
+    } finally {
+      isStartingRound.current = false;
     }
   }, [currentRound, sessionId, sessionInitState]);
 

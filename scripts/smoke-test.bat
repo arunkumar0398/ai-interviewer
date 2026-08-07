@@ -1,18 +1,25 @@
 @echo off
 REM ============================================================
 REM  AI Interviewer - Production Smoke Test
-REM  Verifies: tools, build, source, tests, portable package
-REM  Run: scripts\smoke-test.bat
+REM  Usage:
+REM    scripts\smoke-test.bat                 - run all checks
+REM    scripts\smoke-test.bat --artifact-only  - portable package checks only
 REM ============================================================
 setlocal enabledelayedexpansion
 set PASS=0
 set FAIL=0
+set ARTIFACT_ONLY=0
+
+if "%~1"=="--artifact-only" set ARTIFACT_ONLY=1
 
 echo.
 echo ======================================
 echo  AI Interviewer - Production Smoke
+if %ARTIFACT_ONLY% equ 1 (echo  Mode: artifact-only)
 echo ======================================
 echo.
+
+if %ARTIFACT_ONLY% equ 1 goto :step8
 
 REM --- 1. Check tool binaries ---
 echo [1/8] Checking tool binaries...
@@ -35,11 +42,19 @@ if exist "%TOOLS_DIR%\piper\model.onnx" (
     set /a FAIL+=1
 )
 
-if exist "%TOOLS_DIR%\whisper\main.exe" (
+if exist "%TOOLS_DIR%\piper\model.onnx.json" (
+    echo   [PASS] Piper model config exists
+    set /a PASS+=1
+) else (
+    echo   [FAIL] Piper model config missing
+    set /a FAIL+=1
+)
+
+if exist "%TOOLS_DIR%\whisper\Release\main.exe" (
     echo   [PASS] Whisper binary exists
     set /a PASS+=1
 ) else (
-    echo   [FAIL] Whisper binary missing
+    echo   [FAIL] Whisper binary missing (expected at tools\whisper\Release\main.exe)
     set /a FAIL+=1
 )
 
@@ -85,7 +100,7 @@ echo [4/8] Checking key source files...
 
 set SRC=%~dp0..\src-tauri\src
 
-for %%F in (lib.rs main.rs db.rs paths.rs) do (
+for %%F in (lib.rs main.rs paths.rs) do (
     if exist "%SRC%\%%F" (
         echo   [PASS] src\%%F exists
         set /a PASS+=1
@@ -122,7 +137,7 @@ for %%F in (audio_roundtrip.rs database.rs interview_orchestrator.rs command_con
 )
 
 for %%F in (home.test.tsx interview.test.tsx candidate.test.tsx dashboard.test.tsx) do (
-    if exist "%~dp0tests\%%F" (
+    if exist "%~dp0..\tests\%%F" (
         echo   [PASS] tests\%%F exists
         set /a PASS+=1
     ) else (
@@ -228,6 +243,7 @@ if %ERRORLEVEL% equ 0 (
 
 popd
 
+:step8
 REM --- 8. Check portable package structure ---
 echo.
 echo [8/8] Checking portable package...
@@ -273,11 +289,69 @@ if exist "%PORTABLE_DIR%\THIRD_PARTY_NOTICES" (
     set /a FAIL+=1
 )
 
-if exist "%PORTABLE_DIR%\tools\licenses" (
-    echo   [PASS] Portable tools\licenses exists
+REM --- License files (from resources/licenses/) ---
+if exist "%PORTABLE_DIR%\licenses\Piper-LICENSE.txt" (
+    echo   [PASS] Piper-LICENSE.txt exists
     set /a PASS+=1
 ) else (
-    echo   [FAIL] tools\licenses missing
+    echo   [FAIL] Piper-LICENSE.txt missing
+    set /a FAIL+=1
+)
+
+if exist "%PORTABLE_DIR%\licenses\WhisperCPP-LICENSE.txt" (
+    echo   [PASS] WhisperCPP-LICENSE.txt exists
+    set /a PASS+=1
+) else (
+    echo   [FAIL] WhisperCPP-LICENSE.txt missing
+    set /a FAIL+=1
+)
+
+if exist "%PORTABLE_DIR%\licenses\model-attribution.txt" (
+    echo   [PASS] model-attribution.txt exists
+    set /a PASS+=1
+) else (
+    echo   [FAIL] model-attribution.txt missing
+    set /a FAIL+=1
+)
+
+REM --- Required tool binaries in portable ---
+if exist "%PORTABLE_DIR%\tools\piper\piper.exe" (
+    echo   [PASS] Portable piper.exe exists
+    set /a PASS+=1
+) else (
+    echo   [FAIL] Portable piper.exe missing
+    set /a FAIL+=1
+)
+
+if exist "%PORTABLE_DIR%\tools\piper\model.onnx" (
+    echo   [PASS] Portable piper model exists
+    set /a PASS+=1
+) else (
+    echo   [FAIL] Portable piper model missing
+    set /a FAIL+=1
+)
+
+if exist "%PORTABLE_DIR%\tools\piper\model.onnx.json" (
+    echo   [PASS] Portable piper model config exists
+    set /a PASS+=1
+) else (
+    echo   [FAIL] Portable piper model config missing
+    set /a FAIL+=1
+)
+
+if exist "%PORTABLE_DIR%\tools\whisper\Release\main.exe" (
+    echo   [PASS] Portable whisper binary exists
+    set /a PASS+=1
+) else (
+    echo   [FAIL] Portable whisper binary missing
+    set /a FAIL+=1
+)
+
+if exist "%PORTABLE_DIR%\tools\models\ggml-tiny.en.bin" (
+    echo   [PASS] Portable whisper model exists
+    set /a PASS+=1
+) else (
+    echo   [FAIL] Portable whisper model missing
     set /a FAIL+=1
 )
 

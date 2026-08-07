@@ -1,14 +1,23 @@
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 
 /// Piper outputs raw PCM at 22050 Hz mono — tied to the en_US-amy-medium model
 const PIPER_SAMPLE_RATE: u32 = 22050;
 
 /// Maximum time allowed for a single playback operation before it is cancelled.
 const PLAYBACK_TIMEOUT_SECS: u64 = 120;
+
+/// Process-level timeout for standalone TTS generation. The child process owner
+/// enforces this directly — any outer timeout is only defense-in-depth.
+const GENERATE_TTS_TIMEOUT_SECS: u64 = 25;
+
+/// Maximum chunk size for reading Piper stdout in bounded reads.
+const STDOUT_CHUNK_SIZE: usize = 8192;
 
 /// Playback events sent to the UI
 #[derive(Debug, Clone, serde::Serialize)]
@@ -134,7 +143,9 @@ pub async fn play_wav(
     .await?
 }
 
-/// Generate a TTS WAV file using Piper via stdin (correct invocation per spike findings)
+/// Generate a TTS WAV file using Piper via stdin.
+/// The child process owner enforces timeout, kill, wait/reap, and partial
+/// output cleanup directly. Any outer timeout is only defense-in-depth.
 pub async fn generate_tts(
     text: &str,
     output_path: PathBuf,
@@ -148,28 +159,107 @@ pub async fn generate_tts(
         .arg("--model")
         .arg(model)
         .arg("--output-raw")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
         .spawn()?;
 
     // Send text via stdin
     if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        stdin.write_all(text.as_bytes())?;
+        use tokio::io::AsyncWriteExt;
+        stdin.write_all(text.as_bytes()).await?;
         drop(stdin); // close stdin to signal EOF
     }
 
-    let output = child.wait_with_output()?;
+    // Read stdout with async bounded reads and deadline enforcement
+    let mut raw_pcm = Vec::new();
+    let mut stdout = child.stdout.take();
+    let deadline =
+        tokio::time::Instant::now() + tokio::time::Duration::from_secs(GENERATE_TTS_TIMEOUT_SECS);
+    let mut buf = vec![0u8; STDOUT_CHUNK_SIZE];
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Piper TTS failed: {}", stderr);
+    let read_result: anyhow::Result<()> = loop {
+        tokio::select! {
+            result = async {
+                if let Some(ref mut stdout) = stdout {
+                    stdout.read(&mut buf).await
+                } else {
+                    Ok(0)
+                }
+            } => {
+                match result {
+                    Ok(0) => break Ok(()), // EOF
+                    Ok(n) => raw_pcm.extend_from_slice(&buf[..n]),
+                    Err(e) => break Err(anyhow::anyhow!("Piper stdout read error: {}", e)),
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                // Cleanup partial output
+                let _ = std::fs::remove_file(&output_path);
+                anyhow::bail!(
+                    "TTS generation timed out after {}s — process killed",
+                    GENERATE_TTS_TIMEOUT_SECS
+                );
+            }
+        }
+    };
+
+    if let Err(e) = read_result {
+        let _ = std::fs::remove_file(&output_path);
+        return Err(e);
+    }
+
+    // Wait for process to finish — with deadline
+    let wait_result = timeout(
+        tokio::time::Duration::from_secs(GENERATE_TTS_TIMEOUT_SECS),
+        child.wait(),
+    )
+    .await;
+
+    match wait_result {
+        Ok(Ok(status)) => {
+            if !status.success() {
+                // Read stderr
+                let stderr_msg = child
+                    .stderr
+                    .take()
+                    .map(|mut s| {
+                        let mut buf = String::new();
+                        tokio::runtime::Handle::current().block_on(async {
+                            let _ = s.read_to_string(&mut buf).await;
+                        });
+                        buf
+                    })
+                    .unwrap_or_default();
+                let _ = std::fs::remove_file(&output_path);
+                anyhow::bail!(
+                    "Piper TTS failed (exit {}): {}",
+                    status.code().unwrap_or(-1),
+                    stderr_msg
+                );
+            }
+        }
+        Ok(Err(e)) => {
+            let _ = std::fs::remove_file(&output_path);
+            anyhow::bail!("TTS process wait error: {}", e);
+        }
+        Err(_) => {
+            // Timeout waiting for child to exit — force kill
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = std::fs::remove_file(&output_path);
+            anyhow::bail!(
+                "TTS generation timed out after {}s — process killed",
+                GENERATE_TTS_TIMEOUT_SECS
+            );
+        }
     }
 
     // Piper outputs raw PCM (16-bit signed, mono, PIPER_SAMPLE_RATE Hz).
     // Wrap it in a proper WAV file using hound.
-    let raw_pcm = output.stdout;
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate: PIPER_SAMPLE_RATE,

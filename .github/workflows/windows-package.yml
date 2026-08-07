@@ -78,14 +78,16 @@ jobs:
           Copy-Item -Path "README.md" -Destination "portable/"
           Copy-Item -Path "resources/tool-manifest.json" -Destination "portable/"
           Copy-Item -Path "THIRD_PARTY_NOTICES" -Destination "portable/"
-          # Create tools/licenses directory in portable package
-          New-Item -ItemType Directory -Path "portable/tools/licenses" -Force | Out-Null
-          Copy-Item -Path "portable/tools/licenses/README.md" -Destination "portable/tools/licenses/" -ErrorAction SilentlyContinue
-          Copy-Item -Path "portable/tools/licenses/MIT.txt" -Destination "portable/tools/licenses/" -ErrorAction SilentlyContinue
-          Copy-Item -Path "portable/tools/licenses/Apache-2.0.txt" -Destination "portable/tools/licenses/" -ErrorAction SilentlyContinue
-          Copy-Item -Path "portable/tools/licenses/MIT-Apache-2.0.txt" -Destination "portable/tools/licenses/" -ErrorAction SilentlyContinue
+          # Stage license files from resources/licenses/ to portable/licenses/
+          New-Item -ItemType Directory -Path "portable/licenses" -Force | Out-Null
+          Copy-Item -Path "resources/licenses/Piper-LICENSE.txt" -Destination "portable/licenses/"
+          Copy-Item -Path "resources/licenses/WhisperCPP-LICENSE.txt" -Destination "portable/licenses/"
+          Copy-Item -Path "resources/licenses/model-attribution.txt" -Destination "portable/licenses/"
           Compress-Archive -Path "portable/*" -DestinationPath $zipName
           echo "PORTABLE_ZIP=$zipName" >> $env:GITHUB_ENV
+
+      - name: Artifact smoke test
+        run: scripts\smoke-test.bat --artifact-only
 
       - name: Validate staged portable artifact
         run: |
@@ -110,9 +112,10 @@ jobs:
           if ($entries -notcontains "tool-manifest.json") { $missing += "tool-manifest.json" }
           if ($entries -notcontains "README.md") { $missing += "README.md" }
           if ($entries -notcontains "THIRD_PARTY_NOTICES") { $missing += "THIRD_PARTY_NOTICES" }
-          # Check for tools/licenses directory with at least one license file
-          $licenseFiles = Get-ChildItem -Path $extractDir -Recurse -File | Where-Object { $_.FullName -match "tools\\licenses\\.*\.txt$" }
-          if (-not $licenseFiles) { $missing += "tools/licenses/*.txt" }
+          # Validate each required license file individually
+          if ($entries -notcontains "Piper-LICENSE.txt") { $missing += "licenses/Piper-LICENSE.txt" }
+          if ($entries -notcontains "WhisperCPP-LICENSE.txt") { $missing += "licenses/WhisperCPP-LICENSE.txt" }
+          if ($entries -notcontains "model-attribution.txt") { $missing += "licenses/model-attribution.txt" }
           Remove-Item -Path $extractDir -Recurse -Force -ErrorAction SilentlyContinue
           if ($missing.Count -gt 0) {
             Write-Error "Portable ZIP missing: $($missing -join ', ')"

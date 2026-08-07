@@ -1,0 +1,20 @@
+# AI Model Attribution
+
+## Text-to-Speech: en_US-amy-medium
+
+- **Source**: [Piper TTS](https://github.com/rhasspy/piper)
+- **Version**: 2023.11.14-2 (see Piper-LICENSE.txt)
+- **License**: MIT — Copyright (c) 2022 Michael Hansen
+- **Model**: en_US-amy-medium
+- **HuggingFace**: rhasspy/piper-voices
+- **Description**: English (US) female voice, medium quality neural TTS model
+
+## Speech-to-Text: ggml-tiny.en
+
+- **Source**: [whisper.cpp](https://github.com/ggerganov/whisper.cpp)
+- **Version**: v1.5.4 (see WhisperCPP-LICENSE.txt)
+- **License**: MIT — Copyright (c) 2023 Georgi Gerganov
+- **Model**: ggml-tiny.en
+- **HuggingFace**: ggerganov/whisper.cpp
+- **Description**: English-only Whisper model, tiny variant, optimized for CPU inference via ggml format
+- **Original Paper**: Robust Speech Recognition via Large-Scale Weak Supervision (Radford et al., 2019)
