@@ -99,6 +99,7 @@ impl Database {
         if current_version < 2 {
             // Migrate v1 -> v2: add unique constraint on (session_id, round_index)
             // SQLite doesn't support ALTER TABLE ADD CONSTRAINT, so recreate rounds table.
+            // Deterministic tie-breaker: keep the row with the highest id per duplicate pair.
             conn.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS rounds_new (
@@ -118,12 +119,16 @@ impl Database {
                     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
                 );
 
-                INSERT OR REPLACE INTO rounds_new
+                INSERT INTO rounds_new
                     (id, session_id, round_index, question, transcription, audio_path,
                      sha256, duration_ms, sample_rate, channels, file_size_bytes, created_at)
                 SELECT id, session_id, round_index, question, transcription, audio_path,
                        sha256, duration_ms, sample_rate, channels, file_size_bytes, created_at
-                FROM rounds;
+                FROM rounds
+                WHERE id IN (
+                    SELECT MAX(r2.id) FROM rounds r2
+                    GROUP BY r2.session_id, r2.round_index
+                );
 
                 DROP TABLE rounds;
 
@@ -217,8 +222,8 @@ impl Database {
     }
 
     /// Insert a round and increment the session's total_rounds atomically.
-    /// Uses INSERT OR IGNORE to respect the UNIQUE(session_id, round_index)
-    /// constraint — duplicate rounds for the same slot are silently skipped.
+    /// Uses plain INSERT — UNIQUE(session_id, round_index) violation returns
+    /// a domain error so the caller can surface "Round N already exists".
     #[allow(clippy::too_many_arguments)]
     pub fn insert_round_with_session_update(
         &self,
@@ -236,8 +241,8 @@ impl Database {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
-            let inserted = conn.execute(
-                "INSERT OR IGNORE INTO rounds (session_id, round_index, question, transcription, audio_path, sha256, duration_ms, sample_rate, channels, file_size_bytes)
+            conn.execute(
+                "INSERT INTO rounds (session_id, round_index, question, transcription, audio_path, sha256, duration_ms, sample_rate, channels, file_size_bytes)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     session_id,
@@ -252,12 +257,10 @@ impl Database {
                     file_size_bytes,
                 ],
             )?;
-            if inserted > 0 {
-                conn.execute(
-                    "UPDATE sessions SET total_rounds = total_rounds + 1 WHERE id = ?1",
-                    params![session_id],
-                )?;
-            }
+            conn.execute(
+                "UPDATE sessions SET total_rounds = total_rounds + 1 WHERE id = ?1",
+                params![session_id],
+            )?;
             Ok::<_, rusqlite::Error>(conn.last_insert_rowid())
         })();
         match result {

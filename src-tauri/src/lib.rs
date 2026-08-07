@@ -327,7 +327,14 @@ async fn run_interview_round(
                     metadata.channels,
                     metadata.file_size_bytes,
                 )
-                .map_err(|e| format!("Failed to persist round: {}", e))?;
+                .map_err(|e| {
+                    let msg = e.to_string();
+                    if msg.contains("UNIQUE constraint failed") {
+                        format!("Round {} already exists for this session", round_index + 1)
+                    } else {
+                        format!("Failed to persist round: {}", e)
+                    }
+                })?;
 
                 // Backend-authoritative session completion: finalize immediately
                 // after the final round is persisted successfully.

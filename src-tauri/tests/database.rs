@@ -426,9 +426,9 @@ fn db_schema_version_set() {
     let _ = std::fs::remove_file(&db_path);
 }
 
-/// Test: Duplicate (session_id, round_index) is silently ignored via insert_round_with_session_update
+/// Test: Duplicate (session_id, round_index) returns an error (no longer silently ignored)
 #[test]
-fn db_duplicate_round_index_ignored() {
+fn db_duplicate_round_index_errors() {
     let db_path = std::env::temp_dir().join("test_dup_round.db");
     let _ = std::fs::remove_file(&db_path);
 
@@ -449,8 +449,8 @@ fn db_duplicate_round_index_ignored() {
     )
     .unwrap();
 
-    // Second insert with same (session_id, round_index) should be silently ignored
-    db.insert_round_with_session_update(
+    // Second insert with same (session_id, round_index) should fail with UNIQUE error
+    let result = db.insert_round_with_session_update(
         "dup-round-session",
         0,
         "Q1-retry",
@@ -461,11 +461,11 @@ fn db_duplicate_round_index_ignored() {
         16000,
         1,
         168044,
-    )
-    .unwrap();
+    );
+    assert!(result.is_err(), "Duplicate round_index should error");
 
     let rounds = db.get_rounds("dup-round-session").unwrap();
-    assert_eq!(rounds.len(), 1, "Duplicate round_index should be ignored");
+    assert_eq!(rounds.len(), 1, "Only original round should exist");
     assert_eq!(rounds[0].question, "Q1", "Original round should be kept");
 
     let _ = std::fs::remove_file(&db_path);
@@ -567,9 +567,9 @@ fn db_insert_round_with_session_update_rollback() {
         1
     );
 
-    // Duplicate round_index should be silently ignored (INSERT OR IGNORE),
-    // and total_rounds should NOT increase.
-    db.insert_round_with_session_update(
+    // Duplicate round_index should error (UNIQUE constraint), and total_rounds
+    // should NOT increase because the transaction rolls back.
+    let result = db.insert_round_with_session_update(
         "rollback-session",
         0,
         "Q1-dup",
@@ -580,15 +580,15 @@ fn db_insert_round_with_session_update_rollback() {
         16000,
         1,
         168044,
-    )
-    .unwrap();
+    );
+    assert!(result.is_err(), "Duplicate round_index should error");
     assert_eq!(
         db.get_session("rollback-session")
             .unwrap()
             .unwrap()
             .total_rounds,
         1,
-        "total_rounds should not increase for ignored duplicate"
+        "total_rounds should not increase for failed duplicate"
     );
 
     let _ = std::fs::remove_file(&db_path);
@@ -665,6 +665,101 @@ fn db_schema_v1_to_v2_migration() {
     assert_eq!(rounds.len(), 2);
     assert_eq!(rounds[0].question, "Q1");
     assert_eq!(rounds[1].question, "Q2");
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// Test: Migration from v1 with duplicate rounds keeps highest-id per (session_id, round_index)
+#[test]
+fn db_schema_v1_to_v2_migration_deterministic_tiebreak() {
+    let db_path = std::env::temp_dir().join("test_migration_v1_v2_tiebreak.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    // Create a v1 database with duplicate (session_id, round_index) rows
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA user_version=1;").unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                candidate_name TEXT NOT NULL DEFAULT '',
+                started_at TEXT NOT NULL DEFAULT (datetime('now')),
+                completed_at TEXT,
+                total_rounds INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE rounds (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                round_index INTEGER NOT NULL,
+                question TEXT NOT NULL,
+                transcription TEXT NOT NULL DEFAULT '',
+                audio_path TEXT NOT NULL DEFAULT '',
+                sha256 TEXT NOT NULL DEFAULT '',
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                sample_rate INTEGER NOT NULL DEFAULT 16000,
+                channels INTEGER NOT NULL DEFAULT 1,
+                file_size_bytes INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_rounds_session ON rounds(session_id);
+            ",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO sessions (id, candidate_name, total_rounds) VALUES ('s1', 'Alice', 3)",
+            [],
+        )
+        .unwrap();
+        // Insert 3 rows for round_index=0: ids 1, 2, 3 — keep id=3
+        conn.execute(
+            "INSERT INTO rounds (id, session_id, round_index, question, transcription) VALUES (1, 's1', 0, 'Q1-old', 'A1-old')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO rounds (id, session_id, round_index, question, transcription) VALUES (2, 's1', 0, 'Q1-mid', 'A1-mid')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO rounds (id, session_id, round_index, question, transcription) VALUES (3, 's1', 0, 'Q1-new', 'A1-new')",
+            [],
+        )
+        .unwrap();
+        // Insert 2 rows for round_index=1: ids 4, 5 — keep id=5
+        conn.execute(
+            "INSERT INTO rounds (id, session_id, round_index, question, transcription) VALUES (4, 's1', 1, 'Q2-old', 'A2-old')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO rounds (id, session_id, round_index, question, transcription) VALUES (5, 's1', 1, 'Q2-new', 'A2-new')",
+            [],
+        )
+        .unwrap();
+    }
+
+    // Open with the real Database::open — triggers migration v1 -> v2
+    let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
+
+    // Data should be preserved, highest-id rows kept
+    let rounds = db.get_rounds("s1").unwrap();
+    assert_eq!(
+        rounds.len(),
+        2,
+        "Should have 2 unique rounds after migration"
+    );
+    assert_eq!(
+        rounds[0].question, "Q1-new",
+        "Should keep highest-id row for round_index=0"
+    );
+    assert_eq!(
+        rounds[1].question, "Q2-new",
+        "Should keep highest-id row for round_index=1"
+    );
 
     let _ = std::fs::remove_file(&db_path);
 }
