@@ -49,6 +49,7 @@ fn sha256_file(path: &Path) -> anyhow::Result<String> {
 
 /// Orchestrate a half-duplex interview round.
 /// Returns (audio_metadata, transcription_text) on success.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_interview_round(
     question: &str,
     paths: &crate::paths::AppPaths,
@@ -57,12 +58,18 @@ pub async fn run_interview_round(
     event_tx: mpsc::Sender<CaptureEvent>,
     tts_event_tx: mpsc::Sender<TtsEvent>,
     stop_flag: Arc<AtomicBool>,
+    phase_tx: Option<mpsc::Sender<InterviewPhase>>,
 ) -> anyhow::Result<(AudioMetadata, String)> {
     let piper = PiperSupervisor::new(paths)?;
 
     // Phase 1: Speak the question
     let _ = tts_event_tx.try_send(TtsEvent::Speaking {
         text: question.to_string(),
+    });
+    let _ = phase_tx.as_ref().map(|tx| {
+        tx.try_send(InterviewPhase::SpeakingQuestion {
+            question: question.to_string(),
+        })
     });
 
     piper
@@ -75,6 +82,11 @@ pub async fn run_interview_round(
 
     // Phase 2: Settling period (1.5s) - let speaker output settle before recording
     let settle_ms = 1500u64;
+    let _ = phase_tx.as_ref().map(|tx| {
+        tx.try_send(InterviewPhase::Settling {
+            duration_ms: settle_ms,
+        })
+    });
     tokio::time::sleep(tokio::time::Duration::from_millis(settle_ms)).await;
 
     if stop_flag.load(Ordering::SeqCst) {
@@ -82,6 +94,10 @@ pub async fn run_interview_round(
     }
 
     // Phase 3: Record the answer — isolated to recordings/<session_id>/<round_id>.wav
+    let _ = phase_tx
+        .as_ref()
+        .map(|tx| tx.try_send(InterviewPhase::RecordingAnswer));
+
     let session_dir = paths.session_recordings_dir(session_id);
     std::fs::create_dir_all(&session_dir)?;
     let wav_path = session_dir.join(format!("{}.wav", uuid_to_path(&round_id)));
@@ -151,7 +167,15 @@ pub async fn run_interview_round(
     };
 
     // Phase 5: Transcribe with whisper — temp file isolated to temp/<session_id>/<round_id>.txt
+    let _ = phase_tx
+        .as_ref()
+        .map(|tx| tx.try_send(InterviewPhase::Processing));
+
     let transcription = transcribe_wav(paths, &wav_path, session_id, round_id).await?;
+
+    let _ = phase_tx
+        .as_ref()
+        .map(|tx| tx.try_send(InterviewPhase::Complete));
 
     Ok((metadata, transcription))
 }

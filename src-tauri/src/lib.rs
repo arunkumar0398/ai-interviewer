@@ -4,7 +4,7 @@ pub mod interview;
 pub mod paths;
 
 use std::sync::Arc;
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 use tokio::sync::{mpsc, Mutex};
 
 use paths::{get_app_config, resolve_app_paths, uuid_to_path, PathsState};
@@ -200,6 +200,14 @@ struct InterviewRoundResult {
     transcription: String,
 }
 
+/// Payload emitted to the frontend for interview phase transitions
+#[derive(serde::Serialize, Clone)]
+struct PhaseEventPayload {
+    phase: String,
+    question: Option<String>,
+    duration_ms: Option<u64>,
+}
+
 #[tauri::command]
 async fn run_interview_round(
     question: String,
@@ -207,9 +215,11 @@ async fn run_interview_round(
     round_id: uuid::Uuid,
     state: State<'_, Arc<RecordingState>>,
     paths: State<'_, PathsState>,
+    app: tauri::AppHandle,
 ) -> Result<InterviewRoundResult, String> {
     let (event_tx, _event_rx) = mpsc::channel(32);
     let (tts_event_tx, _tts_event_rx) = mpsc::channel(32);
+    let (phase_tx, mut phase_rx) = mpsc::channel(8);
 
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -224,6 +234,55 @@ async fn run_interview_round(
     let event_tx_clone = event_tx.clone();
     let tts_event_tx_clone = tts_event_tx.clone();
 
+    // Spawn phase event relay: forwards phase changes to Tauri event system
+    let app_clone = app.clone();
+    let phase_relay = tokio::spawn(async move {
+        while let Some(phase) = phase_rx.recv().await {
+            let payload = match &phase {
+                interview::orchestrator::InterviewPhase::SpeakingQuestion { question } => {
+                    PhaseEventPayload {
+                        phase: "speaking-question".to_string(),
+                        question: Some(question.clone()),
+                        duration_ms: None,
+                    }
+                }
+                interview::orchestrator::InterviewPhase::Settling { duration_ms } => {
+                    PhaseEventPayload {
+                        phase: "settling".to_string(),
+                        question: None,
+                        duration_ms: Some(*duration_ms),
+                    }
+                }
+                interview::orchestrator::InterviewPhase::RecordingAnswer => PhaseEventPayload {
+                    phase: "recording-answer".to_string(),
+                    question: None,
+                    duration_ms: None,
+                },
+                interview::orchestrator::InterviewPhase::Processing => PhaseEventPayload {
+                    phase: "processing".to_string(),
+                    question: None,
+                    duration_ms: None,
+                },
+                interview::orchestrator::InterviewPhase::Complete => PhaseEventPayload {
+                    phase: "complete".to_string(),
+                    question: None,
+                    duration_ms: None,
+                },
+                interview::orchestrator::InterviewPhase::Idle => PhaseEventPayload {
+                    phase: "idle".to_string(),
+                    question: None,
+                    duration_ms: None,
+                },
+                interview::orchestrator::InterviewPhase::Error { message } => PhaseEventPayload {
+                    phase: "error".to_string(),
+                    question: Some(message.clone()),
+                    duration_ms: None,
+                },
+            };
+            let _ = app_clone.emit("interview-phase", &payload);
+        }
+    });
+
     // Spawn worker; guaranteed cleanup on all paths
     let worker = tokio::spawn(async move {
         interview::orchestrator::run_interview_round(
@@ -234,11 +293,13 @@ async fn run_interview_round(
             event_tx_clone,
             tts_event_tx_clone,
             stop_clone,
+            Some(phase_tx),
         )
         .await
     });
 
     let join_result = worker.await;
+    phase_relay.abort();
     clear_active_recording(&state).await;
 
     let result = join_result.map_err(|e| format!("Interview worker failed: {}", e))?;
@@ -250,6 +311,23 @@ async fn run_interview_round(
         }),
         Err(e) => Err(e.to_string()),
     }
+}
+
+/// Retry a failed interview round. Generates a new round_id, so the old
+/// round (if partially written) is left in the DB as-is and the new one
+/// is inserted under a fresh UUID via the UNIQUE(session_id, round_index)
+/// constraint (INSERT OR IGNORE).
+#[tauri::command]
+async fn retry_interview_round(
+    question: String,
+    session_id: uuid::Uuid,
+    _round_index: i32,
+    state: State<'_, Arc<RecordingState>>,
+    paths: State<'_, PathsState>,
+    app: tauri::AppHandle,
+) -> Result<InterviewRoundResult, String> {
+    let new_round_id = uuid::Uuid::new_v4();
+    run_interview_round(question, session_id, new_round_id, state, paths, app).await
 }
 
 #[tauri::command]
@@ -382,6 +460,7 @@ pub fn run() {
             list_audio_devices,
             check_audio_devices,
             run_interview_round,
+            retry_interview_round,
             stop_interview_round,
             get_tools_dir,
             create_session,
