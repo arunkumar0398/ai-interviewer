@@ -1,8 +1,7 @@
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use tokio::sync::mpsc;
+use std::sync::{Arc, LazyLock};
+use tokio::sync::{mpsc, Semaphore};
 
 /// TTS events sent to the UI
 #[derive(Debug, Clone, serde::Serialize)]
@@ -12,6 +11,10 @@ pub enum TtsEvent {
     Error { message: String },
     ProcessCrashed { restarts: u32 },
 }
+
+/// Global semaphore that bounds concurrent Piper TTS processes to 1.
+/// Held for the duration of a `speak()` call.
+static TTS_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(1));
 
 /// Supervises a Piper TTS child process with restart and graceful shutdown.
 pub struct PiperSupervisor {
@@ -45,7 +48,9 @@ impl PiperSupervisor {
     }
 
     /// Speak text through Piper TTS. Blocks until finished or stop_flag is set.
+    /// Acquires the global TTS semaphore to ensure only one Piper runs at a time.
     /// Spawns a new Piper process per call (simple, reliable).
+    /// Kills the child process immediately when stop_flag is set.
     pub async fn speak(
         &self,
         text: &str,
@@ -55,6 +60,12 @@ impl PiperSupervisor {
         if text.trim().is_empty() {
             return Ok(());
         }
+
+        // Acquire TTS semaphore — only one Piper at a time
+        let _permit = TTS_SEMAPHORE
+            .acquire()
+            .await
+            .map_err(|_| anyhow::anyhow!("TTS semaphore closed"))?;
 
         let piper_bin = self.piper_bin.clone();
         let model_path = self.model_path.clone();
@@ -71,13 +82,13 @@ impl PiperSupervisor {
                 }
 
                 // Spawn Piper with stdin input (not --text flag)
-                let result = Command::new(&piper_bin)
+                let result = std::process::Command::new(&piper_bin)
                     .arg("--model")
                     .arg(&model_path)
                     .arg("--output-raw")
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
                     .spawn();
 
                 let mut child = match result {
@@ -108,6 +119,13 @@ impl PiperSupervisor {
                 let _ = event_tx.try_send(TtsEvent::Speaking { text: text.clone() });
 
                 let _play_result = play_raw_pcm(stdout, sample_rate, stop_flag.clone());
+
+                // Kill the child process if stop was requested during playback
+                if stop_flag.load(Ordering::SeqCst) {
+                    let _ = child.kill();
+                    let _ = child.wait(); // reap the process
+                    return Ok(());
+                }
 
                 // Wait for process to finish
                 match child.wait() {
