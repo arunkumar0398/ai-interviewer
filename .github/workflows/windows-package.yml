@@ -94,18 +94,17 @@ jobs:
             exit 1
           }
           # Verify it contains expected entries
-          $entries = Expand-Archive -Path $zip -DestinationPath "$env:TEMP\validate-check" -PassThru
-          $names = $entries | Select-Object -ExpandProperty FullName
-          if ($names -notmatch "ai-interviewer\.exe") {
-            Write-Error "Portable ZIP missing ai-interviewer.exe"
-            exit 1
-          }
-          if ($names -notmatch "LICENSE") {
-            Write-Error "Portable ZIP missing LICENSE"
-            exit 1
-          }
-          if ($names -notmatch "tool-manifest\.json") {
-            Write-Error "Portable ZIP missing tool-manifest.json"
+          $extractDir = "$env:TEMP\validate-check-$(Get-Random)"
+          Expand-Archive -Path $zip -DestinationPath $extractDir -Force
+          $entries = Get-ChildItem -Path $extractDir -Recurse -File | Select-Object -ExpandProperty Name
+          $missing = @()
+          if ($entries -notcontains "ai-interviewer.exe") { $missing += "ai-interviewer.exe" }
+          if ($entries -notcontains "LICENSE") { $missing += "LICENSE" }
+          if ($entries -notcontains "tool-manifest.json") { $missing += "tool-manifest.json" }
+          if ($entries -notcontains "README.md") { $missing += "README.md" }
+          Remove-Item -Path $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+          if ($missing.Count -gt 0) {
+            Write-Error "Portable ZIP missing: $($missing -join ', ')"
             exit 1
           }
           Write-Host "Portable artifact validated"
