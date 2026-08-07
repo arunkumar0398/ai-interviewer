@@ -1,6 +1,6 @@
 use ai_interviewer_lib::paths::{
     resolve_piper_paths, resolve_whisper_model_path, validate_path_component, AppPaths,
-    ToolDirOptions, ToolDirectorySource,
+    ToolDirOptions, ToolDirectorySource, ToolDistributionMode,
 };
 use std::fs;
 use uuid::Uuid;
@@ -18,10 +18,11 @@ fn resolve_tool_dir_env_var_priority() {
 
     let opts = ToolDirOptions {
         env_override: Some(fake_tools.to_str().unwrap().to_string()),
+        resource_dir: None,
         allow_dev_fallback: false,
     };
 
-    let (resolved, source, portable) = ai_interviewer_lib::paths::resolve_tool_dir_with_options(
+    let (resolved, source, mode) = ai_interviewer_lib::paths::resolve_tool_dir_with_options(
         tmp.path().join("exe_dir").as_path(),
         &opts,
     );
@@ -33,7 +34,12 @@ fn resolve_tool_dir_env_var_priority() {
             value: fake_tools.to_str().unwrap().to_string()
         }
     );
-    assert!(!portable);
+    assert_eq!(
+        mode,
+        ToolDistributionMode::EnvVar {
+            value: fake_tools.to_str().unwrap().to_string()
+        }
+    );
 }
 
 /// Test: env override pointing to non-existent dir is ignored
@@ -44,17 +50,18 @@ fn resolve_tool_dir_env_var_nonexistent_falls_through() {
 
     let opts = ToolDirOptions {
         env_override: Some(fake_env.to_str().unwrap().to_string()),
+        resource_dir: None,
         allow_dev_fallback: false,
     };
 
     let exe_dir = tmp.path().join("exe_dir");
     fs::create_dir_all(&exe_dir).unwrap();
 
-    let (_resolved, _source, _portable) =
+    let (_resolved, _source, mode) =
         ai_interviewer_lib::paths::resolve_tool_dir_with_options(&exe_dir, &opts);
 
     // Should fall through to Unresolved (no tools dir exists next to exe either)
-    // The resolved path should be exe_dir/tools
+    assert_eq!(mode, ToolDistributionMode::Unresolved);
 }
 
 /// Test: portable layout detected when tools dir is next to exe
@@ -67,6 +74,7 @@ fn resolve_tool_dir_portable_layout() {
 
     let opts = ToolDirOptions {
         env_override: None,
+        resource_dir: None,
         allow_dev_fallback: false,
     };
 
@@ -74,12 +82,12 @@ fn resolve_tool_dir_portable_layout() {
     let resources_dir = exe_dir.join("resources").join("tools");
     fs::remove_dir_all(&resources_dir).ok();
 
-    let (resolved, source, portable) =
+    let (resolved, source, mode) =
         ai_interviewer_lib::paths::resolve_tool_dir_with_options(&exe_dir, &opts);
 
     assert_eq!(resolved, tools_dir);
     assert!(matches!(source, ToolDirectorySource::Portable { .. }));
-    assert!(portable);
+    assert_eq!(mode, ToolDistributionMode::Portable);
 }
 
 /// Test: Unresolved when no tools dir exists anywhere
@@ -91,6 +99,7 @@ fn resolve_tool_dir_unresolved() {
 
     let opts = ToolDirOptions {
         env_override: None,
+        resource_dir: None,
         allow_dev_fallback: false,
     };
 
@@ -98,12 +107,12 @@ fn resolve_tool_dir_unresolved() {
     let resources_dir = exe_dir.join("resources").join("tools");
     fs::remove_dir_all(&resources_dir).ok();
 
-    let (resolved, source, portable) =
+    let (resolved, source, mode) =
         ai_interviewer_lib::paths::resolve_tool_dir_with_options(&exe_dir, &opts);
 
     assert!(resolved.ends_with("tools"));
     assert_eq!(source, ToolDirectorySource::Unresolved);
-    assert!(!portable);
+    assert_eq!(mode, ToolDistributionMode::Unresolved);
 }
 
 // ---------------------------------------------------------------------------

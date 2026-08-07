@@ -97,11 +97,28 @@ pub struct PathResolutionInput {
     pub resource_dir: Option<PathBuf>,
 }
 
+/// Describes the distribution mode for external tools.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ToolDistributionMode {
+    /// Tools bundled via Tauri resource bundling.
+    Bundled,
+    /// Portable layout — tools live next to the executable.
+    Portable,
+    /// Resolved from the `AI_INTERVIEWER_TOOLS` env var.
+    EnvVar { value: String },
+    /// Dev fallback — only in debug builds.
+    DevFallback,
+    /// Could not resolve a tools directory.
+    Unresolved,
+}
+
 /// Options for testable tool directory resolution. Replaces `set_var` in tests.
 #[derive(Debug, Clone, Default)]
 pub struct ToolDirOptions {
     /// Override the env var value. `None` means do not check env var.
     pub env_override: Option<String>,
+    /// Tauri resource directory (from `resource_dir()`).
+    pub resource_dir: Option<PathBuf>,
     /// Whether to allow the dev fallback (default: false in tests).
     pub allow_dev_fallback: bool,
 }
@@ -172,13 +189,17 @@ impl AppPaths {
 
     /// Resolve paths from injected inputs (testable without env vars).
     pub fn resolve_from_input(input: PathResolutionInput) -> Result<Self, DatabasePathError> {
-        let (tool_dir, tool_directory_source, is_portable) = resolve_tool_dir(&input.exe_dir);
-
-        let data_dir = if is_portable {
-            input.exe_dir.join("data")
-        } else {
-            input.app_data_dir.clone()
+        let options = ToolDirOptions {
+            env_override: None,
+            resource_dir: input.resource_dir.clone(),
+            allow_dev_fallback: true,
         };
+        let (tool_dir, tool_directory_source, distribution_mode) =
+            resolve_tool_dir_with_options(&input.exe_dir, &options);
+        let is_portable = distribution_mode == ToolDistributionMode::Portable;
+
+        // Persistent data ALWAYS goes to app_data_dir — never exe_dir/data.
+        let data_dir = input.app_data_dir.clone();
 
         let recordings_dir = data_dir.join("recordings");
         let tts_dir = data_dir.join("tts");
@@ -197,15 +218,23 @@ impl AppPaths {
     }
 
     /// Canonical constructor used at application startup.
+    /// Uses `app_data_dir` (LOCALAPPDATA) for persistent storage — never
+    /// `exe_dir/data`, even in portable mode.
     pub fn resolve() -> Result<Self, DatabasePathError> {
         let exe_dir = env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| PathBuf::from("."));
 
-        let (tool_dir, tool_directory_source, is_portable) = resolve_tool_dir(&exe_dir);
+        let (tool_dir, tool_directory_source, distribution_mode) = resolve_tool_dir(&exe_dir);
+        let is_portable = distribution_mode == ToolDistributionMode::Portable;
 
-        let data_dir = compute_data_dir(&exe_dir, is_portable);
+        // Persistent data always uses LOCALAPPDATA — never exe_dir/data.
+        let data_dir = if let Ok(local) = env::var("LOCALAPPDATA") {
+            PathBuf::from(local).join("ai-interviewer")
+        } else {
+            exe_dir.join("data")
+        };
         let recordings_dir = data_dir.join("recordings");
         let tts_dir = data_dir.join("tts");
         let temp_dir = data_dir.join("temp");
@@ -315,65 +344,18 @@ impl AppPaths {
 // audio spike binary without going through AppPaths).
 // ---------------------------------------------------------------------------
 
-/// Determine the tools directory and how it was found.
+/// Resolve the tool directory from injected options.  This is the single
+/// canonical resolver — all callers should use this function.
 ///
 /// Resolution order:
-/// 1. `AI_INTERVIEWER_TOOLS` env var
-/// 2. Tauri bundled resources (production)
-/// 3. Portable layout next to the exe
-/// 4. Dev fallback (debug builds only)
-pub fn resolve_tool_dir(exe_dir: &Path) -> (PathBuf, ToolDirectorySource, bool) {
-    // 1. Explicit env var
-    if let Ok(val) = env::var("AI_INTERVIEWER_TOOLS") {
-        let p = PathBuf::from(&val);
-        if p.exists() {
-            return (p, ToolDirectorySource::EnvVar { value: val }, false);
-        }
-    }
-
-    // 2. Tauri bundled resources — on Windows the bundle root sits one level
-    //    above the exe directory.
-    let bundled = exe_dir.join("resources").join("tools");
-    if bundled.exists() {
-        return (bundled, ToolDirectorySource::Bundled, false);
-    }
-
-    // 3. Portable layout next to the exe
-    let portable = exe_dir.join("tools");
-    if portable.exists() {
-        return (
-            portable.clone(),
-            ToolDirectorySource::Portable {
-                exe_dir: exe_dir.display().to_string(),
-            },
-            true,
-        );
-    }
-
-    // 4. Dev fallback — only in debug builds, resolves relative to workspace
-    #[cfg(debug_assertions)]
-    {
-        let dev = dev_tools_dir();
-        if dev.exists() {
-            return (dev, ToolDirectorySource::DevFallback, false);
-        }
-    }
-
-    // Nothing found — return the exe_dir/tools path as a best-effort default
-    // so the caller gets a valid PathBuf while readiness flags the issue.
-    (
-        exe_dir.join("tools"),
-        ToolDirectorySource::Unresolved,
-        false,
-    )
-}
-
-/// Testable version of `resolve_tool_dir` that accepts injected options
-/// instead of reading from the environment.
+/// 1. `AI_INTERVIEWER_TOOLS` env var (or `options.env_override`)
+/// 2. Tauri bundled resources (`options.resource_dir` → `tools/`)
+/// 3. Portable layout next to the exe (`exe_dir/tools/`)
+/// 4. Dev fallback (debug builds only, when `options.allow_dev_fallback`)
 pub fn resolve_tool_dir_with_options(
     exe_dir: &Path,
     options: &ToolDirOptions,
-) -> (PathBuf, ToolDirectorySource, bool) {
+) -> (PathBuf, ToolDirectorySource, ToolDistributionMode) {
     // 1. Explicit env override
     if let Some(ref val) = options.env_override {
         let p = PathBuf::from(val);
@@ -381,26 +363,33 @@ pub fn resolve_tool_dir_with_options(
             return (
                 p.clone(),
                 ToolDirectorySource::EnvVar { value: val.clone() },
-                false,
+                ToolDistributionMode::EnvVar { value: val.clone() },
             );
         }
     }
 
-    // 2. Tauri bundled resources
-    let bundled = exe_dir.join("resources").join("tools");
-    if bundled.exists() {
-        return (bundled, ToolDirectorySource::Bundled, false);
+    // 2. Tauri bundled resources — only when an explicit resource_dir is
+    //    provided (from Tauri's app.path().resource_dir()).
+    if let Some(ref res_dir) = options.resource_dir {
+        let bundled = res_dir.join("tools");
+        if bundled.exists() {
+            return (
+                bundled,
+                ToolDirectorySource::Bundled,
+                ToolDistributionMode::Bundled,
+            );
+        }
     }
 
     // 3. Portable layout next to the exe
     let portable = exe_dir.join("tools");
     if portable.exists() {
         return (
-            portable.clone(),
+            portable,
             ToolDirectorySource::Portable {
                 exe_dir: exe_dir.display().to_string(),
             },
-            true,
+            ToolDistributionMode::Portable,
         );
     }
 
@@ -410,7 +399,11 @@ pub fn resolve_tool_dir_with_options(
         {
             let dev = dev_tools_dir();
             if dev.exists() {
-                return (dev, ToolDirectorySource::DevFallback, false);
+                return (
+                    dev,
+                    ToolDirectorySource::DevFallback,
+                    ToolDistributionMode::DevFallback,
+                );
             }
         }
     }
@@ -418,22 +411,19 @@ pub fn resolve_tool_dir_with_options(
     (
         exe_dir.join("tools"),
         ToolDirectorySource::Unresolved,
-        false,
+        ToolDistributionMode::Unresolved,
     )
 }
 
-/// Canonical data directory: `data/` subdirectory (portable) or %LOCALAPPDATA%.
-///
-/// In portable mode, user data lives in `exe_dir/data/` so that tool binaries
-/// (`exe_dir/tools/`) can be replaced without risking user data.
-fn compute_data_dir(exe_dir: &Path, is_portable: bool) -> PathBuf {
-    if is_portable {
-        return exe_dir.join("data");
-    }
-    if let Ok(local) = env::var("LOCALAPPDATA") {
-        return PathBuf::from(local).join("ai-interviewer");
-    }
-    exe_dir.join("data")
+/// Resolve the tool directory using environment variables and exe path.
+/// Prefer `resolve_tool_dir_with_options` for testable code.
+pub fn resolve_tool_dir(exe_dir: &Path) -> (PathBuf, ToolDirectorySource, ToolDistributionMode) {
+    let options = ToolDirOptions {
+        env_override: None,
+        resource_dir: None,
+        allow_dev_fallback: true,
+    };
+    resolve_tool_dir_with_options(exe_dir, &options)
 }
 
 /// Resolve the database file path.  Prefers `interviews.db` (canonical).
@@ -638,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn portable_data_dir_is_subdirectory_of_exe_dir() {
+    fn portable_detection_via_tool_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let exe_dir = tmp.path();
         // Simulate portable layout: exe_dir/tools exists
@@ -647,19 +637,25 @@ mod tests {
 
         let opts = ToolDirOptions {
             env_override: None,
+            resource_dir: None,
             allow_dev_fallback: false,
         };
-        let (tool_dir, _, is_portable) = resolve_tool_dir_with_options(exe_dir, &opts);
-        assert!(is_portable);
+        let (tool_dir, _, mode) = resolve_tool_dir_with_options(exe_dir, &opts);
+        assert_eq!(mode, ToolDistributionMode::Portable);
         assert_eq!(tool_dir, tools_dir);
 
-        // data_dir should be exe_dir/data, not exe_dir itself
-        let data_dir = compute_data_dir(exe_dir, is_portable);
-        assert_eq!(data_dir, exe_dir.join("data"));
-        assert_eq!(
-            data_dir.join("recordings"),
-            exe_dir.join("data").join("recordings")
-        );
+        // Portable mode should be detected in AppPaths
+        let app_data = tmp.path().join("app_data");
+        fs::create_dir_all(&app_data).unwrap();
+        let input = PathResolutionInput {
+            exe_dir: exe_dir.to_path_buf(),
+            app_data_dir: app_data.clone(),
+            resource_dir: None,
+        };
+        let paths = AppPaths::resolve_from_input(input).unwrap();
+        assert!(paths.is_portable);
+        // Data dir should ALWAYS be app_data_dir, never exe_dir/data
+        assert_eq!(paths.recordings_dir, app_data.join("recordings"));
     }
 
     #[test]
