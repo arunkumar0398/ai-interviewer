@@ -49,8 +49,53 @@ fn sha256_file(path: &Path) -> anyhow::Result<String> {
 
 /// Orchestrate a half-duplex interview round.
 /// Returns (audio_metadata, transcription_text) on success.
+/// Full round is bounded by `ROUND_TIMEOUT_SECS` — if exceeded, all
+/// child processes are killed and temp files cleaned up.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_interview_round(
+    question: &str,
+    paths: &crate::paths::AppPaths,
+    session_id: Uuid,
+    round_id: Uuid,
+    event_tx: mpsc::Sender<CaptureEvent>,
+    tts_event_tx: mpsc::Sender<TtsEvent>,
+    stop_flag: Arc<AtomicBool>,
+    phase_tx: Option<mpsc::Sender<InterviewPhase>>,
+) -> anyhow::Result<(AudioMetadata, String)> {
+    const ROUND_TIMEOUT_SECS: u64 = 300; // 5 minutes max for an entire round
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(ROUND_TIMEOUT_SECS),
+        run_interview_round_inner(
+            question,
+            paths,
+            session_id,
+            round_id,
+            event_tx,
+            tts_event_tx,
+            stop_flag,
+            phase_tx,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            // Timeout — clean up temp files
+            let temp_dir = paths.temp_dir.join(session_id.hyphenated().to_string());
+            let _ = std::fs::remove_dir_all(temp_dir);
+            anyhow::bail!(
+                "Round timed out after {}s — partial artifacts cleaned up",
+                ROUND_TIMEOUT_SECS
+            );
+        }
+    }
+}
+
+/// Inner implementation of `run_interview_round` — separated so the outer
+/// function can wrap this in `tokio::time::timeout`.
+#[allow(clippy::too_many_arguments)]
+async fn run_interview_round_inner(
     question: &str,
     paths: &crate::paths::AppPaths,
     session_id: Uuid,
@@ -102,7 +147,6 @@ pub async fn run_interview_round(
     std::fs::create_dir_all(&session_dir)?;
     let wav_path = session_dir.join(format!("{}.wav", uuid_to_path(&round_id)));
 
-    let _record_stop = stop_flag.clone();
     let record_event_tx = event_tx.clone();
 
     // Use a separate stop flag for recording (auto-stop after 60s or silence)
@@ -180,6 +224,11 @@ pub async fn run_interview_round(
     Ok((metadata, transcription))
 }
 
+/// Process-level timeout for whisper.cpp transcription.
+/// Spawns the child, polls with a deadline, kills on timeout, and cleans up
+/// temp files — never lets `Command::new().output()` block indefinitely.
+const WHISPER_TIMEOUT_SECS: u64 = 120;
+
 /// Transcribe a WAV file using whisper.cpp — temp output isolated to temp/<session_id>/<round_id>.txt
 async fn transcribe_wav(
     paths: &crate::paths::AppPaths,
@@ -187,6 +236,8 @@ async fn transcribe_wav(
     session_id: Uuid,
     round_id: Uuid,
 ) -> anyhow::Result<String> {
+    use std::process::Stdio;
+
     let tools = crate::paths::resolve_tools(&paths.tool_dir);
     let whisper_bin = tools
         .whisper_bin
@@ -202,37 +253,69 @@ async fn transcribe_wav(
         anyhow::bail!("Whisper model not found at {}", model_path.display());
     }
 
-    // Clone only what's needed for the blocking task
-    let whisper_bin = whisper_bin.clone();
-    let model_path = model_path.clone();
-    let wav_path = wav_path.to_path_buf();
     let output_dir = paths.temp_dir.join(session_id.hyphenated().to_string());
     std::fs::create_dir_all(&output_dir)?;
-    let stem_clone = uuid_to_path(&round_id);
+    let stem = uuid_to_path(&round_id);
+    let txt_path = output_dir.join(format!("{}.txt", stem));
 
-    tokio::task::spawn_blocking(move || {
-        let output = std::process::Command::new(&whisper_bin)
-            .arg("--model")
-            .arg(&model_path)
-            .arg("--file")
-            .arg(&wav_path)
-            .arg("--language")
-            .arg("en")
-            .arg("-otxt")
-            .arg("-of")
-            .arg(output_dir.join(&stem_clone))
-            .output()?;
+    // Spawn whisper as a child process (non-blocking)
+    let mut child = std::process::Command::new(&whisper_bin)
+        .arg("--model")
+        .arg(&model_path)
+        .arg("--file")
+        .arg(wav_path)
+        .arg("--language")
+        .arg("en")
+        .arg("-otxt")
+        .arg("-of")
+        .arg(output_dir.join(&stem))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("Whisper failed: {}", stderr);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(WHISPER_TIMEOUT_SECS);
+
+    // Poll with deadline — kill on timeout, wait for process to exit
+    loop {
+        match child.try_wait()? {
+            Some(status) => {
+                if !status.success() {
+                    // Read stderr from the pipe before returning
+                    let stderr = child
+                        .stderr
+                        .take()
+                        .map(|mut s| {
+                            let mut buf = String::new();
+                            let _ = std::io::Read::read_to_string(&mut s, &mut buf);
+                            buf
+                        })
+                        .unwrap_or_default();
+                    anyhow::bail!(
+                        "Whisper failed (exit {}): {}",
+                        status.code().unwrap_or(-1),
+                        stderr
+                    );
+                }
+                break;
+            }
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait(); // reap zombie
+                    let _ = std::fs::remove_file(&txt_path);
+                    anyhow::bail!(
+                        "Whisper timed out after {}s — process killed, temp cleaned",
+                        WHISPER_TIMEOUT_SECS
+                    );
+                }
+                // Avoid tight loop
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
         }
+    }
 
-        let txt_path = output_dir.join(format!("{}.txt", stem_clone));
-        let text = std::fs::read_to_string(&txt_path)?;
-        let _ = std::fs::remove_file(&txt_path); // cleanup
+    let text = std::fs::read_to_string(&txt_path)?;
+    let _ = std::fs::remove_file(&txt_path); // cleanup
 
-        Ok(text.trim().to_string())
-    })
-    .await?
+    Ok(text.trim().to_string())
 }

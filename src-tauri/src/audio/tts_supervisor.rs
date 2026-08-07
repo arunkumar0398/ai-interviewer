@@ -17,6 +17,8 @@ pub enum TtsEvent {
 static TTS_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(1));
 
 /// Supervises a Piper TTS child process with restart and graceful shutdown.
+const PIPER_TIMEOUT_SECS: u64 = 60;
+
 pub struct PiperSupervisor {
     piper_bin: PathBuf,
     model_path: PathBuf,
@@ -76,7 +78,7 @@ impl PiperSupervisor {
         tokio::task::spawn_blocking(move || {
             let mut restarts = 0u32;
 
-            loop {
+            'restart: loop {
                 if stop_flag.load(Ordering::SeqCst) {
                     return Ok(());
                 }
@@ -127,30 +129,55 @@ impl PiperSupervisor {
                     return Ok(());
                 }
 
-                // Wait for process to finish
-                match child.wait() {
-                    Ok(status) => {
-                        if status.success() {
-                            let _ = event_tx.try_send(TtsEvent::Finished { duration_ms: 0 });
-                            return Ok(());
+                // Wait for process to finish — deadline-based to enforce timeout
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(PIPER_TIMEOUT_SECS);
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            if status.success() {
+                                let _ = event_tx.try_send(TtsEvent::Finished { duration_ms: 0 });
+                                return Ok(());
+                            }
+                            // Non-zero exit — may need restart
+                            restarts += 1;
+                            if restarts >= max_restarts {
+                                let _ = event_tx.try_send(TtsEvent::Error {
+                                    message: format!(
+                                        "Piper crashed {} times, giving up",
+                                        max_restarts
+                                    ),
+                                });
+                                return Err(anyhow::anyhow!("Piper exceeded max restarts"));
+                            }
+                            let _ = event_tx.try_send(TtsEvent::ProcessCrashed { restarts });
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            continue 'restart;
                         }
-                        // Non-zero exit — may need restart
-                        restarts += 1;
-                        if restarts >= max_restarts {
+                        Ok(None) => {
+                            // Still running — check deadline
+                            if std::time::Instant::now() >= deadline {
+                                let _ = child.kill();
+                                let _ = child.wait(); // reap zombie
+                                let _ = event_tx.try_send(TtsEvent::Error {
+                                    message: format!(
+                                        "Piper timed out after {}s — process killed",
+                                        PIPER_TIMEOUT_SECS
+                                    ),
+                                });
+                                return Err(anyhow::anyhow!(
+                                    "Piper timed out after {}s",
+                                    PIPER_TIMEOUT_SECS
+                                ));
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                        Err(e) => {
                             let _ = event_tx.try_send(TtsEvent::Error {
-                                message: format!("Piper crashed {} times, giving up", max_restarts),
+                                message: format!("Piper wait error: {}", e),
                             });
-                            return Err(anyhow::anyhow!("Piper exceeded max restarts"));
+                            return Err(anyhow::anyhow!("Piper wait error: {}", e));
                         }
-                        let _ = event_tx.try_send(TtsEvent::ProcessCrashed { restarts });
-                        std::thread::sleep(std::time::Duration::from_millis(500));
-                        continue;
-                    }
-                    Err(e) => {
-                        let _ = event_tx.try_send(TtsEvent::Error {
-                            message: format!("Piper wait error: {}", e),
-                        });
-                        return Err(anyhow::anyhow!("Piper wait error: {}", e));
                     }
                 }
             }
