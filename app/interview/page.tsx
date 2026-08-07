@@ -171,6 +171,7 @@ export default function InterviewPage() {
         question,
         sessionId,
         roundId,
+        roundIndex: currentRound,
       });
 
       setRoundResults((prev) => [...prev, result]);

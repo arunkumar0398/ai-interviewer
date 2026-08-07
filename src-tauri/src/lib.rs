@@ -209,12 +209,15 @@ struct PhaseEventPayload {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn run_interview_round(
     question: String,
     session_id: uuid::Uuid,
     round_id: uuid::Uuid,
+    round_index: i32,
     state: State<'_, Arc<RecordingState>>,
     paths: State<'_, PathsState>,
+    db_state: State<'_, Arc<DbState>>,
     app: tauri::AppHandle,
 ) -> Result<InterviewRoundResult, String> {
     let (event_tx, _event_rx) = mpsc::channel(32);
@@ -284,9 +287,10 @@ async fn run_interview_round(
     });
 
     // Spawn worker; guaranteed cleanup on all paths
+    let question_clone = question.clone();
     let worker = tokio::spawn(async move {
         interview::orchestrator::run_interview_round(
-            &question,
+            &question_clone,
             &paths_clone,
             session_id,
             round_id,
@@ -305,10 +309,30 @@ async fn run_interview_round(
     let result = join_result.map_err(|e| format!("Interview worker failed: {}", e))?;
 
     match result {
-        Ok((metadata, transcription)) => Ok(InterviewRoundResult {
-            metadata,
-            transcription,
-        }),
+        Ok((metadata, transcription)) => {
+            // Persist round atomically: INSERT OR IGNORE + session total_rounds++
+            {
+                let guard = db_state.db.lock().await;
+                let db = guard.as_ref().ok_or("Database not initialized")?;
+                db.insert_round_with_session_update(
+                    &session_id.hyphenated().to_string(),
+                    round_index,
+                    &question,
+                    &transcription,
+                    &metadata.file_path,
+                    &metadata.sha256,
+                    metadata.duration_ms,
+                    metadata.sample_rate,
+                    metadata.channels,
+                    metadata.file_size_bytes,
+                )
+                .map_err(|e| format!("Failed to persist round: {}", e))?;
+            }
+            Ok(InterviewRoundResult {
+                metadata,
+                transcription,
+            })
+        }
         Err(e) => Err(e.to_string()),
     }
 }
@@ -321,13 +345,24 @@ async fn run_interview_round(
 async fn retry_interview_round(
     question: String,
     session_id: uuid::Uuid,
-    _round_index: i32,
+    round_index: i32,
     state: State<'_, Arc<RecordingState>>,
     paths: State<'_, PathsState>,
+    db_state: State<'_, Arc<DbState>>,
     app: tauri::AppHandle,
 ) -> Result<InterviewRoundResult, String> {
     let new_round_id = uuid::Uuid::new_v4();
-    run_interview_round(question, session_id, new_round_id, state, paths, app).await
+    run_interview_round(
+        question,
+        session_id,
+        new_round_id,
+        round_index,
+        state,
+        paths,
+        db_state,
+        app,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -362,38 +397,6 @@ async fn create_session(
     let db = guard.as_ref().ok_or("Database not initialized")?;
     db.create_session(&session_id.hyphenated().to_string(), &candidate_name)
         .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-#[allow(clippy::too_many_arguments)]
-async fn insert_round(
-    session_id: uuid::Uuid,
-    round_index: i32,
-    question: String,
-    transcription: String,
-    audio_path: String,
-    sha256: String,
-    duration_ms: u64,
-    sample_rate: u32,
-    channels: u16,
-    file_size_bytes: u64,
-    state: State<'_, Arc<DbState>>,
-) -> Result<i64, String> {
-    let guard = state.db.lock().await;
-    let db = guard.as_ref().ok_or("Database not initialized")?;
-    db.insert_round(
-        &session_id.hyphenated().to_string(),
-        round_index,
-        &question,
-        &transcription,
-        &audio_path,
-        &sha256,
-        duration_ms,
-        sample_rate,
-        channels,
-        file_size_bytes,
-    )
-    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -464,7 +467,6 @@ pub fn run() {
             stop_interview_round,
             get_tools_dir,
             create_session,
-            insert_round,
             complete_session,
             get_sessions,
             get_rounds,
