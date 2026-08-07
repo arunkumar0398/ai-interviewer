@@ -7,6 +7,7 @@ fn fake_app_paths(base: &std::path::Path) -> AppPaths {
         tool_dir: base.to_path_buf(),
         db_path: base.join("interviews.db"),
         recordings_dir: base.join("recordings"),
+        tts_dir: base.join("tts"),
         temp_dir: base.join("temp"),
         is_portable: false,
         tool_directory_source: ToolDirectorySource::DevFallback,

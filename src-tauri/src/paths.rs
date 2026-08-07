@@ -68,6 +68,7 @@ pub struct AppPaths {
     pub tool_dir: PathBuf,
     pub db_path: PathBuf,
     pub recordings_dir: PathBuf,
+    pub tts_dir: PathBuf,
     pub temp_dir: PathBuf,
     pub is_portable: bool,
     pub tool_directory_source: ToolDirectorySource,
@@ -79,6 +80,7 @@ pub struct AppConfig {
     pub tool_dir: String,
     pub db_path: String,
     pub recordings_dir: String,
+    pub tts_dir: String,
     pub temp_dir: String,
     pub is_portable: bool,
     pub tool_directory_source: ToolDirectorySource,
@@ -144,14 +146,15 @@ impl AppPaths {
 
     /// Return the TTS output path for a specific request.
     pub fn tts_output_path(&self, request_id: Uuid) -> PathBuf {
-        let tts_dir = self.temp_dir.join("tts");
-        tts_dir.join(format!("{}.wav", uuid_to_path(&request_id)))
+        self.tts_dir
+            .join(format!("{}.wav", uuid_to_path(&request_id)))
     }
 
     /// Build paths from an explicit tool directory (used by tests and the
     /// audio spike binary).
     pub fn from_tool_dir(tool_dir: PathBuf, data_dir: PathBuf) -> Result<Self, DatabasePathError> {
         let recordings_dir = data_dir.join("recordings");
+        let tts_dir = data_dir.join("tts");
         let temp_dir = data_dir.join("temp");
         let db_path = resolve_database_path(&data_dir)?;
         let tool_directory_source = ToolDirectorySource::DevFallback;
@@ -160,6 +163,7 @@ impl AppPaths {
             tool_dir,
             db_path,
             recordings_dir,
+            tts_dir,
             temp_dir,
             is_portable: false,
             tool_directory_source,
@@ -177,6 +181,7 @@ impl AppPaths {
         };
 
         let recordings_dir = data_dir.join("recordings");
+        let tts_dir = data_dir.join("tts");
         let temp_dir = data_dir.join("temp");
         let db_path = resolve_database_path(&data_dir)?;
 
@@ -184,6 +189,7 @@ impl AppPaths {
             tool_dir,
             db_path,
             recordings_dir,
+            tts_dir,
             temp_dir,
             is_portable,
             tool_directory_source,
@@ -201,6 +207,7 @@ impl AppPaths {
 
         let data_dir = compute_data_dir(&exe_dir, is_portable);
         let recordings_dir = data_dir.join("recordings");
+        let tts_dir = data_dir.join("tts");
         let temp_dir = data_dir.join("temp");
         let db_path = resolve_database_path(&data_dir)?;
 
@@ -208,6 +215,7 @@ impl AppPaths {
             tool_dir,
             db_path,
             recordings_dir,
+            tts_dir,
             temp_dir,
             is_portable,
             tool_directory_source,
@@ -221,6 +229,7 @@ impl AppPaths {
             tool_dir: self.tool_dir.display().to_string(),
             db_path: self.db_path.display().to_string(),
             recordings_dir: self.recordings_dir.display().to_string(),
+            tts_dir: self.tts_dir.display().to_string(),
             temp_dir: self.temp_dir.display().to_string(),
             is_portable: self.is_portable,
             tool_directory_source: self.tool_directory_source.clone(),
@@ -232,6 +241,8 @@ impl AppPaths {
     pub fn ensure_directories(&self) -> Result<(), String> {
         std::fs::create_dir_all(&self.recordings_dir)
             .map_err(|e| format!("Failed to create recordings dir: {e}"))?;
+        std::fs::create_dir_all(&self.tts_dir)
+            .map_err(|e| format!("Failed to create tts dir: {e}"))?;
         std::fs::create_dir_all(&self.temp_dir)
             .map_err(|e| format!("Failed to create temp dir: {e}"))?;
         Ok(())
@@ -823,6 +834,7 @@ mod tests {
         let paths = AppPaths::from_tool_dir(tool, data).unwrap();
         paths.ensure_directories().unwrap();
         assert!(paths.recordings_dir.exists());
+        assert!(paths.tts_dir.exists());
         assert!(paths.temp_dir.exists());
     }
 
