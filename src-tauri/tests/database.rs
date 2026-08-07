@@ -404,3 +404,192 @@ fn db_transaction_rollback() {
 
     let _ = std::fs::remove_file(&db_path);
 }
+
+// ============================================================
+// Schema versioning and unique round constraint
+// ============================================================
+
+/// Test: Schema version is set to current version after initialize
+#[test]
+fn db_schema_version_set() {
+    let db_path = std::env::temp_dir().join("test_schema_version.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let _db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let version: i32 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 2, "Schema version should be 2");
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// Test: Duplicate (session_id, round_index) is silently ignored via insert_round_with_session_update
+#[test]
+fn db_duplicate_round_index_ignored() {
+    let db_path = std::env::temp_dir().join("test_dup_round.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
+    db.create_session("dup-round-session", "Test").unwrap();
+
+    db.insert_round_with_session_update(
+        "dup-round-session",
+        0,
+        "Q1",
+        "A1",
+        "/tmp/r1.wav",
+        "h1",
+        5000,
+        16000,
+        1,
+        160044,
+    )
+    .unwrap();
+
+    // Second insert with same (session_id, round_index) should be silently ignored
+    db.insert_round_with_session_update(
+        "dup-round-session",
+        0,
+        "Q1-retry",
+        "A1-retry",
+        "/tmp/r1b.wav",
+        "h1b",
+        5500,
+        16000,
+        1,
+        168044,
+    )
+    .unwrap();
+
+    let rounds = db.get_rounds("dup-round-session").unwrap();
+    assert_eq!(rounds.len(), 1, "Duplicate round_index should be ignored");
+    assert_eq!(rounds[0].question, "Q1", "Original round should be kept");
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// Test: insert_round_with_session_update increments total_rounds
+#[test]
+fn db_insert_round_with_session_update() {
+    let db_path = std::env::temp_dir().join("test_round_session_update.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
+    db.create_session("update-session", "Test").unwrap();
+
+    assert_eq!(
+        db.get_session("update-session")
+            .unwrap()
+            .unwrap()
+            .total_rounds,
+        0
+    );
+
+    db.insert_round_with_session_update(
+        "update-session",
+        0,
+        "Q1",
+        "A1",
+        "/tmp/r1.wav",
+        "h1",
+        5000,
+        16000,
+        1,
+        160044,
+    )
+    .unwrap();
+    assert_eq!(
+        db.get_session("update-session")
+            .unwrap()
+            .unwrap()
+            .total_rounds,
+        1
+    );
+
+    db.insert_round_with_session_update(
+        "update-session",
+        1,
+        "Q2",
+        "A2",
+        "/tmp/r2.wav",
+        "h2",
+        6000,
+        16000,
+        1,
+        192044,
+    )
+    .unwrap();
+    assert_eq!(
+        db.get_session("update-session")
+            .unwrap()
+            .unwrap()
+            .total_rounds,
+        2
+    );
+
+    let rounds = db.get_rounds("update-session").unwrap();
+    assert_eq!(rounds.len(), 2);
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// Test: insert_round_with_session_update rolls back atomically on error
+#[test]
+fn db_insert_round_with_session_update_rollback() {
+    let db_path = std::env::temp_dir().join("test_round_rollback.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
+    db.create_session("rollback-session", "Test").unwrap();
+
+    // First insert succeeds
+    db.insert_round_with_session_update(
+        "rollback-session",
+        0,
+        "Q1",
+        "A1",
+        "/tmp/r1.wav",
+        "h1",
+        5000,
+        16000,
+        1,
+        160044,
+    )
+    .unwrap();
+    assert_eq!(
+        db.get_session("rollback-session")
+            .unwrap()
+            .unwrap()
+            .total_rounds,
+        1
+    );
+
+    // Duplicate round_index should be silently ignored (INSERT OR IGNORE),
+    // and total_rounds should NOT increase.
+    db.insert_round_with_session_update(
+        "rollback-session",
+        0,
+        "Q1-dup",
+        "A1-dup",
+        "/tmp/r1b.wav",
+        "h1b",
+        5500,
+        16000,
+        1,
+        168044,
+    )
+    .unwrap();
+    assert_eq!(
+        db.get_session("rollback-session")
+            .unwrap()
+            .unwrap()
+            .total_rounds,
+        1,
+        "total_rounds should not increase for ignored duplicate"
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+}

@@ -49,7 +49,7 @@ fn contract_play_round_audio_rejects_nonexistent_file() {
 #[test]
 fn contract_generate_tts_rejects_empty_text() {
     let _paths = make_test_paths();
-    let tts_dir = _paths.temp_dir.join("tts");
+    let tts_dir = _paths.tts_dir.clone();
     std::fs::create_dir_all(&tts_dir).unwrap();
     let output_path = tts_dir.join("test.wav");
     assert!(!output_path.exists());
