@@ -144,7 +144,7 @@ fn contract_database_complete_nonexistent_session() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("test.db");
     let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
-    // complete_session does a WHERE id= update; non-existent session is a no-op, not an error.
+    // complete_session now returns an error when the session does not exist.
     let result = db.complete_session("550e8400-e29b-41d4-a716-446655440000", 5);
-    assert!(result.is_ok());
+    assert!(result.is_err());
 }

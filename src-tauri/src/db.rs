@@ -168,13 +168,16 @@ impl Database {
         Ok(())
     }
 
-    /// Complete a session
+    /// Complete a session. Returns an error if the session does not exist.
     pub fn complete_session(&self, session_id: &str, total_rounds: i32) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute(
+        let affected = conn.execute(
             "UPDATE sessions SET completed_at = datetime('now'), total_rounds = ?1 WHERE id = ?2",
             params![total_rounds, session_id],
         )?;
+        if affected == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
         Ok(())
     }
 

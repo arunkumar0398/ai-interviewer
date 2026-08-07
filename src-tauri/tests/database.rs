@@ -117,7 +117,7 @@ fn db_serialization() {
 // NEW: Database edge case tests
 // ============================================================
 
-/// Test: Complete a nonexistent session is idempotent (no error, 0 rows affected)
+/// Test: Complete a nonexistent session returns an error
 #[test]
 fn db_complete_session_nonexistent() {
     let db_path = std::env::temp_dir().join("test_complete_nonexistent.db");
@@ -126,8 +126,8 @@ fn db_complete_session_nonexistent() {
     let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
     let result = db.complete_session("does-not-exist", 5);
     assert!(
-        result.is_ok(),
-        "Completing nonexistent session should not error"
+        result.is_err(),
+        "Completing nonexistent session should error"
     );
 
     let _ = std::fs::remove_file(&db_path);
@@ -590,6 +590,81 @@ fn db_insert_round_with_session_update_rollback() {
         1,
         "total_rounds should not increase for ignored duplicate"
     );
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// Test: Migration from schema v1 to v2 preserves data and adds unique constraint
+#[test]
+fn db_schema_v1_to_v2_migration() {
+    let db_path = std::env::temp_dir().join("test_migration_v1_v2.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    // Create a v1 database manually (no UNIQUE constraint on rounds)
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA user_version=1;").unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                candidate_name TEXT NOT NULL DEFAULT '',
+                started_at TEXT NOT NULL DEFAULT (datetime('now')),
+                completed_at TEXT,
+                total_rounds INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE rounds (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                round_index INTEGER NOT NULL,
+                question TEXT NOT NULL,
+                transcription TEXT NOT NULL DEFAULT '',
+                audio_path TEXT NOT NULL DEFAULT '',
+                sha256 TEXT NOT NULL DEFAULT '',
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                sample_rate INTEGER NOT NULL DEFAULT 16000,
+                channels INTEGER NOT NULL DEFAULT 1,
+                file_size_bytes INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_rounds_session ON rounds(session_id);
+            ",
+        )
+        .unwrap();
+
+        // Insert test data
+        conn.execute(
+            "INSERT INTO sessions (id, candidate_name, total_rounds) VALUES ('s1', 'Alice', 2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO rounds (session_id, round_index, question, transcription) VALUES ('s1', 0, 'Q1', 'A1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO rounds (session_id, round_index, question, transcription) VALUES ('s1', 1, 'Q2', 'A2')",
+            [],
+        )
+        .unwrap();
+    }
+
+    // Open with the real Database::open — triggers migration v1 -> v2
+    let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
+
+    // Data should be preserved
+    let sessions = db.get_sessions().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, "s1");
+    assert_eq!(sessions[0].candidate_name, "Alice");
+    assert_eq!(sessions[0].total_rounds, 2);
+
+    let rounds = db.get_rounds("s1").unwrap();
+    assert_eq!(rounds.len(), 2);
+    assert_eq!(rounds[0].question, "Q1");
+    assert_eq!(rounds[1].question, "Q2");
 
     let _ = std::fs::remove_file(&db_path);
 }
