@@ -1,6 +1,6 @@
 use ai_interviewer_lib::paths::{
     resolve_piper_paths, resolve_whisper_model_path, validate_path_component, AppPaths,
-    ToolDirOptions, ToolDirectorySource, ToolDistributionMode,
+    PathResolutionInput, ToolDirOptions, ToolDirectorySource, ToolDistributionMode,
 };
 use std::fs;
 use uuid::Uuid;
@@ -494,4 +494,60 @@ fn session_recordings_dir_includes_uuid_in_path() {
     let path = paths.session_recordings_dir(id);
     let expected = ai_interviewer_lib::paths::uuid_to_path(&id);
     assert!(path.to_string_lossy().contains(&expected));
+}
+
+// ---------------------------------------------------------------------------
+// env_tools_dir override via PathResolutionInput
+// ---------------------------------------------------------------------------
+
+/// Test: env_tools_dir in PathResolutionInput takes priority over portable/bundled
+#[test]
+fn env_tools_dir_override_takes_priority() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fake_tools = tmp.path().join("env_injected_tools");
+    fs::create_dir_all(&fake_tools).unwrap();
+
+    let exe_dir = tmp.path().join("exe");
+    let app_data = tmp.path().join("app_data");
+    fs::create_dir_all(&exe_dir).unwrap();
+    fs::create_dir_all(&app_data).unwrap();
+
+    let input = PathResolutionInput {
+        exe_dir,
+        app_data_dir: app_data,
+        resource_dir: None,
+        env_tools_dir: Some(fake_tools.clone()),
+    };
+    let paths = AppPaths::resolve_from_input(input).unwrap();
+    assert_eq!(paths.tool_dir, fake_tools);
+    assert_eq!(
+        paths.tool_directory_source,
+        ToolDirectorySource::EnvVar {
+            value: fake_tools.to_str().unwrap().to_string()
+        }
+    );
+}
+
+/// Test: env_tools_dir=None falls through to other resolution strategies
+#[test]
+fn env_tools_dir_none_falls_through() {
+    let tmp = tempfile::tempdir().unwrap();
+    let exe_dir = tmp.path().join("exe");
+    let tools_dir = exe_dir.join("tools");
+    fs::create_dir_all(&tools_dir).unwrap();
+    let app_data = tmp.path().join("app_data");
+    fs::create_dir_all(&app_data).unwrap();
+
+    let input = PathResolutionInput {
+        exe_dir,
+        app_data_dir: app_data,
+        resource_dir: None,
+        env_tools_dir: None,
+    };
+    let paths = AppPaths::resolve_from_input(input).unwrap();
+    assert_eq!(paths.tool_dir, tools_dir);
+    assert!(matches!(
+        paths.tool_directory_source,
+        ToolDirectorySource::Portable { .. }
+    ));
 }

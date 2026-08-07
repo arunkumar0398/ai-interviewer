@@ -111,6 +111,7 @@ fn contract_path_resolution_portable_exe_dir_subdir() {
         exe_dir,
         app_data_dir,
         resource_dir: None,
+        env_tools_dir: None,
     };
     let paths = AppPaths::resolve_from_input(input).unwrap();
     assert!(paths.recordings_dir.starts_with(tmp.path()));

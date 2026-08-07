@@ -95,6 +95,10 @@ pub struct PathResolutionInput {
     pub app_data_dir: PathBuf,
     /// Tauri resource directory (optional override for tool distribution).
     pub resource_dir: Option<PathBuf>,
+    /// Override for the `AI_INTERVIEWER_TOOLS` env var. Production reads
+    /// `var_os("AI_INTERVIEWER_TOOLS")` into this field; tests supply
+    /// synthetic paths directly — keeping the resolver pure.
+    pub env_tools_dir: Option<PathBuf>,
 }
 
 /// Describes the distribution mode for external tools.
@@ -190,7 +194,10 @@ impl AppPaths {
     /// Resolve paths from injected inputs (testable without env vars).
     pub fn resolve_from_input(input: PathResolutionInput) -> Result<Self, DatabasePathError> {
         let options = ToolDirOptions {
-            env_override: None,
+            env_override: input
+                .env_tools_dir
+                .as_ref()
+                .map(|p| p.display().to_string()),
             resource_dir: input.resource_dir.clone(),
             allow_dev_fallback: true,
         };
@@ -593,6 +600,7 @@ pub fn resolve_app_paths(app: &tauri::AppHandle) -> Result<PathsState, String> {
         exe_dir,
         app_data_dir,
         resource_dir: Some(resource_dir),
+        env_tools_dir: env::var_os("AI_INTERVIEWER_TOOLS").map(PathBuf::from),
     };
     let app_paths =
         AppPaths::resolve_from_input(input).map_err(|e| format!("Path resolution failed: {e}"))?;
@@ -651,6 +659,7 @@ mod tests {
             exe_dir: exe_dir.to_path_buf(),
             app_data_dir: app_data.clone(),
             resource_dir: None,
+            env_tools_dir: None,
         };
         let paths = AppPaths::resolve_from_input(input).unwrap();
         assert!(paths.is_portable);
