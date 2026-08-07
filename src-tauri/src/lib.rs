@@ -215,6 +215,7 @@ async fn run_interview_round(
     session_id: uuid::Uuid,
     round_id: uuid::Uuid,
     round_index: i32,
+    is_final: bool,
     state: State<'_, Arc<RecordingState>>,
     paths: State<'_, PathsState>,
     db_state: State<'_, Arc<DbState>>,
@@ -327,6 +328,13 @@ async fn run_interview_round(
                     metadata.file_size_bytes,
                 )
                 .map_err(|e| format!("Failed to persist round: {}", e))?;
+
+                // Backend-authoritative session completion: finalize immediately
+                // after the final round is persisted successfully.
+                if is_final {
+                    db.complete_session(&session_id.hyphenated().to_string(), round_index + 1)
+                        .map_err(|e| format!("Failed to complete session: {}", e))?;
+                }
             }
             Ok(InterviewRoundResult {
                 metadata,
@@ -342,10 +350,12 @@ async fn run_interview_round(
 /// is inserted under a fresh UUID via the UNIQUE(session_id, round_index)
 /// constraint (INSERT OR IGNORE).
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn retry_interview_round(
     question: String,
     session_id: uuid::Uuid,
     round_index: i32,
+    is_final: bool,
     state: State<'_, Arc<RecordingState>>,
     paths: State<'_, PathsState>,
     db_state: State<'_, Arc<DbState>>,
@@ -357,6 +367,7 @@ async fn retry_interview_round(
         session_id,
         new_round_id,
         round_index,
+        is_final,
         state,
         paths,
         db_state,

@@ -91,6 +91,11 @@ export default function InterviewPage() {
   const [sessionId] = useState(() => crypto.randomUUID());
   const sessionIdRef = useRef(sessionId);
 
+  // Backend-authoritative session lifecycle: tracks whether create_session
+  // has been called and whether the session is ready for round execution.
+  type SessionInitState = "idle" | "creating" | "ready" | "error";
+  const [sessionInitState, setSessionInitState] = useState<SessionInitState>("idle");
+
   // Keep ref in sync
   useEffect(() => {
     sessionIdRef.current = sessionId;
@@ -192,22 +197,42 @@ export default function InterviewPage() {
   // Start interview round — let backend phase events drive the UI
   const handleStartRound = useCallback(async () => {
     if (currentRound >= QUESTIONS.length) {
-      // All rounds done — finalize session on the backend
-      try {
-        await invoke("complete_session", {
-          sessionId,
-          totalRounds: currentRound,
-        });
-      } catch (e) {
-        console.error("complete_session failed:", e);
-      }
+      // All rounds done — backend already called complete_session on final round
       setPhase("showing-result");
       return;
+    }
+
+    // Backend-authoritative session lifecycle: create session before first round
+    if (sessionInitState === "idle") {
+      setSessionInitState("creating");
+      try {
+        await invoke("create_session", {
+          sessionId,
+          candidateName: "Candidate",
+        });
+        setSessionInitState("ready");
+      } catch (e) {
+        setSessionInitState("error");
+        setPhase("error");
+        setError(`Failed to create session: ${String(e)}`);
+        return;
+      }
+    }
+
+    // Gate round execution on session being ready
+    if (sessionInitState !== "ready" && sessionInitState !== "creating") {
+      return;
+    }
+    if (sessionInitState === "creating") {
+      return; // Wait for session creation to complete
     }
 
     const question = QUESTIONS[currentRound];
     setCurrentQuestion(question);
     setRetryTarget(null);
+
+    // isFinal: true when this is the last round
+    const isFinal = currentRound === QUESTIONS.length - 1;
 
     try {
       const roundId = crypto.randomUUID();
@@ -216,6 +241,7 @@ export default function InterviewPage() {
         sessionId,
         roundId,
         roundIndex: currentRound,
+        isFinal,
       });
 
       setRoundResults((prev) => [...prev, result]);
@@ -230,7 +256,7 @@ export default function InterviewPage() {
         setRetryTarget({ kind: "round", question });
       }
     }
-  }, [currentRound, sessionId]);
+  }, [currentRound, sessionId, sessionInitState]);
 
   // Retry handler — only redoes the failed operation
   const handleRetry = useCallback(async () => {
@@ -269,6 +295,7 @@ export default function InterviewPage() {
       }
       case "round": {
         // Re-run the failed round via retry command
+        const isFinalRetry = currentRound === QUESTIONS.length - 1;
         try {
           const result = await invoke<InterviewRoundResult>(
             "retry_interview_round",
@@ -276,6 +303,7 @@ export default function InterviewPage() {
               question: retryTarget.question,
               sessionId,
               roundIndex: currentRound,
+              isFinal: isFinalRetry,
             }
           );
           setRoundResults((prev) => [...prev, result]);
