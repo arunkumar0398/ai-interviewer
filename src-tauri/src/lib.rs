@@ -53,7 +53,7 @@ async fn start_recording(
     state: State<'_, Arc<RecordingState>>,
     paths: State<'_, PathsState>,
 ) -> Result<RecordingResult, String> {
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, _rx) = mpsc::channel(32);
     let sr = sample_rate.unwrap_or(16000);
 
     // Backend generates path: recordings/<session_id>/<round_id>.wav
@@ -75,10 +75,7 @@ async fn start_recording(
 
     // Spawn worker; drop original tx so channel closes when worker finishes
     let worker = tokio::spawn(async move {
-        if let Err(e) = audio::capture::record_to_wav(path_clone, sr, 1, event_tx, stop_clone).await
-        {
-            eprintln!("Recording error: {}", e);
-        }
+        audio::capture::record_to_wav(path_clone, sr, 1, event_tx, stop_clone).await
     });
     drop(tx);
 
@@ -87,28 +84,14 @@ async fn start_recording(
     clear_active_recording(&state).await;
 
     // Check for join failure (panic/cancellation)
-    join_result.map_err(|e| format!("Recording worker failed: {}", e))?;
+    let record_result = join_result
+        .map_err(|e| format!("Recording worker failed: {}", e))?
+        .map_err(|e| e.to_string())?;
 
-    // Drain remaining events from channel
-    while let Some(event) = rx.recv().await {
-        match event {
-            audio::capture::CaptureEvent::Stopped {
-                file_path,
-                duration_ms,
-            } => {
-                return Ok(RecordingResult {
-                    path: file_path,
-                    duration_ms,
-                });
-            }
-            audio::capture::CaptureEvent::Error { message } => {
-                return Err(message);
-            }
-            _ => continue,
-        }
-    }
-
-    Err("Recording interrupted".to_string())
+    Ok(RecordingResult {
+        path: record_result.file_path.to_string_lossy().to_string(),
+        duration_ms: record_result.duration_ms,
+    })
 }
 
 #[tauri::command]
@@ -142,15 +125,13 @@ async fn play_round_audio(
     let worker_tx = tx.clone();
     let path = file_path;
 
-    let worker = tokio::spawn(async move {
-        if let Err(e) = audio::playback::play_wav(path, worker_tx).await {
-            eprintln!("Playback error: {}", e);
-        }
-    });
+    let worker = tokio::spawn(async move { audio::playback::play_wav(path, worker_tx).await });
     drop(tx);
 
     let join_result = worker.await;
-    join_result.map_err(|e| format!("Playback worker failed: {}", e))?;
+    join_result
+        .map_err(|e| format!("Playback worker failed: {}", e))?
+        .map_err(|e| e.to_string())?;
 
     while let Some(event) = rx.recv().await {
         match event {
@@ -184,9 +165,14 @@ async fn generate_tts(
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    audio::playback::generate_tts_with_paths(&text, output_path.clone(), &paths.paths)
-        .await
-        .map_err(|e| e.to_string())?;
+    let tts_timeout = std::time::Duration::from_secs(30);
+    tokio::time::timeout(
+        tts_timeout,
+        audio::playback::generate_tts_with_paths(&text, output_path.clone(), &paths.paths),
+    )
+    .await
+    .map_err(|_| "TTS generation timed out".to_string())?
+    .map_err(|e| e.to_string())?;
     Ok(output_path.to_string_lossy().to_string())
 }
 
