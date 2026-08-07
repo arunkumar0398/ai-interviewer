@@ -2,6 +2,8 @@ use rusqlite::{params, Connection, Result as SqlResult};
 use std::path::Path;
 use std::sync::Mutex;
 
+const SCHEMA_VERSION: u32 = 2;
+
 /// Database wrapper for interview data storage
 pub struct Database {
     conn: Mutex<Connection>,
@@ -55,39 +57,84 @@ impl Database {
         Ok(db)
     }
 
-    /// Create tables if they don't exist
+    /// Create tables if they don't exist and apply migrations
     fn initialize(&self) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
 
-        conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS sessions (
-                id TEXT PRIMARY KEY,
-                candidate_name TEXT NOT NULL DEFAULT '',
-                started_at TEXT NOT NULL DEFAULT (datetime('now')),
-                completed_at TEXT,
-                total_rounds INTEGER NOT NULL DEFAULT 0
-            );
+        let current_version: u32 =
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
 
-            CREATE TABLE IF NOT EXISTS rounds (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                round_index INTEGER NOT NULL,
-                question TEXT NOT NULL,
-                transcription TEXT NOT NULL DEFAULT '',
-                audio_path TEXT NOT NULL DEFAULT '',
-                sha256 TEXT NOT NULL DEFAULT '',
-                duration_ms INTEGER NOT NULL DEFAULT 0,
-                sample_rate INTEGER NOT NULL DEFAULT 16000,
-                channels INTEGER NOT NULL DEFAULT 1,
-                file_size_bytes INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
-            );
+        if current_version == 0 {
+            conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS sessions (
+                    id TEXT PRIMARY KEY,
+                    candidate_name TEXT NOT NULL DEFAULT '',
+                    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    completed_at TEXT,
+                    total_rounds INTEGER NOT NULL DEFAULT 0
+                );
 
-            CREATE INDEX IF NOT EXISTS idx_rounds_session ON rounds(session_id);
-            ",
-        )?;
+                CREATE TABLE IF NOT EXISTS rounds (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    round_index INTEGER NOT NULL,
+                    question TEXT NOT NULL,
+                    transcription TEXT NOT NULL DEFAULT '',
+                    audio_path TEXT NOT NULL DEFAULT '',
+                    sha256 TEXT NOT NULL DEFAULT '',
+                    duration_ms INTEGER NOT NULL DEFAULT 0,
+                    sample_rate INTEGER NOT NULL DEFAULT 16000,
+                    channels INTEGER NOT NULL DEFAULT 1,
+                    file_size_bytes INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_rounds_session ON rounds(session_id);
+                ",
+            )?;
+        }
+
+        if current_version < 2 {
+            // Migrate v1 -> v2: add unique constraint on (session_id, round_index)
+            // SQLite doesn't support ALTER TABLE ADD CONSTRAINT, so recreate rounds table.
+            conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS rounds_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    round_index INTEGER NOT NULL,
+                    question TEXT NOT NULL,
+                    transcription TEXT NOT NULL DEFAULT '',
+                    audio_path TEXT NOT NULL DEFAULT '',
+                    sha256 TEXT NOT NULL DEFAULT '',
+                    duration_ms INTEGER NOT NULL DEFAULT 0,
+                    sample_rate INTEGER NOT NULL DEFAULT 16000,
+                    channels INTEGER NOT NULL DEFAULT 1,
+                    file_size_bytes INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(session_id, round_index),
+                    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
+
+                INSERT OR REPLACE INTO rounds_new
+                    (id, session_id, round_index, question, transcription, audio_path,
+                     sha256, duration_ms, sample_rate, channels, file_size_bytes, created_at)
+                SELECT id, session_id, round_index, question, transcription, audio_path,
+                       sha256, duration_ms, sample_rate, channels, file_size_bytes, created_at
+                FROM rounds;
+
+                DROP TABLE rounds;
+
+                ALTER TABLE rounds_new RENAME TO rounds;
+
+                CREATE INDEX IF NOT EXISTS idx_rounds_session ON rounds(session_id);
+                ",
+            )?;
+        }
+
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
 
         Ok(())
     }
@@ -164,6 +211,62 @@ impl Database {
             ],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// Insert a round and increment the session's total_rounds atomically.
+    /// Uses INSERT OR IGNORE to respect the UNIQUE(session_id, round_index)
+    /// constraint — duplicate rounds for the same slot are silently skipped.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_round_with_session_update(
+        &self,
+        session_id: &str,
+        round_index: i32,
+        question: &str,
+        transcription: &str,
+        audio_path: &str,
+        sha256: &str,
+        duration_ms: u64,
+        sample_rate: u32,
+        channels: u16,
+        file_size_bytes: u64,
+    ) -> SqlResult<i64> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO rounds (session_id, round_index, question, transcription, audio_path, sha256, duration_ms, sample_rate, channels, file_size_bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    session_id,
+                    round_index,
+                    question,
+                    transcription,
+                    audio_path,
+                    sha256,
+                    duration_ms,
+                    sample_rate,
+                    channels,
+                    file_size_bytes,
+                ],
+            )?;
+            if inserted > 0 {
+                conn.execute(
+                    "UPDATE sessions SET total_rounds = total_rounds + 1 WHERE id = ?1",
+                    params![session_id],
+                )?;
+            }
+            Ok::<_, rusqlite::Error>(conn.last_insert_rowid())
+        })();
+        match result {
+            Ok(id) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(id)
+            }
+            Err(e) => {
+                conn.execute_batch("ROLLBACK")?;
+                Err(e)
+            }
+        }
     }
 
     /// Get all rounds for a session
