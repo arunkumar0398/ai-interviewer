@@ -125,7 +125,8 @@ async fn play_round_audio(
     let worker_tx = tx.clone();
     let path = file_path;
 
-    let worker = tokio::spawn(async move { audio::playback::play_wav(path, worker_tx).await });
+    let worker =
+        tokio::spawn(async move { audio::playback::play_wav(path, worker_tx, None).await });
     drop(tx);
 
     let join_result = worker.await;
@@ -137,6 +138,9 @@ async fn play_round_audio(
         match event {
             audio::playback::PlaybackEvent::Completed => {
                 return Ok("Playback completed".to_string());
+            }
+            audio::playback::PlaybackEvent::Cancelled => {
+                return Ok("Playback cancelled".to_string());
             }
             audio::playback::PlaybackEvent::Error { message } => {
                 return Err(message);

@@ -34,3 +34,15 @@ Object.defineProperty(window, "__TAURI_INTERNALS__", {
   },
   writable: true,
 });
+
+// Store to capture listen callbacks for tests that need to emit events
+export const mockListenCallbacks = new Map<string, (...args: unknown[]) => void>();
+export const mockListenUnlisten = vi.fn(() => Promise.resolve());
+
+// Mock @tauri-apps/api/event module — captures callback so tests can emit events
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+    mockListenCallbacks.set(event, cb);
+    return Promise.resolve(mockListenUnlisten);
+  }),
+}));

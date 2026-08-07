@@ -137,7 +137,7 @@ echo [6/8] Running Rust quality gates...
 
 pushd "%~dp0..\src-tauri"
 
-cargo fmt --check
+cargo fmt --all -- --check
 if %ERRORLEVEL% equ 0 (
     echo   [PASS] cargo fmt
     set /a PASS+=1
@@ -146,7 +146,7 @@ if %ERRORLEVEL% equ 0 (
     set /a FAIL+=1
 )
 
-cargo clippy -- -D warnings
+cargo clippy --locked --all-targets --all-features -- -D warnings
 if %ERRORLEVEL% equ 0 (
     echo   [PASS] cargo clippy
     set /a PASS+=1
@@ -155,12 +155,21 @@ if %ERRORLEVEL% equ 0 (
     set /a FAIL+=1
 )
 
-cargo test
+cargo test --locked --all-targets --all-features
 if %ERRORLEVEL% equ 0 (
     echo   [PASS] cargo test
     set /a PASS+=1
 ) else (
     echo   [FAIL] cargo test
+    set /a FAIL+=1
+)
+
+cargo check --locked --features spike --bin audio-spike
+if %ERRORLEVEL% equ 0 (
+    echo   [PASS] cargo check audio-spike
+    set /a PASS+=1
+) else (
+    echo   [FAIL] cargo check audio-spike
     set /a FAIL+=1
 )
 
@@ -171,6 +180,15 @@ echo.
 echo [7/8] Running frontend quality gates...
 
 pushd "%~dp0.."
+
+npm ci
+if %ERRORLEVEL% equ 0 (
+    echo   [PASS] npm ci
+    set /a PASS+=1
+) else (
+    echo   [FAIL] npm ci
+    set /a FAIL+=1
+)
 
 npm run lint -- --max-warnings=0
 if %ERRORLEVEL% equ 0 (
@@ -199,6 +217,15 @@ if %ERRORLEVEL% equ 0 (
     set /a FAIL+=1
 )
 
+npm run build
+if %ERRORLEVEL% equ 0 (
+    echo   [PASS] npm build
+    set /a PASS+=1
+) else (
+    echo   [FAIL] npm build
+    set /a FAIL+=1
+)
+
 popd
 
 REM --- 8. Check portable package structure ---
@@ -210,14 +237,12 @@ if exist "%PORTABLE_DIR%\ai-interviewer.exe" (
     echo   [PASS] Portable exe exists
     set /a PASS+=1
 ) else (
-    echo   [SKIP] No portable directory (run tauri build first)
+    echo   [FAIL] No portable directory (run tauri build first)
+    set /a FAIL+=1
 )
 
 if exist "%PORTABLE_DIR%\LICENSE" (
     echo   [PASS] Portable LICENSE exists
-    set /a PASS+=1
-) else if exist "%~dp0..\LICENSE" (
-    echo   [PASS] LICENSE exists at repo root
     set /a PASS+=1
 ) else (
     echo   [FAIL] LICENSE missing
@@ -227,9 +252,6 @@ if exist "%PORTABLE_DIR%\LICENSE" (
 if exist "%PORTABLE_DIR%\README.md" (
     echo   [PASS] Portable README.md exists
     set /a PASS+=1
-) else if exist "%~dp0..\README.md" (
-    echo   [PASS] README.md exists at repo root
-    set /a PASS+=1
 ) else (
     echo   [FAIL] README.md missing
     set /a FAIL+=1
@@ -238,11 +260,24 @@ if exist "%PORTABLE_DIR%\README.md" (
 if exist "%PORTABLE_DIR%\tool-manifest.json" (
     echo   [PASS] Portable tool-manifest.json exists
     set /a PASS+=1
-) else if exist "%~dp0..\resources\tool-manifest.json" (
-    echo   [PASS] tool-manifest.json exists at repo root
-    set /a PASS+=1
 ) else (
     echo   [FAIL] tool-manifest.json missing
+    set /a FAIL+=1
+)
+
+if exist "%PORTABLE_DIR%\THIRD_PARTY_NOTICES" (
+    echo   [PASS] Portable THIRD_PARTY_NOTICES exists
+    set /a PASS+=1
+) else (
+    echo   [FAIL] THIRD_PARTY_NOTICES missing
+    set /a FAIL+=1
+)
+
+if exist "%PORTABLE_DIR%\tools\licenses" (
+    echo   [PASS] Portable tools\licenses exists
+    set /a PASS+=1
+) else (
+    echo   [FAIL] tools\licenses missing
     set /a FAIL+=1
 )
 

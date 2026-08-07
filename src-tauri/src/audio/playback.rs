@@ -1,22 +1,32 @@
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Piper outputs raw PCM at 22050 Hz mono — tied to the en_US-amy-medium model
 const PIPER_SAMPLE_RATE: u32 = 22050;
+
+/// Maximum time allowed for a single playback operation before it is cancelled.
+const PLAYBACK_TIMEOUT_SECS: u64 = 120;
 
 /// Playback events sent to the UI
 #[derive(Debug, Clone, serde::Serialize)]
 pub enum PlaybackEvent {
     Started { duration_ms: u64 },
     Completed,
+    Cancelled,
     Error { message: String },
 }
 
-/// Play a WAV file through the system speakers using cpal
+/// Play a WAV file through the system speakers using cpal.
+/// Respects `stop_flag` for cancellation and enforces an internal timeout.
+/// On timeout or stop, the audio stream is dropped (stopping playback) and
+/// `Cancelled` is emitted.
 pub async fn play_wav(
     file_path: PathBuf,
     event_tx: mpsc::Sender<PlaybackEvent>,
+    stop_flag: Option<Arc<AtomicBool>>,
 ) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -88,13 +98,30 @@ pub async fn play_wav(
 
         stream.play()?;
 
-        // Wait for playback to finish
-        // TODO: Replace busy-poll with tokio::sync::Notify for cleaner async wakeup
+        // Wait for playback to finish, with cancellation and timeout
         let total_samples = samples.len();
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(PLAYBACK_TIMEOUT_SECS);
         loop {
             let current = pos.load(std::sync::atomic::Ordering::Relaxed);
             if current >= total_samples {
                 break;
+            }
+            // Check external stop flag
+            if let Some(ref flag) = stop_flag {
+                if flag.load(Ordering::SeqCst) {
+                    drop(stream);
+                    let _ = event_tx.try_send(PlaybackEvent::Cancelled);
+                    return Ok(());
+                }
+            }
+            // Check internal deadline
+            if std::time::Instant::now() >= deadline {
+                drop(stream);
+                let _ = event_tx.try_send(PlaybackEvent::Error {
+                    message: format!("Playback timed out after {}s", PLAYBACK_TIMEOUT_SECS),
+                });
+                anyhow::bail!("Playback timed out after {}s", PLAYBACK_TIMEOUT_SECS);
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }

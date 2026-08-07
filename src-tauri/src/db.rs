@@ -57,7 +57,9 @@ impl Database {
         Ok(db)
     }
 
-    /// Create tables if they don't exist and apply migrations
+    /// Create tables if they don't exist and apply migrations.
+    /// Each migration step runs in an explicit transaction so a failure
+    /// cannot leave half-migrated tables.
     fn initialize(&self) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -65,7 +67,8 @@ impl Database {
             conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
 
         if current_version == 0 {
-            conn.execute_batch(
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = conn.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS sessions (
                     id TEXT PRIMARY KEY,
@@ -93,14 +96,26 @@ impl Database {
 
                 CREATE INDEX IF NOT EXISTS idx_rounds_session ON rounds(session_id);
                 ",
-            )?;
+            );
+            match result {
+                Ok(_) => {
+                    conn.execute_batch("COMMIT")?;
+                }
+                Err(e) => {
+                    conn.execute_batch("ROLLBACK")?;
+                    return Err(e);
+                }
+            }
         }
 
         if current_version < 2 {
             // Migrate v1 -> v2: add unique constraint on (session_id, round_index)
             // SQLite doesn't support ALTER TABLE ADD CONSTRAINT, so recreate rounds table.
-            // Deterministic tie-breaker: keep the row with the highest id per duplicate pair.
-            conn.execute_batch(
+            // Deterministic tie-breaker: retain the row with the highest primary-key id.
+            // Wrapped in an explicit transaction so a failure cannot leave
+            // half-migrated tables.
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = conn.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS rounds_new (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -136,7 +151,16 @@ impl Database {
 
                 CREATE INDEX IF NOT EXISTS idx_rounds_session ON rounds(session_id);
                 ",
-            )?;
+            );
+            match result {
+                Ok(_) => {
+                    conn.execute_batch("COMMIT")?;
+                }
+                Err(e) => {
+                    conn.execute_batch("ROLLBACK")?;
+                    return Err(e);
+                }
+            }
         }
 
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
