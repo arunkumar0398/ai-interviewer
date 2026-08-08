@@ -334,7 +334,7 @@ async fn run_interview_round(
         .await
     });
 
-    // Full-round deadline + cooperative shutdown + abort fallback
+    // Full-round deadline + cooperative shutdown
     const ROUND_TIMEOUT_SECS: u64 = 300;
     const GRACE_SECS: u64 = 5;
 
@@ -342,48 +342,53 @@ async fn run_interview_round(
         tokio::time::Instant::now() + tokio::time::Duration::from_secs(ROUND_TIMEOUT_SECS);
 
     let mut worker_future = std::pin::pin!(worker);
-    let mut timed_out = false;
-    tokio::select! {
-        _ = &mut worker_future => { /* normal completion */ }
-        _ = tokio::time::sleep_until(deadline) => {
-            timed_out = true;
+    let timed_out = tokio::select! {
+        _ = &mut worker_future => false,
+        _ = tokio::time::sleep_until(deadline) => true,
+    };
 
-            // Deadline hit — signal cancellation
-            stop_flag.store(true, Ordering::SeqCst);
-            let _ = app.emit(
-                "interview-phase",
-                PhaseEventPayload {
-                    phase: "error".to_string(),
-                    question: Some(format!("Round timed out after {}s", ROUND_TIMEOUT_SECS)),
-                    duration_ms: None,
-                },
-            );
+    if timed_out {
+        // Deadline hit — signal cancellation via stop_flag
+        stop_flag.store(true, Ordering::SeqCst);
+        let _ = app.emit(
+            "interview-phase",
+            PhaseEventPayload {
+                phase: "error".to_string(),
+                question: Some(format!("Round timed out after {}s", ROUND_TIMEOUT_SECS)),
+                duration_ms: None,
+            },
+        );
 
-            // Grace period: let workers observe stop_flag and exit cleanly
-            tokio::time::sleep(tokio::time::Duration::from_secs(GRACE_SECS)).await;
+        // Await worker up to grace period — allows cooperative exit
+        let graceful = tokio::time::timeout(
+            tokio::time::Duration::from_secs(GRACE_SECS),
+            &mut worker_future,
+        )
+        .await;
 
-            // Abort if still alive, then await actual termination
+        if graceful.is_err() {
+            // Grace period expired — force abort and reap
             worker_future.as_mut().abort();
             let _ = tokio::time::timeout(
                 tokio::time::Duration::from_secs(2),
                 &mut worker_future,
             )
             .await;
-
-            // Clean up temp files
-            let temp_dir = paths.paths.temp_dir.join(session_id.hyphenated().to_string());
-            let _ = std::fs::remove_dir_all(temp_dir);
         }
-    }
 
-    phase_relay.abort();
+        // Clean up temp files
+        let temp_dir = paths.paths.temp_dir.join(session_id.hyphenated().to_string());
+        let _ = std::fs::remove_dir_all(temp_dir);
 
-    if timed_out {
+        phase_relay.abort();
         return Err(format!(
             "Round timed out after {}s — processes terminated, partial artifacts cleaned up",
             ROUND_TIMEOUT_SECS
         ));
     }
+
+    // Normal completion path — process JoinHandle result exactly once
+    phase_relay.abort();
 
     // Retrieve the join result — worker_future was polled by &mut in select, still usable
     let result = match worker_future.await {

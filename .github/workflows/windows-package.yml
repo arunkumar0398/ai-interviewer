@@ -110,6 +110,7 @@ jobs:
           Expand-Archive -Path $zip -DestinationPath $extractDir -Force
           $required = @(
             "ai-interviewer.exe",
+            "LICENSE",
             "tools\piper\piper.exe",
             "tools\piper\model.onnx",
             "tools\piper\model.onnx.json",

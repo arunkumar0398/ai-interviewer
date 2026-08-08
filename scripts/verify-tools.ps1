@@ -50,20 +50,40 @@ foreach ($tool in $manifest.tools.PSObject.Properties) {
     Write-Host "  Type:    $toolType"
 
     if ($toolType -eq "archive") {
-        # For archives, check if the destination directory exists and has files
-        if (-not (Test-Path $expectedPath -PathType Container)) {
-            Write-Host "  [FAIL] Directory not found: $expectedPath" -ForegroundColor Red
-            $fail++
-            Write-Host ""
-            continue
-        }
-        $files = Get-ChildItem -Path $expectedPath -Recurse -File
-        if ($files.Count -eq 0) {
-            Write-Host "  [FAIL] Directory exists but is empty: $expectedPath" -ForegroundColor Red
-            $fail++
+        # For archives, check canonical executable path exists
+        if ($name -eq "piper") {
+            $expectedExe = Join-Path $ToolsDir "piper\piper.exe"
+            if (-not (Test-Path $expectedExe -PathType Leaf)) {
+                Write-Host "  [FAIL] Canonical executable not found: $expectedExe" -ForegroundColor Red
+                $fail++
+            } else {
+                Write-Host "  [OK] Canonical executable: piper\piper.exe" -ForegroundColor Green
+                $pass++
+            }
+        } elseif ($name -eq "whisper") {
+            $expectedExe = Join-Path $ToolsDir "whisper\Release\main.exe"
+            if (-not (Test-Path $expectedExe -PathType Leaf)) {
+                Write-Host "  [FAIL] Canonical executable not found: $expectedExe" -ForegroundColor Red
+                $fail++
+            } else {
+                Write-Host "  [OK] Canonical executable: whisper\Release\main.exe" -ForegroundColor Green
+                $pass++
+            }
         } else {
-            Write-Host "  [OK] Directory exists with $($files.Count) file(s)" -ForegroundColor Green
-            $pass++
+            # Generic archive check
+            if (-not (Test-Path $expectedPath -PathType Container)) {
+                Write-Host "  [FAIL] Directory not found: $expectedPath" -ForegroundColor Red
+                $fail++
+            } else {
+                $files = Get-ChildItem -Path $expectedPath -Recurse -File
+                if ($files.Count -eq 0) {
+                    Write-Host "  [FAIL] Directory exists but is empty: $expectedPath" -ForegroundColor Red
+                    $fail++
+                } else {
+                    Write-Host "  [OK] Directory exists with $($files.Count) file(s)" -ForegroundColor Green
+                    $pass++
+                }
+            }
         }
     } elseif ($toolType -eq "file") {
         # For files, check if the specific file exists and verify checksum

@@ -129,6 +129,39 @@ foreach ($tool in $manifest.tools.PSObject.Properties) {
             Write-Status "Extracting archive to $destination..."
             New-Item -ItemType Directory -Path $destination -Force | Out-Null
             Expand-Archive -Path $downloadPath -DestinationPath $destination -Force
+
+            # Normalize: ensure canonical executable paths after extraction
+            if ($name -eq "piper") {
+                $canonical = Join-Path $destination "piper.exe"
+                if (-not (Test-Path $canonical -PathType Leaf)) {
+                    # Some ZIP layouts extract to a subfolder — move up
+                    $nested = Get-ChildItem -Path $destination -Filter "piper.exe" -Recurse -File | Select-Object -First 1
+                    if ($nested) {
+                        Copy-Item -Path $nested.FullName -Destination $canonical -Force
+                        Write-Status "Normalized piper.exe to canonical path" "DarkYellow"
+                    }
+                }
+            } elseif ($name -eq "whisper") {
+                $canonicalDir = Join-Path $destination "Release"
+                $canonical = Join-Path $canonicalDir "main.exe"
+                if (-not (Test-Path $canonical -PathType Leaf)) {
+                    # Some ZIP layouts put main.exe at root — move to Release/
+                    $rootMain = Join-Path $destination "main.exe"
+                    if (Test-Path $rootMain -PathType Leaf) {
+                        New-Item -ItemType Directory -Path $canonicalDir -Force | Out-Null
+                        Copy-Item -Path $rootMain -Destination $canonical -Force
+                        Write-Status "Normalized main.exe to Release/main.exe" "DarkYellow"
+                    } else {
+                        # Search recursively
+                        $nested = Get-ChildItem -Path $destination -Filter "main.exe" -Recurse -File | Select-Object -First 1
+                        if ($nested) {
+                            New-Item -ItemType Directory -Path $canonicalDir -Force | Out-Null
+                            Copy-Item -Path $nested.FullName -Destination $canonical -Force
+                            Write-Status "Normalized main.exe to Release/main.exe" "DarkYellow"
+                        }
+                    }
+                }
+            }
         } elseif ($toolType -eq "file") {
             Write-Status "Copying file to $destination..."
             $destDir = Split-Path $destination -Parent
