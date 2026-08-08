@@ -132,13 +132,31 @@ foreach ($tool in $manifest.tools.PSObject.Properties) {
 
             # Normalize: ensure canonical executable paths after extraction
             if ($name -eq "piper") {
+                # The pinned archive extracts a nested piper/ folder containing
+                # piper.exe, its runtime DLLs (espeak-ng.dll, piper_phonemize.dll,
+                # onnxruntime.dll, onnxruntime_providers_shared.dll) and
+                # espeak-ng-data/. Move the WHOLE runtime up so every companion
+                # is colocated with the canonical executable — never just the exe.
+                $nestedDir = Join-Path $destination "piper"
+                if ((Test-Path $nestedDir -PathType Container) -and -not (Test-Path (Join-Path $destination "piper.exe") -PathType Leaf)) {
+                    Get-ChildItem -Path $nestedDir -Force | ForEach-Object {
+                        Move-Item -Path $_.FullName -Destination $destination -Force
+                    }
+                    Remove-Item -Path $nestedDir -Force -ErrorAction SilentlyContinue
+                    Write-Status "Normalized piper runtime (exe + DLLs + data) to canonical path" "DarkYellow"
+                }
+                # Fallback for other archive layouts: find piper.exe and move its
+                # sibling runtime files (DLLs, espeak-ng-data) up with it.
                 $canonical = Join-Path $destination "piper.exe"
                 if (-not (Test-Path $canonical -PathType Leaf)) {
-                    # Some ZIP layouts extract to a subfolder — move up
                     $nested = Get-ChildItem -Path $destination -Filter "piper.exe" -Recurse -File | Select-Object -First 1
                     if ($nested) {
-                        Copy-Item -Path $nested.FullName -Destination $canonical -Force
-                        Write-Status "Normalized piper.exe to canonical path" "DarkYellow"
+                        $nestedParent = $nested.Directory
+                        Get-ChildItem -Path $nestedParent -Force | ForEach-Object {
+                            Move-Item -Path $_.FullName -Destination $destination -Force
+                        }
+                        Remove-Item -Path $nestedParent -Force -ErrorAction SilentlyContinue
+                        Write-Status "Normalized piper runtime to canonical path" "DarkYellow"
                     }
                 }
                 # Piper requires espeak-ng-data adjacent to the executable for

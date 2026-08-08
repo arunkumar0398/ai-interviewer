@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor, act } from "@testing-library/react";
+import { render, screen, waitFor, act, fireEvent } from "@testing-library/react";
 import InterviewPage from "../app/interview/page";
 import { mockListenCallbacks } from "./setup";
 
@@ -226,6 +226,93 @@ describe("Interview Page", () => {
       // Component should not be in device-check or error state
       expect(screen.queryByText("Device Check")).not.toBeInTheDocument();
     });
+  });
+
+  it("recovers from create_session failure via Retry with the same session UUID", async () => {
+    let createSessionCalls = 0;
+    let capturedSessionId: string | null = null;
+    let roundCalls = 0;
+
+    mockInvoke.mockImplementation(
+      (cmd: string, args?: Record<string, unknown>) => {
+        switch (cmd) {
+          case "get_app_config":
+            return Promise.resolve(mockAppConfig);
+          case "check_audio_devices":
+            return Promise.resolve({
+              mic_available: true,
+              mic_name: "Mic",
+              speaker_available: true,
+              speaker_name: "Speaker",
+              mic_test_ok: true,
+              errors: [],
+            });
+          case "create_session": {
+            capturedSessionId = args?.sessionId as string;
+            createSessionCalls += 1;
+            // First attempt fails, the retry succeeds.
+            if (createSessionCalls === 1) {
+              return Promise.reject(new Error("DB locked"));
+            }
+            return Promise.resolve();
+          }
+          case "run_interview_round": {
+            roundCalls += 1;
+            expect(args?.sessionId).toBe(capturedSessionId);
+            return Promise.resolve({
+              metadata: {
+                file_path: "/tmp/round.wav",
+                sha256: "abc123",
+                duration_ms: 5000,
+                sample_rate: 16000,
+                channels: 1,
+                file_size_bytes: 100,
+              },
+              transcription: "My answer",
+            });
+          }
+          default:
+            return Promise.reject(new Error(`Unexpected command: ${cmd}`));
+        }
+      }
+    );
+
+    await act(async () => {
+      render(<InterviewPage />);
+    });
+
+    // Tools ready -> device check screen.
+    await waitFor(() => {
+      expect(screen.getByText("Check Devices")).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText("Check Devices"));
+
+    // Device check passes -> ready to start.
+    await waitFor(() => {
+      expect(screen.getByText("Start Interview")).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText("Start Interview"));
+
+    // create_session fails -> error phase with Retry.
+    await waitFor(() => {
+      expect(screen.getByText("Retry")).toBeInTheDocument();
+    });
+    expect(createSessionCalls).toBe(1);
+
+    // Retry retries ONLY create_session, preserving the stable sessionId.
+    fireEvent.click(screen.getByText("Retry"));
+    await waitFor(() => {
+      expect(screen.getByText("Start Interview")).toBeInTheDocument();
+    });
+    expect(createSessionCalls).toBe(2);
+
+    // First round can now execute exactly once, with the same session UUID.
+    fireEvent.click(screen.getByText("Start Interview"));
+    await waitFor(() => {
+      expect(screen.getByText("Round 1 Complete")).toBeInTheDocument();
+    });
+    expect(roundCalls).toBe(1);
+    expect(capturedSessionId).toBeTruthy();
   });
 
   it("responds to processing phase event and shows processing state", async () => {

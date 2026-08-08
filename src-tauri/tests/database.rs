@@ -446,6 +446,7 @@ fn db_duplicate_round_index_errors() {
         16000,
         1,
         160044,
+        false,
     )
     .unwrap();
 
@@ -461,6 +462,7 @@ fn db_duplicate_round_index_errors() {
         16000,
         1,
         168044,
+        false,
     );
     assert!(result.is_err(), "Duplicate round_index should error");
 
@@ -499,6 +501,7 @@ fn db_insert_round_with_session_update() {
         16000,
         1,
         160044,
+        false,
     )
     .unwrap();
     assert_eq!(
@@ -520,6 +523,7 @@ fn db_insert_round_with_session_update() {
         16000,
         1,
         192044,
+        false,
     )
     .unwrap();
     assert_eq!(
@@ -557,6 +561,7 @@ fn db_insert_round_with_session_update_rollback() {
         16000,
         1,
         160044,
+        false,
     )
     .unwrap();
     assert_eq!(
@@ -580,6 +585,7 @@ fn db_insert_round_with_session_update_rollback() {
         16000,
         1,
         168044,
+        false,
     );
     assert!(result.is_err(), "Duplicate round_index should error");
     assert_eq!(
@@ -589,6 +595,116 @@ fn db_insert_round_with_session_update_rollback() {
             .total_rounds,
         1,
         "total_rounds should not increase for failed duplicate"
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// Test: a final round commits the round AND the session completion together.
+/// completed_at must be set in the same transaction as the round insert.
+#[test]
+fn db_final_round_commits_round_and_session_completion() {
+    let db_path = std::env::temp_dir().join("test_final_round_commit.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
+    db.create_session("final-session", "Test").unwrap();
+
+    let session_before = db.get_session("final-session").unwrap().unwrap();
+    assert!(session_before.completed_at.is_none());
+
+    db.insert_round_with_session_update(
+        "final-session",
+        0,
+        "Q-final",
+        "A-final",
+        "/tmp/rf.wav",
+        "hf",
+        7000,
+        16000,
+        1,
+        224044,
+        true,
+    )
+    .unwrap();
+
+    // Round persisted and session finalized together.
+    let rounds = db.get_rounds("final-session").unwrap();
+    assert_eq!(rounds.len(), 1);
+    assert_eq!(rounds[0].question, "Q-final");
+
+    let session_after = db.get_session("final-session").unwrap().unwrap();
+    assert_eq!(session_after.total_rounds, 1);
+    assert!(
+        session_after.completed_at.is_some(),
+        "completed_at must be set when the final round commits"
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// Test: a non-final round must NOT mark the session completed.
+#[test]
+fn db_non_final_round_does_not_complete_session() {
+    let db_path = std::env::temp_dir().join("test_non_final_round.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
+    db.create_session("nonfinal-session", "Test").unwrap();
+
+    db.insert_round_with_session_update(
+        "nonfinal-session",
+        0,
+        "Q1",
+        "A1",
+        "/tmp/r1.wav",
+        "h1",
+        5000,
+        16000,
+        1,
+        160044,
+        false,
+    )
+    .unwrap();
+
+    let session = db.get_session("nonfinal-session").unwrap().unwrap();
+    assert_eq!(session.total_rounds, 1);
+    assert!(
+        session.completed_at.is_none(),
+        "completed_at must stay NULL for non-final rounds"
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// Test: when the session does not exist, the whole transaction rolls back and
+/// no round row is left behind.
+#[test]
+fn db_final_round_missing_session_rolls_back_everything() {
+    let db_path = std::env::temp_dir().join("test_missing_session_rollback.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
+
+    let result = db.insert_round_with_session_update(
+        "no-such-session",
+        0,
+        "Q1",
+        "A1",
+        "/tmp/r1.wav",
+        "h1",
+        5000,
+        16000,
+        1,
+        160044,
+        true,
+    );
+    assert!(result.is_err(), "Insert for a missing session must error");
+
+    let rounds = db.get_rounds("no-such-session").unwrap();
+    assert!(
+        rounds.is_empty(),
+        "No partially persisted round may remain after a rolled-back transaction"
     );
 
     let _ = std::fs::remove_file(&db_path);

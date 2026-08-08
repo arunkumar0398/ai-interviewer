@@ -245,9 +245,14 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
-    /// Insert a round and increment the session's total_rounds atomically.
-    /// Uses plain INSERT — UNIQUE(session_id, round_index) violation returns
-    /// a domain error so the caller can surface "Round N already exists".
+    /// Insert a round and update the owning session atomically: the round
+    /// INSERT, the session total_rounds increment, and — when `is_final` is
+    /// true — the session completed_at timestamp all commit in ONE
+    /// transaction. Uses plain INSERT — UNIQUE(session_id, round_index)
+    /// violation returns a domain error so the caller can surface
+    /// "Round N already exists". The session update must affect exactly one
+    /// row (the session must exist); otherwise the whole transaction rolls
+    /// back and no round is persisted.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_round_with_session_update(
         &self,
@@ -261,6 +266,7 @@ impl Database {
         sample_rate: u32,
         channels: u16,
         file_size_bytes: u64,
+        is_final: bool,
     ) -> SqlResult<i64> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -281,10 +287,19 @@ impl Database {
                     file_size_bytes,
                 ],
             )?;
-            conn.execute(
-                "UPDATE sessions SET total_rounds = total_rounds + 1 WHERE id = ?1",
-                params![session_id],
+            // Session must exist — verify exactly one row is updated. The
+            // completed_at timestamp is set in the same statement when this is
+            // the final round, so commit is all-or-nothing.
+            let affected = conn.execute(
+                "UPDATE sessions
+                    SET total_rounds = total_rounds + 1,
+                        completed_at = CASE WHEN ?2 = 1 THEN datetime('now') ELSE completed_at END
+                  WHERE id = ?1",
+                params![session_id, if is_final { 1 } else { 0 }],
             )?;
+            if affected != 1 {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
             Ok::<_, rusqlite::Error>(conn.last_insert_rowid())
         })();
         match result {

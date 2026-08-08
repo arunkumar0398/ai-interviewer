@@ -1,3 +1,4 @@
+use crate::audio::pipe::StderrDrain;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -109,6 +110,10 @@ impl PiperSupervisor {
                 }
             };
 
+            // Drain stderr concurrently so Piper can never block on a full
+            // stderr pipe while we consume its stdout PCM.
+            let stderr_drain = child.stderr.take().map(StderrDrain::start);
+
             // Write text to stdin
             if let Some(mut stdin) = child.stdin.take() {
                 use tokio::io::AsyncWriteExt;
@@ -196,26 +201,50 @@ impl PiperSupervisor {
             match wait_result {
                 Ok(Ok(status)) => {
                     if status.success() {
-                        // Play the collected PCM data
-                        let _ = play_raw_pcm_async(&pcm_data, sample_rate, stop_flag.clone()).await;
+                        // Play the collected PCM data. A playback failure must
+                        // surface as an error: the candidate did not actually
+                        // hear the question, so the round must not continue.
+                        if let Err(e) =
+                            play_raw_pcm_async(&pcm_data, sample_rate, stop_flag.clone()).await
+                        {
+                            let _ = event_tx.try_send(TtsEvent::Error {
+                                message: format!("Playback failed: {}", e),
+                            });
+                            return Err(anyhow::anyhow!("Playback failed: {}", e));
+                        }
                         let _ = event_tx.try_send(TtsEvent::Finished { duration_ms: 0 });
                         return Ok(());
                     }
                     // Non-zero exit — may need restart
                     restarts += 1;
+                    let stderr_text = match &stderr_drain {
+                        Some(d) => d.text().await,
+                        None => String::new(),
+                    };
                     if restarts >= max_restarts {
                         let _ = event_tx.try_send(TtsEvent::Error {
-                            message: format!("Piper crashed {} times, giving up", max_restarts),
+                            message: format!(
+                                "Piper crashed {} times, giving up: {}",
+                                max_restarts,
+                                stderr_text.trim()
+                            ),
                         });
-                        return Err(anyhow::anyhow!("Piper exceeded max restarts"));
+                        return Err(anyhow::anyhow!(
+                            "Piper exceeded max restarts: {}",
+                            stderr_text.trim()
+                        ));
                     }
                     let _ = event_tx.try_send(TtsEvent::ProcessCrashed { restarts });
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                     continue 'restart;
                 }
                 Ok(Err(e)) => {
+                    let stderr_text = match &stderr_drain {
+                        Some(d) => d.text().await,
+                        None => String::new(),
+                    };
                     let _ = event_tx.try_send(TtsEvent::Error {
-                        message: format!("Piper wait error: {}", e),
+                        message: format!("Piper wait error: {} ({})", e, stderr_text.trim()),
                     });
                     return Err(anyhow::anyhow!("Piper wait error: {}", e));
                 }

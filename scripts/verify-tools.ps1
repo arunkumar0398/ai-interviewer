@@ -70,6 +70,19 @@ foreach ($tool in $manifest.tools.PSObject.Properties) {
                 Write-Host "  [OK] Required runtime data: piper\espeak-ng-data\phontab" -ForegroundColor Green
                 $pass++
             }
+            # Every required runtime DLL is individually mandatory — the
+            # packaged piper.exe will not load without them.
+            $requiredDlls = @("espeak-ng.dll", "piper_phonemize.dll", "onnxruntime.dll", "onnxruntime_providers_shared.dll")
+            foreach ($dll in $requiredDlls) {
+                $dllPath = Join-Path $ToolsDir ("piper\" + $dll)
+                if (-not (Test-Path $dllPath -PathType Leaf)) {
+                    Write-Host "  [FAIL] Required runtime DLL missing: piper\$dll" -ForegroundColor Red
+                    $fail++
+                } else {
+                    Write-Host "  [OK] Required runtime DLL: piper\$dll" -ForegroundColor Green
+                    $pass++
+                }
+            }
         } elseif ($name -eq "whisper") {
             $expectedExe = Join-Path $ToolsDir "whisper\Release\main.exe"
             if (-not (Test-Path $expectedExe -PathType Leaf)) {

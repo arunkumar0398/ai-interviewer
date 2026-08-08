@@ -64,7 +64,8 @@ type InterviewPhase =
 type RetryTarget =
   | { kind: "round"; question: string }
   | { kind: "device-check" }
-  | { kind: "readiness" };
+  | { kind: "readiness" }
+  | { kind: "session-init" };
 
 const QUESTIONS = [
   "Tell me about yourself and your background.",
@@ -208,6 +209,8 @@ export default function InterviewPage() {
 
     // Prevent concurrent double-starts while session creation or round startup
     if (isStartingRound.current) return;
+    // Never execute a round while session initialization is pending or failed.
+    if (sessionInitState === "creating" || sessionInitState === "error") return;
     isStartingRound.current = true;
 
     try {
@@ -226,6 +229,7 @@ export default function InterviewPage() {
           setSessionInitState("error");
           setPhase("error");
           setError(`Failed to create session: ${String(e)}`);
+          setRetryTarget({ kind: "session-init" });
           return;
         }
       }
@@ -295,6 +299,23 @@ export default function InterviewPage() {
       case "device-check": {
         // Re-run device check only
         await handleDeviceCheck();
+        break;
+      }
+      case "session-init": {
+        // Retry only create_session, reusing the stable sessionId. On success
+        // transition to ready; the user then starts the first round.
+        try {
+          await invoke("create_session", {
+            sessionId,
+            candidateName: "Candidate",
+          });
+          setSessionInitState("ready");
+          setPhase("ready");
+        } catch (e) {
+          setError(String(e));
+          setRetryTarget({ kind: "session-init" });
+          setPhase("error");
+        }
         break;
       }
       case "round": {

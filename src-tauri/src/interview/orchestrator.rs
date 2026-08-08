@@ -1,4 +1,5 @@
 use crate::audio::capture::{self, CaptureEvent};
+use crate::audio::pipe::StderrDrain;
 use crate::audio::tts_supervisor::{PiperSupervisor, TtsEvent};
 use crate::paths::uuid_to_path;
 use sha2::Digest;
@@ -29,6 +30,41 @@ pub struct AudioMetadata {
     pub sample_rate: u32,
     pub channels: u16,
     pub file_size_bytes: u64,
+}
+
+/// A finalized WAV is provisional until the round's DB transaction commits.
+/// If the round fails before commit (stop, timeout, checksum failure,
+/// transcription failure, or any other error), the file is deleted on drop.
+/// The orchestrator commits it right before returning success; the caller
+/// (lib.rs) is responsible for deleting it again if persistence fails.
+struct ProvisionalAudio {
+    wav_path: std::path::PathBuf,
+    committed: bool,
+}
+
+impl ProvisionalAudio {
+    fn new(wav_path: std::path::PathBuf) -> Self {
+        Self {
+            wav_path,
+            committed: false,
+        }
+    }
+
+    /// Mark the WAV as committed (round succeeded). Deletion on drop is
+    /// then suppressed.
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ProvisionalAudio {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.wav_path);
+            // Partial recordings land in a temp file next to the final path.
+            let _ = std::fs::remove_file(self.wav_path.with_extension("wav.tmp"));
+        }
+    }
 }
 
 /// Compute SHA-256 hash of a file
@@ -102,6 +138,11 @@ pub async fn run_interview_round(
     let session_dir = paths.session_recordings_dir(session_id);
     std::fs::create_dir_all(&session_dir)?;
     let wav_path = session_dir.join(format!("{}.wav", uuid_to_path(&round_id)));
+
+    // The WAV is provisional until the round's DB transaction commits. Any
+    // failure after this point (stop, timeout, checksum, transcription) deletes
+    // it on drop; the success path commits it before returning.
+    let mut provisional = ProvisionalAudio::new(wav_path.clone());
 
     let record_event_tx = event_tx.clone();
 
@@ -177,6 +218,9 @@ pub async fn run_interview_round(
         .as_ref()
         .map(|tx| tx.try_send(InterviewPhase::Complete));
 
+    // Round succeeded — keep the WAV; lib.rs persists it (and owns deletion
+    // if the persistence transaction fails).
+    provisional.commit();
     Ok((metadata, transcription))
 }
 
@@ -206,7 +250,6 @@ async fn transcribe_wav(
     stop_flag: Arc<AtomicBool>,
 ) -> anyhow::Result<String> {
     use std::process::Stdio;
-    use tokio::io::AsyncReadExt;
 
     let tools = crate::paths::resolve_tools(&paths.tool_dir);
     let whisper_bin = tools
@@ -238,10 +281,15 @@ async fn transcribe_wav(
         .arg("-otxt")
         .arg("-of")
         .arg(output_dir.join(&stem))
-        .stdout(Stdio::piped())
+        // stdout is not used for the transcription result (it goes to -otxt),
+        // so point it at null; stderr is drained concurrently so whisper can
+        // never block on a full pipe while we wait for it to exit.
+        .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;
+
+    let stderr_drain = child.stderr.take().map(StderrDrain::start);
 
     let deadline =
         tokio::time::Instant::now() + tokio::time::Duration::from_secs(WHISPER_TIMEOUT_SECS);
@@ -267,15 +315,20 @@ async fn transcribe_wav(
         }
     };
 
-    let status = wait_result?;
+    let status = wait_result.inspect_err(|_| {
+        let _ = std::fs::remove_file(&txt_path);
+    })?;
     if !status.success() {
-        let mut stderr = child.stderr.take().unwrap();
-        let mut buf = String::new();
-        let _ = stderr.read_to_string(&mut buf).await;
+        // Non-zero exit — remove the partial transcript and surface stderr.
+        let _ = std::fs::remove_file(&txt_path);
+        let stderr_text = match &stderr_drain {
+            Some(d) => d.text().await,
+            None => String::new(),
+        };
         anyhow::bail!(
             "Whisper failed (exit {}): {}",
             status.code().unwrap_or(-1),
-            buf
+            stderr_text.trim()
         );
     }
 
@@ -283,4 +336,53 @@ async fn transcribe_wav(
     let _ = std::fs::remove_file(&txt_path);
 
     Ok(text.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A WAV left uncommitted (round failed before persistence) must be
+    /// deleted when the guard drops, including any partial temp file.
+    #[test]
+    fn provisional_audio_deletes_wav_and_tmp_on_drop_without_commit() {
+        let dir = std::env::temp_dir().join("provisional_audio_delete_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let wav = dir.join("round.wav");
+        let tmp = dir.join("round.wav.tmp");
+        std::fs::write(&wav, b"audio").unwrap();
+        std::fs::write(&tmp, b"partial").unwrap();
+
+        {
+            let _provisional = ProvisionalAudio::new(wav.clone());
+            // dropped without commit — simulates a failed round
+        }
+
+        assert!(!wav.exists(), "uncommitted WAV must be deleted");
+        assert!(!tmp.exists(), "partial temp WAV must be deleted");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A committed WAV (round persisted) must never be deleted automatically.
+    #[test]
+    fn provisional_audio_keeps_wav_after_commit() {
+        let dir = std::env::temp_dir().join("provisional_audio_commit_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let wav = dir.join("round.wav");
+        std::fs::write(&wav, b"audio").unwrap();
+
+        {
+            let mut provisional = ProvisionalAudio::new(wav.clone());
+            provisional.commit();
+        }
+
+        assert!(wav.exists(), "committed WAV must be retained");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

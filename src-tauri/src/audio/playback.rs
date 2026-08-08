@@ -1,3 +1,4 @@
+use crate::audio::pipe::StderrDrain;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -165,6 +166,10 @@ pub async fn generate_tts(
         .kill_on_drop(true)
         .spawn()?;
 
+    // Drain stderr concurrently so Piper can never block on a full stderr
+    // pipe while we consume its stdout PCM.
+    let stderr_drain = child.stderr.take().map(StderrDrain::start);
+
     // Send text via stdin
     if let Some(mut stdin) = child.stdin.take() {
         use tokio::io::AsyncWriteExt;
@@ -222,23 +227,15 @@ pub async fn generate_tts(
     match wait_result {
         Ok(Ok(status)) => {
             if !status.success() {
-                // Read stderr
-                let stderr_msg = child
-                    .stderr
-                    .take()
-                    .map(|mut s| {
-                        let mut buf = String::new();
-                        tokio::runtime::Handle::current().block_on(async {
-                            let _ = s.read_to_string(&mut buf).await;
-                        });
-                        buf
-                    })
-                    .unwrap_or_default();
+                let stderr_msg = match &stderr_drain {
+                    Some(d) => d.text().await,
+                    None => String::new(),
+                };
                 let _ = std::fs::remove_file(&output_path);
                 anyhow::bail!(
                     "Piper TTS failed (exit {}): {}",
                     status.code().unwrap_or(-1),
-                    stderr_msg
+                    stderr_msg.trim()
                 );
             }
         }

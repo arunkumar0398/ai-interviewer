@@ -46,20 +46,33 @@ async fn clear_active_recording(state: &RecordingState) {
     *guard = None;
 }
 
-/// Scope guard that clears RecordingState when dropped.
-/// Guarantees cleanup on all exit paths: success, error, panic, cancel, timeout.
+/// Scope guard that clears RecordingState when dropped. This is only a
+/// panic/cancellation safety net: every controlled path clears RecordingState
+/// explicitly (and disarms the guard) before returning, so the slot is free
+/// deterministically — no spawned task, no timing dependence.
 struct RecordingGuard {
     state: Arc<RecordingState>,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+impl RecordingGuard {
+    /// Disarm the safety net after explicit cleanup has run, so Drop does not
+    /// schedule a redundant async clear.
+    fn disarm(&self) {
+        self.armed.store(false, Ordering::SeqCst);
+    }
 }
 
 impl Drop for RecordingGuard {
     fn drop(&mut self) {
-        let state = self.state.clone();
-        // Spawn the async clear on the runtime; this runs even on panic.
-        // clone() ensures the Arc keeps the state alive past the guard's lifetime.
-        tokio::runtime::Handle::current().spawn(async move {
-            clear_active_recording(&state).await;
-        });
+        if self.armed.load(Ordering::SeqCst) {
+            let state = self.state.clone();
+            // Spawn the async clear on the runtime; this runs even on panic.
+            // clone() ensures the Arc keeps the state alive past the guard's lifetime.
+            tokio::runtime::Handle::current().spawn(async move {
+                clear_active_recording(&state).await;
+            });
+        }
     }
 }
 
@@ -258,10 +271,11 @@ async fn run_interview_round(
     acquire_recording(&state, recording_handle).await?;
 
     // Safety-net guard: clears RecordingState on any early return, panic, or
-    // cancellation. Explicit clear_active_recording call at normal exit is
-    // still needed to avoid a redundant tokio::spawn.
-    let _recording_guard = RecordingGuard {
+    // cancellation. Every controlled path below clears RecordingState
+    // explicitly (after the worker has fully terminated) and disarms it.
+    let recording_guard = RecordingGuard {
         state: state.inner().clone(),
+        armed: std::sync::atomic::AtomicBool::new(true),
     };
 
     let paths_clone = paths.paths.clone();
@@ -364,12 +378,21 @@ async fn run_interview_round(
                 Err(join_err) => Err(format!("Interview worker failed: {}", join_err)),
             };
 
+            // Worker has fully terminated — release the recording slot
+            // deterministically and disarm the safety net.
+            clear_active_recording(&state).await;
+            recording_guard.disarm();
+
             match result {
                 Ok((metadata, transcription)) => {
-                    // Persist round atomically: INSERT + session total_rounds++
-                    {
+                    // Persist round atomically: round INSERT + session
+                    // total_rounds increment + completed_at (when final) commit
+                    // in ONE transaction.
+                    let persist_result: Result<i64, String> = (async {
                         let guard = db_state.db.lock().await;
-                        let db = guard.as_ref().ok_or("Database not initialized")?;
+                        let db = guard
+                            .as_ref()
+                            .ok_or_else(|| "Database not initialized".to_string())?;
                         db.insert_round_with_session_update(
                             &session_id.hyphenated().to_string(),
                             round_index,
@@ -381,6 +404,7 @@ async fn run_interview_round(
                             metadata.sample_rate,
                             metadata.channels,
                             metadata.file_size_bytes,
+                            is_final,
                         )
                         .map_err(|e| {
                             let msg = e.to_string();
@@ -389,22 +413,23 @@ async fn run_interview_round(
                             } else {
                                 format!("Failed to persist round: {}", e)
                             }
-                        })?;
+                        })
+                    })
+                    .await;
 
-                        // Backend-authoritative session completion: finalize immediately
-                        // after the final round is persisted successfully.
-                        if is_final {
-                            db.complete_session(
-                                &session_id.hyphenated().to_string(),
-                                round_index + 1,
-                            )
-                            .map_err(|e| format!("Failed to complete session: {}", e))?;
+                    match persist_result {
+                        Ok(_) => Ok(InterviewRoundResult {
+                            metadata,
+                            transcription,
+                        }),
+                        Err(e) => {
+                            // The round never committed — the WAV was provisional
+                            // until this transaction. Delete it plus any partial
+                            // temp artifacts for this attempted round.
+                            let _ = std::fs::remove_file(&metadata.file_path);
+                            Err(e)
                         }
                     }
-                    Ok(InterviewRoundResult {
-                        metadata,
-                        transcription,
-                    })
                 }
                 Err(e) => Err(e.to_string()),
             }
@@ -437,7 +462,17 @@ async fn run_interview_round(
                 let _ = worker_future.await;
             }
 
-            // Clean up temp files
+            // Worker has fully terminated (cooperatively or aborted) — release
+            // the recording slot deterministically and disarm the safety net.
+            clear_active_recording(&state).await;
+            recording_guard.disarm();
+
+            // The round never committed — remove provisional artifacts: the
+            // WAV for this round_id, its partial temp file, and the session
+            // temp transcript directory.
+            let wav_path = paths.paths.round_audio_path(session_id, round_id);
+            let _ = std::fs::remove_file(&wav_path);
+            let _ = std::fs::remove_file(wav_path.with_extension("wav.tmp"));
             let temp_dir = paths
                 .paths
                 .temp_dir
@@ -592,4 +627,80 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_handle() -> audio::capture::RecordingHandle {
+        audio::capture::RecordingHandle {
+            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Controlled path: after the worker terminates, the command explicitly
+    /// clears RecordingState and disarms the guard, so a second round can
+    /// acquire the recording slot immediately — no spawned-task timing.
+    #[tokio::test]
+    async fn recording_slot_reusable_after_explicit_clear_and_disarm() {
+        let state = Arc::new(RecordingState {
+            handle: Mutex::new(None),
+        });
+        let handle = fake_handle();
+
+        acquire_recording(&state, handle.clone()).await.unwrap();
+        let guard = RecordingGuard {
+            state: state.clone(),
+            armed: std::sync::atomic::AtomicBool::new(true),
+        };
+
+        // Same ordering as the controlled completion/timeout paths in
+        // run_interview_round: worker done -> explicit clear -> disarm.
+        clear_active_recording(&state).await;
+        guard.disarm();
+        drop(guard);
+
+        assert!(state.handle.lock().await.is_none());
+        // Second round can acquire the slot without waiting.
+        acquire_recording(&state, handle).await.unwrap();
+        assert!(state.handle.lock().await.is_some());
+    }
+
+    /// Safety net: a guard dropped while still armed (panic/cancellation path)
+    /// must still clear the slot.
+    #[tokio::test]
+    async fn recording_slot_cleared_by_guard_safety_net_on_drop() {
+        let state = Arc::new(RecordingState {
+            handle: Mutex::new(None),
+        });
+        let handle = fake_handle();
+        acquire_recording(&state, handle.clone()).await.unwrap();
+
+        {
+            let guard = RecordingGuard {
+                state: state.clone(),
+                armed: std::sync::atomic::AtomicBool::new(true),
+            };
+            drop(guard);
+        }
+        // Let the spawned safety-net clear task run.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(state.handle.lock().await.is_none());
+    }
+
+    /// Acquire rejects while a slot is held, mirroring the duplicate-round
+    /// guard in run_interview_round.
+    #[tokio::test]
+    async fn acquire_rejects_while_slot_held() {
+        let state = Arc::new(RecordingState {
+            handle: Mutex::new(None),
+        });
+        let handle = fake_handle();
+        acquire_recording(&state, handle.clone()).await.unwrap();
+
+        let result = acquire_recording(&state, fake_handle()).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("already active"));
+    }
 }

@@ -347,6 +347,38 @@ if exist "%PORTABLE_DIR%\tools\piper\espeak-ng-data\phontab" (
     set /a FAIL+=1
 )
 
+if exist "%PORTABLE_DIR%\tools\piper\espeak-ng.dll" (
+    echo   [PASS] Portable espeak-ng.dll exists
+    set /a PASS+=1
+) else (
+    echo   [FAIL] Portable espeak-ng.dll missing
+    set /a FAIL+=1
+)
+
+if exist "%PORTABLE_DIR%\tools\piper\piper_phonemize.dll" (
+    echo   [PASS] Portable piper_phonemize.dll exists
+    set /a PASS+=1
+) else (
+    echo   [FAIL] Portable piper_phonemize.dll missing
+    set /a FAIL+=1
+)
+
+if exist "%PORTABLE_DIR%\tools\piper\onnxruntime.dll" (
+    echo   [PASS] Portable onnxruntime.dll exists
+    set /a PASS+=1
+) else (
+    echo   [FAIL] Portable onnxruntime.dll missing
+    set /a FAIL+=1
+)
+
+if exist "%PORTABLE_DIR%\tools\piper\onnxruntime_providers_shared.dll" (
+    echo   [PASS] Portable onnxruntime_providers_shared.dll exists
+    set /a PASS+=1
+) else (
+    echo   [FAIL] Portable onnxruntime_providers_shared.dll missing
+    set /a FAIL+=1
+)
+
 if exist "%PORTABLE_DIR%\tools\whisper\Release\main.exe" (
     echo   [PASS] Portable whisper binary exists
     set /a PASS+=1
@@ -360,6 +392,16 @@ if exist "%PORTABLE_DIR%\tools\models\ggml-tiny.en.bin" (
     set /a PASS+=1
 ) else (
     echo   [FAIL] Portable whisper model missing
+    set /a FAIL+=1
+)
+
+REM --- Staged-runtime Piper smoke: invoke the packaged exe, never repo tools/ ---
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0\piper-runtime-smoke.ps1" -PiperDir "%PORTABLE_DIR%\tools\piper"
+if %ERRORLEVEL% equ 0 (
+    echo   [PASS] Staged Piper runtime smoke
+    set /a PASS+=1
+) else (
+    echo   [FAIL] Staged Piper runtime smoke
     set /a FAIL+=1
 )
 
