@@ -315,6 +315,97 @@ describe("Interview Page", () => {
     expect(capturedSessionId).toBeTruthy();
   });
 
+  it("does not become ready when speaker is missing (P2-5)", async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      switch (cmd) {
+        case "get_app_config":
+          return Promise.resolve(mockAppConfig);
+        case "check_audio_devices":
+          return Promise.resolve({
+            mic_available: true,
+            mic_name: "Mic",
+            speaker_available: false,
+            speaker_name: null,
+            mic_test_ok: true,
+            errors: ["No speaker/headphone detected"],
+          });
+        default:
+          return Promise.reject(new Error(`Unexpected command: ${cmd}`));
+      }
+    });
+
+    await act(async () => {
+      render(<InterviewPage />);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Check Devices")).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText("Check Devices"));
+
+    // Mic is OK but the speaker is missing -> NOT ready; error + Retry shown.
+    await waitFor(() => {
+      expect(screen.getByText("Retry")).toBeInTheDocument();
+    });
+    expect(screen.getByText(/No speaker\/headphone detected/)).toBeInTheDocument();
+    expect(screen.queryByText("Start Interview")).not.toBeInTheDocument();
+  });
+
+  it("does not pass isFinal to run_interview_round (P1-2)", async () => {
+    let capturedArgs: Record<string, unknown> | null = null;
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      switch (cmd) {
+        case "get_app_config":
+          return Promise.resolve(mockAppConfig);
+        case "check_audio_devices":
+          return Promise.resolve({
+            mic_available: true,
+            mic_name: "Mic",
+            speaker_available: true,
+            speaker_name: "Speaker",
+            mic_test_ok: true,
+            errors: [],
+          });
+        case "create_session":
+          return Promise.resolve();
+        case "run_interview_round": {
+          capturedArgs = args ?? null;
+          return Promise.resolve({
+            metadata: {
+              file_path: "/tmp/round.wav",
+              sha256: "abc123",
+              duration_ms: 5000,
+              sample_rate: 16000,
+              channels: 1,
+              file_size_bytes: 100,
+            },
+            transcription: "My answer",
+          });
+        }
+        default:
+          return Promise.reject(new Error(`Unexpected command: ${cmd}`));
+      }
+    });
+
+    await act(async () => {
+      render(<InterviewPage />);
+    });
+    await waitFor(() => {
+      expect(screen.getByText("Check Devices")).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText("Check Devices"));
+    await waitFor(() => {
+      expect(screen.getByText("Start Interview")).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText("Start Interview"));
+    await waitFor(() => {
+      expect(screen.getByText("Round 1 Complete")).toBeInTheDocument();
+    });
+
+    expect(capturedArgs).not.toBeNull();
+    expect(capturedArgs).not.toHaveProperty("isFinal");
+  });
+
   it("responds to processing phase event and shows processing state", async () => {
     mockInvoke.mockResolvedValueOnce(mockAppConfig);
 

@@ -1,5 +1,5 @@
 use crate::audio::capture::{self, CaptureEvent};
-use crate::audio::pipe::StderrDrain;
+use crate::audio::pipe::{terminate_child, StderrDrain};
 use crate::audio::tts_supervisor::{PiperSupervisor, TtsEvent};
 use crate::paths::uuid_to_path;
 use sha2::Digest;
@@ -32,17 +32,19 @@ pub struct AudioMetadata {
     pub file_size_bytes: u64,
 }
 
-/// A finalized WAV is provisional until the round's DB transaction commits.
-/// If the round fails before commit (stop, timeout, checksum failure,
-/// transcription failure, or any other error), the file is deleted on drop.
-/// The orchestrator commits it right before returning success; the caller
-/// (lib.rs) is responsible for deleting it again if persistence fails.
-struct ProvisionalAudio {
+/// A finalized WAV stays PROVISIONAL until the round's DB transaction
+/// commits. The guard is created before recording starts, stays armed across
+/// the worker, and is returned to the persistence-owning layer (lib.rs), which
+/// commits (disarms) it only after the DB transaction succeeds. Any pre-commit
+/// drop — stop, timeout, checksum failure, transcription failure, capture
+/// error, DB failure — deletes the WAV and its partial temp file.
+/// Once committed, the persisted evidence is never deleted automatically.
+pub struct UnpersistedAudio {
     wav_path: std::path::PathBuf,
     committed: bool,
 }
 
-impl ProvisionalAudio {
+impl UnpersistedAudio {
     fn new(wav_path: std::path::PathBuf) -> Self {
         Self {
             wav_path,
@@ -50,14 +52,14 @@ impl ProvisionalAudio {
         }
     }
 
-    /// Mark the WAV as committed (round succeeded). Deletion on drop is
-    /// then suppressed.
-    fn commit(&mut self) {
+    /// Mark the WAV as durably persisted (DB commit succeeded). Deletion on
+    /// drop is then suppressed.
+    pub fn commit(&mut self) {
         self.committed = true;
     }
 }
 
-impl Drop for ProvisionalAudio {
+impl Drop for UnpersistedAudio {
     fn drop(&mut self) {
         if !self.committed {
             let _ = std::fs::remove_file(&self.wav_path);
@@ -84,8 +86,10 @@ fn sha256_file(path: &Path) -> anyhow::Result<String> {
 }
 
 /// Orchestrate a half-duplex interview round.
-/// Returns (audio_metadata, transcription_text) on success.
-/// Full-round timeout and grace-period enforcement live in lib.rs.
+/// Returns (audio_metadata, transcription_text, unpersisted_audio) on
+/// success. The `UnpersistedAudio` guard stays ARMED: the caller must commit
+/// it only after the round's DB transaction commits. Full-round timeout and
+/// grace-period enforcement live in lib.rs.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_interview_round(
     question: &str,
@@ -96,7 +100,7 @@ pub async fn run_interview_round(
     tts_event_tx: mpsc::Sender<TtsEvent>,
     stop_flag: Arc<AtomicBool>,
     phase_tx: Option<mpsc::Sender<InterviewPhase>>,
-) -> anyhow::Result<(AudioMetadata, String)> {
+) -> anyhow::Result<(AudioMetadata, String, UnpersistedAudio)> {
     let piper = PiperSupervisor::new(paths)?;
 
     // Phase 1: Speak the question
@@ -139,10 +143,12 @@ pub async fn run_interview_round(
     std::fs::create_dir_all(&session_dir)?;
     let wav_path = session_dir.join(format!("{}.wav", uuid_to_path(&round_id)));
 
-    // The WAV is provisional until the round's DB transaction commits. Any
-    // failure after this point (stop, timeout, checksum, transcription) deletes
-    // it on drop; the success path commits it before returning.
-    let mut provisional = ProvisionalAudio::new(wav_path.clone());
+    // The WAV stays provisional until the round's DB transaction commits.
+    // Any failure after this point (stop, timeout, checksum, transcription,
+    // capture error) deletes it on drop. The guard is returned (still armed)
+    // so the persistence layer commits it only after the DB transaction
+    // succeeds — never before.
+    let provisional = UnpersistedAudio::new(wav_path.clone());
 
     let record_event_tx = event_tx.clone();
 
@@ -214,14 +220,13 @@ pub async fn run_interview_round(
 
     let transcription = transcribe_wav(paths, &wav_path, session_id, round_id, stop_flag).await?;
 
-    let _ = phase_tx
-        .as_ref()
-        .map(|tx| tx.try_send(InterviewPhase::Complete));
+    // NOTE: "complete" is deliberately NOT emitted here. The frontend must
+    // only see "complete" after the round is durably persisted, which happens
+    // in the persistence-owning layer (lib.rs) after the DB COMMIT.
 
-    // Round succeeded — keep the WAV; lib.rs persists it (and owns deletion
-    // if the persistence transaction fails).
-    provisional.commit();
-    Ok((metadata, transcription))
+    // Round succeeded end-to-end, but the WAV is still provisional: hand the
+    // armed guard to the caller so it can commit only after persistence.
+    Ok((metadata, transcription, provisional))
 }
 
 /// Process-level timeout for whisper.cpp transcription.
@@ -299,14 +304,12 @@ async fn transcribe_wav(
 
         result = child.wait() => result,
         _ = wait_for_stop(stop_flag) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            terminate_child(&mut child).await;
             let _ = std::fs::remove_file(&txt_path);
             anyhow::bail!("Whisper cancelled — process killed, temp cleaned");
         }
         _ = tokio::time::sleep_until(deadline) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            terminate_child(&mut child).await;
             let _ = std::fs::remove_file(&txt_path);
             anyhow::bail!(
                 "Whisper timed out after {}s — process killed, temp cleaned",
@@ -345,8 +348,8 @@ mod tests {
     /// A WAV left uncommitted (round failed before persistence) must be
     /// deleted when the guard drops, including any partial temp file.
     #[test]
-    fn provisional_audio_deletes_wav_and_tmp_on_drop_without_commit() {
-        let dir = std::env::temp_dir().join("provisional_audio_delete_test");
+    fn unpersisted_audio_deletes_wav_and_tmp_on_drop_without_commit() {
+        let dir = std::env::temp_dir().join("unpersisted_audio_delete_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -356,7 +359,7 @@ mod tests {
         std::fs::write(&tmp, b"partial").unwrap();
 
         {
-            let _provisional = ProvisionalAudio::new(wav.clone());
+            let _unpersisted = UnpersistedAudio::new(wav.clone());
             // dropped without commit — simulates a failed round
         }
 
@@ -368,8 +371,8 @@ mod tests {
 
     /// A committed WAV (round persisted) must never be deleted automatically.
     #[test]
-    fn provisional_audio_keeps_wav_after_commit() {
-        let dir = std::env::temp_dir().join("provisional_audio_commit_test");
+    fn unpersisted_audio_keeps_wav_after_commit() {
+        let dir = std::env::temp_dir().join("unpersisted_audio_commit_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -377,11 +380,31 @@ mod tests {
         std::fs::write(&wav, b"audio").unwrap();
 
         {
-            let mut provisional = ProvisionalAudio::new(wav.clone());
-            provisional.commit();
+            let mut unpersisted = UnpersistedAudio::new(wav.clone());
+            unpersisted.commit();
         }
 
         assert!(wav.exists(), "committed WAV must be retained");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A guard that is handed to the caller stays armed: dropping it there
+    /// (pre-commit failure in the persistence layer) still deletes the WAV.
+    #[test]
+    fn unpersisted_audio_armed_after_handoff_deletes_wav() {
+        let dir = std::env::temp_dir().join("unpersisted_audio_handoff_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let wav = dir.join("round.wav");
+        std::fs::write(&wav, b"audio").unwrap();
+
+        // Worker success hands the guard to the caller WITHOUT committing.
+        let guard = UnpersistedAudio::new(wav.clone());
+        // Persistence fails -> guard dropped pre-commit -> WAV removed.
+        drop(guard);
+        assert!(!wav.exists(), "pre-commit failure must delete the WAV");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

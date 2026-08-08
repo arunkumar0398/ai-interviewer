@@ -5,7 +5,6 @@ use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
-use tokio::time::timeout;
 
 /// Piper outputs raw PCM at 22050 Hz mono — tied to the en_US-amy-medium model
 const PIPER_SAMPLE_RATE: u32 = 22050;
@@ -27,6 +26,34 @@ pub enum PlaybackEvent {
     Completed,
     Cancelled,
     Error { message: String },
+}
+
+/// Wait for playback to finish, be cancelled, or fail. The output-stream error
+/// callback latches the first device error into `playback_err`; observing it
+/// here makes asynchronous playback failures AUTHORITATIVE — the function
+/// returns Err, and callers must never emit Finished/Completed after an error.
+/// Elapsed playback duration alone is NOT treated as proof of success.
+/// Returns Ok when the wall-clock deadline passes (playback finished) or the
+/// stop flag is set (cancelled).
+pub fn await_playback(
+    playback_err: &std::sync::Mutex<Option<String>>,
+    stop_flag: Option<&AtomicBool>,
+    deadline: std::time::Instant,
+) -> anyhow::Result<()> {
+    loop {
+        if let Some(msg) = playback_err.lock().map(|g| g.clone()).unwrap_or_default() {
+            anyhow::bail!("{}", msg);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(());
+        }
+        if let Some(flag) = stop_flag {
+            if flag.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// Play a WAV file through the system speakers using cpal.
@@ -82,6 +109,12 @@ pub async fn play_wav(
         let samples_clone = samples.clone();
         let pos_clone = pos.clone();
 
+        // Latch for asynchronous output-stream errors. The error callback
+        // writes here; the playback loop observes it so a device failure after
+        // stream.play() succeeds still fails the operation (P1-5).
+        let playback_err: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let err_latch = playback_err.clone();
         let err_tx = event_tx.clone();
         let stream = device.build_output_stream(
             &config,
@@ -99,20 +132,30 @@ pub async fn play_wav(
             },
             move |err| {
                 eprintln!("Output stream error: {}", err);
-                let _ = err_tx.try_send(PlaybackEvent::Error {
-                    message: format!("Playback error: {}", err),
-                });
+                let msg = format!("Playback error: {}", err);
+                if let Ok(mut guard) = err_latch.lock() {
+                    if guard.is_none() {
+                        *guard = Some(msg.clone());
+                    }
+                }
+                let _ = err_tx.try_send(PlaybackEvent::Error { message: msg });
             },
             None,
         )?;
 
         stream.play()?;
 
-        // Wait for playback to finish, with cancellation and timeout
+        // Wait for playback to finish, with cancellation and timeout.
         let total_samples = samples.len();
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_secs(PLAYBACK_TIMEOUT_SECS);
         loop {
+            // Async output error is authoritative — never report success after
+            // the device failed.
+            if let Some(msg) = playback_err.lock().map(|g| g.clone()).unwrap_or_default() {
+                drop(stream);
+                anyhow::bail!("{}", msg);
+            }
             let current = pos.load(std::sync::atomic::Ordering::Relaxed);
             if current >= total_samples {
                 break;
@@ -170,18 +213,27 @@ pub async fn generate_tts(
     // pipe while we consume its stdout PCM.
     let stderr_drain = child.stderr.take().map(StderrDrain::start);
 
+    // ONE absolute deadline for the whole process lifecycle (P2-4): stdout
+    // reads, cancellation selection, child exit, and the final wait all share
+    // this budget — EOF does not reset the timeout.
+    let deadline =
+        tokio::time::Instant::now() + tokio::time::Duration::from_secs(GENERATE_TTS_TIMEOUT_SECS);
+
     // Send text via stdin
     if let Some(mut stdin) = child.stdin.take() {
         use tokio::io::AsyncWriteExt;
-        stdin.write_all(text.as_bytes()).await?;
+        if let Err(e) = stdin.write_all(text.as_bytes()).await {
+            // Child may still be running — kill and reap explicitly.
+            crate::audio::pipe::terminate_child(&mut child).await;
+            let _ = std::fs::remove_file(&output_path);
+            anyhow::bail!("Failed to write TTS text to Piper stdin: {}", e);
+        }
         drop(stdin); // close stdin to signal EOF
     }
 
     // Read stdout with async bounded reads and deadline enforcement
     let mut raw_pcm = Vec::new();
     let mut stdout = child.stdout.take();
-    let deadline =
-        tokio::time::Instant::now() + tokio::time::Duration::from_secs(GENERATE_TTS_TIMEOUT_SECS);
     let mut buf = vec![0u8; STDOUT_CHUNK_SIZE];
 
     let read_result: anyhow::Result<()> = loop {
@@ -200,8 +252,7 @@ pub async fn generate_tts(
                 }
             }
             _ = tokio::time::sleep_until(deadline) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                crate::audio::pipe::terminate_child(&mut child).await;
                 // Cleanup partial output
                 let _ = std::fs::remove_file(&output_path);
                 anyhow::bail!(
@@ -213,16 +264,15 @@ pub async fn generate_tts(
     };
 
     if let Err(e) = read_result {
+        // Child may still be running (stdout read error) — kill and reap.
+        crate::audio::pipe::terminate_child(&mut child).await;
         let _ = std::fs::remove_file(&output_path);
         return Err(e);
     }
 
-    // Wait for process to finish — with deadline
-    let wait_result = timeout(
-        tokio::time::Duration::from_secs(GENERATE_TTS_TIMEOUT_SECS),
-        child.wait(),
-    )
-    .await;
+    // Wait for process to finish — the SAME absolute deadline (P2-4), so EOF
+    // does not grant a fresh timeout budget.
+    let wait_result = tokio::time::timeout_at(deadline, child.wait()).await;
 
     match wait_result {
         Ok(Ok(status)) => {
@@ -244,9 +294,8 @@ pub async fn generate_tts(
             anyhow::bail!("TTS process wait error: {}", e);
         }
         Err(_) => {
-            // Timeout waiting for child to exit — force kill
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            // Timeout waiting for child to exit — force kill and reap.
+            crate::audio::pipe::terminate_child(&mut child).await;
             let _ = std::fs::remove_file(&output_path);
             anyhow::bail!(
                 "TTS generation timed out after {}s — process killed",
@@ -308,4 +357,50 @@ pub async fn generate_tts_with_paths(
     let model_str = piper_model.to_string_lossy().to_string();
 
     generate_tts(text, output_path, Some(&piper_str), Some(&model_str)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P1-5: an injected asynchronous playback error becomes an authoritative
+    /// Err — elapsed duration is NOT treated as proof of success.
+    #[test]
+    fn await_playback_surfaces_latched_output_error() {
+        let err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        *err.lock().unwrap() = Some("Output stream error: simulated device failure".to_string());
+        let stop = Arc::new(AtomicBool::new(false));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+
+        let result = await_playback(&err, Some(&stop), deadline);
+        assert!(result.is_err(), "latched output error must fail playback");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("simulated device failure"),
+            "error message must surface, got: {}",
+            msg
+        );
+    }
+
+    /// P1-5: without an error, playback runs until the deadline and returns Ok.
+    #[test]
+    fn await_playback_returns_ok_until_deadline() {
+        let err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        let stop = Arc::new(AtomicBool::new(false));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(30);
+
+        let result = await_playback(&err, Some(&stop), deadline);
+        assert!(result.is_ok());
+    }
+
+    /// P1-5: cancellation (stop flag) still returns Ok without an error.
+    #[test]
+    fn await_playback_returns_ok_on_stop() {
+        let err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        let stop = Arc::new(AtomicBool::new(true));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+
+        let result = await_playback(&err, Some(&stop), deadline);
+        assert!(result.is_ok());
+    }
 }

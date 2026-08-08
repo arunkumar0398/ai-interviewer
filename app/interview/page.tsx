@@ -181,7 +181,9 @@ export default function InterviewPage() {
       const result = await invoke<DeviceCheckResult>("check_audio_devices");
       setDeviceResult(result);
 
-      if (result.mic_available && result.mic_test_ok) {
+      // Readiness requires mic AND speaker. A missing speaker means the
+      // candidate cannot hear questions, so the device check must not pass.
+      if (result.mic_available && result.mic_test_ok && result.speaker_available) {
         setPhase("ready");
       } else {
         setPhase("error");
@@ -202,7 +204,8 @@ export default function InterviewPage() {
   // Start interview round — let backend phase events drive the UI
   const handleStartRound = useCallback(async () => {
     if (currentRound >= QUESTIONS.length) {
-      // All rounds done — backend already called complete_session on final round
+      // All rounds done — the backend derived finality and completed the
+      // session atomically on the final round.
       setPhase("showing-result");
       return;
     }
@@ -238,16 +241,13 @@ export default function InterviewPage() {
       setCurrentQuestion(question);
       setRetryTarget(null);
 
-      // isFinal: true when this is the last round
-      const isFinal = currentRound === QUESTIONS.length - 1;
-
+      // Finality is backend-derived (EXPECTED_ROUNDS) — never sent from here.
       const roundId = crypto.randomUUID();
       const result = await invoke<InterviewRoundResult>("run_interview_round", {
         question,
         sessionId,
         roundId,
         roundIndex: currentRound,
-        isFinal,
       });
 
       setRoundResults((prev) => [...prev, result]);
@@ -319,8 +319,8 @@ export default function InterviewPage() {
         break;
       }
       case "round": {
-        // Re-run the failed round via retry command
-        const isFinalRetry = currentRound === QUESTIONS.length - 1;
+        // Re-run the failed round via retry command. Finality is derived on
+        // the backend from roundIndex.
         try {
           const result = await invoke<InterviewRoundResult>(
             "retry_interview_round",
@@ -328,7 +328,6 @@ export default function InterviewPage() {
               question: retryTarget.question,
               sessionId,
               roundIndex: currentRound,
-              isFinal: isFinalRetry,
             }
           );
           setRoundResults((prev) => [...prev, result]);

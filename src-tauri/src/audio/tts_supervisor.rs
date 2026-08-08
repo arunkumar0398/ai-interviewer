@@ -1,11 +1,11 @@
-use crate::audio::pipe::StderrDrain;
+use crate::audio::pipe::{terminate_child, StderrDrain};
+use crate::audio::playback::await_playback;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::{mpsc, Semaphore};
-use tokio::time::timeout;
 
 /// TTS events sent to the UI
 #[derive(Debug, Clone, serde::Serialize)]
@@ -114,6 +114,12 @@ impl PiperSupervisor {
             // stderr pipe while we consume its stdout PCM.
             let stderr_drain = child.stderr.take().map(StderrDrain::start);
 
+            // ONE absolute deadline for this process lifecycle (P2-4): stdout
+            // reads, cancellation, child exit, and the final wait share the
+            // budget — EOF does not reset the timeout.
+            let deadline =
+                tokio::time::Instant::now() + tokio::time::Duration::from_secs(PIPER_TIMEOUT_SECS);
+
             // Write text to stdin
             if let Some(mut stdin) = child.stdin.take() {
                 use tokio::io::AsyncWriteExt;
@@ -121,7 +127,8 @@ impl PiperSupervisor {
                     let _ = event_tx.try_send(TtsEvent::Error {
                         message: format!("Failed to write to Piper stdin: {}", e),
                     });
-                    let _ = child.kill().await;
+                    // Child may still be running — kill and reap explicitly.
+                    terminate_child(&mut child).await;
                     return Err(anyhow::anyhow!("Stdin write failed: {}", e));
                 }
                 drop(stdin);
@@ -132,8 +139,6 @@ impl PiperSupervisor {
             // Read raw PCM from stdout with async I/O and cancellation
             let mut pcm_data = Vec::new();
             let mut stdout = child.stdout.take();
-            let deadline =
-                tokio::time::Instant::now() + tokio::time::Duration::from_secs(PIPER_TIMEOUT_SECS);
             let mut buf = vec![0u8; STDOUT_CHUNK_SIZE];
 
             let read_result: anyhow::Result<()> = loop {
@@ -162,14 +167,12 @@ impl PiperSupervisor {
                     }
                     // Check stop flag — polling wake-up ensures reliable cancellation
                     _ = crate::interview::orchestrator::wait_for_stop(stop_flag.clone()) => {
-                        let _ = child.kill().await;
-                        let _ = child.wait().await;
+                        terminate_child(&mut child).await;
                         return Ok(());
                     }
                     // Check deadline
                     _ = tokio::time::sleep_until(deadline) => {
-                        let _ = child.kill().await;
-                        let _ = child.wait().await;
+                        terminate_child(&mut child).await;
                         let _ = event_tx.try_send(TtsEvent::Error {
                             message: format!(
                                 "Piper timed out after {}s — process killed",
@@ -185,18 +188,18 @@ impl PiperSupervisor {
             };
 
             if let Err(e) = read_result {
+                // Child may still be running (stdout read error) — kill and
+                // reap explicitly.
+                terminate_child(&mut child).await;
                 let _ = event_tx.try_send(TtsEvent::Error {
                     message: format!("Piper read error: {}", e),
                 });
                 return Err(e);
             }
 
-            // Wait for process to finish — with deadline
-            let wait_result = timeout(
-                tokio::time::Duration::from_secs(PIPER_TIMEOUT_SECS),
-                child.wait(),
-            )
-            .await;
+            // Wait for process to finish — the SAME absolute deadline (P2-4),
+            // so EOF does not grant a fresh timeout budget.
+            let wait_result = tokio::time::timeout_at(deadline, child.wait()).await;
 
             match wait_result {
                 Ok(Ok(status)) => {
@@ -249,9 +252,8 @@ impl PiperSupervisor {
                     return Err(anyhow::anyhow!("Piper wait error: {}", e));
                 }
                 Err(_) => {
-                    // Timeout waiting for child to exit — force kill
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
+                    // Timeout waiting for child to exit — force kill and reap.
+                    terminate_child(&mut child).await;
                     let _ = event_tx.try_send(TtsEvent::Error {
                         message: format!(
                             "Piper timed out after {}s — process killed",
@@ -307,6 +309,13 @@ async fn play_raw_pcm_async(
         let samples_clone = samples_arc.clone();
         let mut pos = 0usize;
 
+        // Latch for asynchronous output-stream errors. The error callback
+        // writes here; `await_playback` observes it so a device failure after
+        // stream.play() succeeds still fails TTS (P1-5). `TtsEvent::Finished`
+        // is therefore never emitted after a failed playback.
+        let playback_err: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let err_latch = playback_err.clone();
         let stream = device.build_output_stream(
             &config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
@@ -319,29 +328,28 @@ async fn play_raw_pcm_async(
                     }
                 }
             },
-            |err| {
+            move |err| {
                 eprintln!("Output stream error: {}", err);
+                let msg = format!("Output stream error: {}", err);
+                if let Ok(mut guard) = err_latch.lock() {
+                    if guard.is_none() {
+                        *guard = Some(msg);
+                    }
+                }
             },
             None,
         )?;
 
         stream.play()?;
 
-        // Busy-wait for playback to finish or stop
+        // Wait for playback to finish or stop, surfacing async device errors
+        // as authoritative failures.
         let total_duration_ms =
             (samples_arc.len() as f64 / sample_rate as f64 * 1000.0) as u64 + 200;
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_millis(total_duration_ms);
 
-        loop {
-            if std::time::Instant::now() >= deadline {
-                break;
-            }
-            if stop_flag_clone.load(Ordering::SeqCst) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+        await_playback(&playback_err, Some(&stop_flag_clone), deadline)?;
 
         drop(stream);
         Ok(())

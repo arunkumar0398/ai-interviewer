@@ -53,6 +53,15 @@ impl Drop for StderrDrain {
     }
 }
 
+/// Explicitly kill and reap a child process on a known error path (stdin
+/// write error, stdout read error, timeout, cancellation). The caller must
+/// use this whenever the child may still be running; `.kill_on_drop(true)` is
+/// only emergency defense-in-depth, never the normal cleanup path.
+pub async fn terminate_child(child: &mut tokio::process::Child) {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -224,40 +224,6 @@ impl AppPaths {
         })
     }
 
-    /// Canonical constructor used at application startup.
-    /// Uses `app_data_dir` (LOCALAPPDATA) for persistent storage — never
-    /// `exe_dir/data`, even in portable mode.
-    pub fn resolve() -> Result<Self, DatabasePathError> {
-        let exe_dir = env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-            .unwrap_or_else(|| PathBuf::from("."));
-
-        let (tool_dir, tool_directory_source, distribution_mode) = resolve_tool_dir(&exe_dir);
-        let is_portable = distribution_mode == ToolDistributionMode::Portable;
-
-        // Persistent data always uses LOCALAPPDATA — never exe_dir/data.
-        let data_dir = if let Ok(local) = env::var("LOCALAPPDATA") {
-            PathBuf::from(local).join("ai-interviewer")
-        } else {
-            exe_dir.join("data")
-        };
-        let recordings_dir = data_dir.join("recordings");
-        let tts_dir = data_dir.join("tts");
-        let temp_dir = data_dir.join("temp");
-        let db_path = resolve_database_path(&data_dir)?;
-
-        Ok(Self {
-            tool_dir,
-            db_path,
-            recordings_dir,
-            tts_dir,
-            temp_dir,
-            is_portable,
-            tool_directory_source,
-        })
-    }
-
     /// Produce the compact config sent to the frontend.
     pub fn to_app_config(&self) -> AppConfig {
         let readiness = self.validate_readiness();

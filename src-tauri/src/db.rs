@@ -36,10 +36,33 @@ pub struct InterviewSession {
     pub total_rounds: i32,
 }
 
+/// Reject databases created by a NEWER build. A newer schema is not
+/// downgradable — silently relabeling it as an older version would corrupt
+/// the data model. This check runs before ANY pragma or schema mutation so
+/// a future-version database is left completely untouched.
+fn ensure_supported_schema_version(conn: &Connection) -> SqlResult<()> {
+    let current_version: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if current_version > SCHEMA_VERSION {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+            Some(format!(
+                "Database schema version {} is newer than supported version {}. Please upgrade the application.",
+                current_version, SCHEMA_VERSION
+            )),
+        ));
+    }
+    Ok(())
+}
+
 impl Database {
     /// Open or create database at the given path
     pub fn open(db_path: &Path) -> SqlResult<Self> {
         let conn = Connection::open(db_path)?;
+
+        // Reject future schema versions before touching anything — the
+        // database must remain byte-for-byte untouched (no WAL, no busy
+        // timeout, no user_version write) when it is newer than us.
+        ensure_supported_schema_version(&conn)?;
 
         // Enable WAL mode for better concurrent read performance
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;

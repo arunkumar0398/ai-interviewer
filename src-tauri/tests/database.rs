@@ -710,6 +710,113 @@ fn db_final_round_missing_session_rolls_back_everything() {
     let _ = std::fs::remove_file(&db_path);
 }
 
+/// Test: A database created by a newer build (future schema version) is
+/// rejected without any mutation — no downgrade migration, no user_version
+/// write, no data/schema change, no journal-mode switch.
+#[test]
+fn db_future_schema_version_rejected_without_mutation() {
+    let db_path = std::env::temp_dir().join("test_future_schema.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    // Create a database with a FUTURE schema version and real data.
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA user_version=3;").unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE future_table (
+                id INTEGER PRIMARY KEY,
+                payload TEXT NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO future_table (payload) VALUES ('keep-me')", [])
+            .unwrap();
+    }
+
+    // Open must FAIL: version 3 is newer than supported version 2.
+    let err_msg = match ai_interviewer_lib::db::Database::open(&db_path) {
+        Ok(_) => panic!("Opening a future-version database must error"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err_msg.contains("newer than supported version"),
+        "error should be explicit, got: {}",
+        err_msg
+    );
+
+    // user_version must still be 3 — no silent downgrade happened.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let version: i32 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 3, "user_version must remain 3 (no downgrade)");
+
+    // Data/schema unchanged.
+    let payload: String = conn
+        .query_row("SELECT payload FROM future_table WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(payload, "keep-me", "data must remain untouched");
+
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+}
+
+/// Test: a database at the CURRENT schema version opens fine (no regression).
+#[test]
+fn db_current_schema_version_opens() {
+    let db_path = std::env::temp_dir().join("test_current_schema.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    // Pre-create with user_version=2 (current) and the v2 schema.
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA user_version=2;").unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                candidate_name TEXT NOT NULL DEFAULT '',
+                started_at TEXT NOT NULL DEFAULT (datetime('now')),
+                completed_at TEXT,
+                total_rounds INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE rounds (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                round_index INTEGER NOT NULL,
+                question TEXT NOT NULL,
+                transcription TEXT NOT NULL DEFAULT '',
+                audio_path TEXT NOT NULL DEFAULT '',
+                sha256 TEXT NOT NULL DEFAULT '',
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                sample_rate INTEGER NOT NULL DEFAULT 16000,
+                channels INTEGER NOT NULL DEFAULT 1,
+                file_size_bytes INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(session_id, round_index),
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+            ",
+        )
+        .unwrap();
+    }
+
+    let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
+    // No migration should have run; a session can be created and read back.
+    db.create_session("current-schema-session", "Test").unwrap();
+    let sessions = db.get_sessions().unwrap();
+    assert_eq!(sessions.len(), 1);
+
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+}
+
 /// Test: Migration from schema v1 to v2 preserves data and adds unique constraint
 #[test]
 fn db_schema_v1_to_v2_migration() {

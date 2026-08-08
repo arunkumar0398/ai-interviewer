@@ -237,6 +237,53 @@ struct InterviewRoundResult {
     transcription: String,
 }
 
+/// Number of questions in the current fixed flow. Finality is derived on the
+/// backend from this constant — the frontend never supplies `is_final`.
+const EXPECTED_ROUNDS: i32 = 5;
+
+/// Backend-authoritative preflight for a round request. Verifies — BEFORE any
+/// audio/hardware work — that the session exists and is not completed, that
+/// the requested `round_index` is non-negative and equals the backend's next
+/// expected logical round (rejecting duplicates and skipped/out-of-order
+/// rounds), and derives finality from `EXPECTED_ROUNDS`. Returns `Ok(true)`
+/// when the round is the final one. Errors are user-facing strings.
+fn preflight_round(
+    db: &db::Database,
+    session_id_str: &str,
+    round_index: i32,
+) -> Result<bool, String> {
+    let session = db
+        .get_session(session_id_str)
+        .map_err(|e| format!("Failed to load session: {}", e))?
+        .ok_or_else(|| format!("Session {} does not exist", session_id_str))?;
+
+    if session.completed_at.is_some() {
+        return Err("Session is already completed — no more rounds can run".to_string());
+    }
+    if round_index < 0 {
+        return Err(format!("Invalid round index {}", round_index));
+    }
+
+    let existing = db
+        .get_rounds(session_id_str)
+        .map_err(|e| format!("Failed to load session rounds: {}", e))?;
+    let next_expected = existing.len() as i32;
+    if round_index < next_expected {
+        return Err(format!(
+            "Round {} already exists for this session",
+            round_index + 1
+        ));
+    }
+    if round_index > next_expected {
+        return Err(format!(
+            "Round {} is out of order — expected round {}",
+            round_index + 1,
+            next_expected + 1
+        ));
+    }
+    Ok(round_index == EXPECTED_ROUNDS - 1)
+}
+
 /// Payload emitted to the frontend for interview phase transitions
 #[derive(serde::Serialize, Clone)]
 struct PhaseEventPayload {
@@ -252,12 +299,21 @@ async fn run_interview_round(
     session_id: uuid::Uuid,
     round_id: uuid::Uuid,
     round_index: i32,
-    is_final: bool,
     state: State<'_, Arc<RecordingState>>,
     paths: State<'_, PathsState>,
     db_state: State<'_, Arc<DbState>>,
     app: tauri::AppHandle,
 ) -> Result<InterviewRoundResult, String> {
+    // Backend-authoritative session lifecycle and round order — ALL checks run
+    // BEFORE any audio/hardware work. Finality is derived here, never trusted
+    // from the client.
+    let session_id_str = session_id.hyphenated().to_string();
+    let is_final = {
+        let guard = db_state.db.lock().await;
+        let db = guard.as_ref().ok_or("Database not initialized")?;
+        preflight_round(db, &session_id_str, round_index)?
+    };
+
     let (event_tx, _event_rx) = mpsc::channel(32);
     let (tts_event_tx, _tts_event_rx) = mpsc::channel(32);
     let (phase_tx, mut phase_rx) = mpsc::channel(8);
@@ -371,7 +427,11 @@ async fn run_interview_round(
     match outcome {
         Ok(join_result) => {
             // Normal completion path — process the JoinHandle result exactly once.
-            phase_relay.abort();
+            // The worker's phase_tx sender is dropped when the worker finishes,
+            // so awaiting the relay lets every queued event flush before any
+            // final event is emitted by the persistence-owning layer. Never
+            // abort it here: a queued "complete"/final event must not be lost.
+            let _ = phase_relay.await;
 
             let result = match join_result {
                 Ok(inner) => inner.map_err(|e| e.to_string()),
@@ -384,17 +444,18 @@ async fn run_interview_round(
             recording_guard.disarm();
 
             match result {
-                Ok((metadata, transcription)) => {
+                Ok((metadata, transcription, mut evidence)) => {
                     // Persist round atomically: round INSERT + session
                     // total_rounds increment + completed_at (when final) commit
-                    // in ONE transaction.
+                    // in ONE transaction. The WAV stays provisional (evidence
+                    // armed) until this COMMIT succeeds.
                     let persist_result: Result<i64, String> = (async {
                         let guard = db_state.db.lock().await;
                         let db = guard
                             .as_ref()
                             .ok_or_else(|| "Database not initialized".to_string())?;
                         db.insert_round_with_session_update(
-                            &session_id.hyphenated().to_string(),
+                            &session_id_str,
                             round_index,
                             &question,
                             &transcription,
@@ -418,15 +479,37 @@ async fn run_interview_round(
                     .await;
 
                     match persist_result {
-                        Ok(_) => Ok(InterviewRoundResult {
-                            metadata,
-                            transcription,
-                        }),
+                        Ok(_) => {
+                            // Durable: disarm the evidence guard (WAV retained)
+                            // and only NOW emit "complete" — it means the round
+                            // is durably persisted.
+                            evidence.commit();
+                            let _ = app.emit(
+                                "interview-phase",
+                                PhaseEventPayload {
+                                    phase: "complete".to_string(),
+                                    question: None,
+                                    duration_ms: None,
+                                },
+                            );
+                            Ok(InterviewRoundResult {
+                                metadata,
+                                transcription,
+                            })
+                        }
                         Err(e) => {
-                            // The round never committed — the WAV was provisional
-                            // until this transaction. Delete it plus any partial
-                            // temp artifacts for this attempted round.
-                            let _ = std::fs::remove_file(&metadata.file_path);
+                            // Persistence failed — evidence is still armed and
+                            // drops at the end of this arm, deleting the WAV
+                            // and any partial temp file. "complete" is NEVER
+                            // emitted for an unpersisted round.
+                            let _ = app.emit(
+                                "interview-phase",
+                                PhaseEventPayload {
+                                    phase: "error".to_string(),
+                                    question: Some(e.clone()),
+                                    duration_ms: None,
+                                },
+                            );
                             Err(e)
                         }
                     }
@@ -467,6 +550,18 @@ async fn run_interview_round(
             clear_active_recording(&state).await;
             recording_guard.disarm();
 
+            // Drain the relay so queued phase events flush BEFORE the final
+            // error event below — the timeout error must be the last word.
+            let _ = phase_relay.await;
+            let _ = app.emit(
+                "interview-phase",
+                PhaseEventPayload {
+                    phase: "error".to_string(),
+                    question: Some(format!("Round timed out after {}s", ROUND_TIMEOUT_SECS)),
+                    duration_ms: None,
+                },
+            );
+
             // The round never committed — remove provisional artifacts: the
             // WAV for this round_id, its partial temp file, and the session
             // temp transcript directory.
@@ -479,7 +574,6 @@ async fn run_interview_round(
                 .join(session_id.hyphenated().to_string());
             let _ = std::fs::remove_dir_all(temp_dir);
 
-            phase_relay.abort();
             Err(format!(
                 "Round timed out after {}s — processes terminated, partial artifacts cleaned up",
                 ROUND_TIMEOUT_SECS
@@ -488,17 +582,17 @@ async fn run_interview_round(
     }
 }
 
-/// Retry a failed interview round. Generates a new round_id, so the old
-/// round (if partially written) is left in the DB as-is and the new one
-/// is inserted under a fresh UUID via the UNIQUE(session_id, round_index)
-/// constraint (INSERT OR IGNORE).
+/// Retry a failed interview round with a fresh round_id. Only a round that
+/// never committed may be retried: the backend preflight requires the
+/// round_index to be the next expected logical round, so an already-persisted
+/// round returns the explicit duplicate error and a retry cannot double-write.
+/// Finality is derived on the backend from round_index.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn retry_interview_round(
     question: String,
     session_id: uuid::Uuid,
     round_index: i32,
-    is_final: bool,
     state: State<'_, Arc<RecordingState>>,
     paths: State<'_, PathsState>,
     db_state: State<'_, Arc<DbState>>,
@@ -510,7 +604,6 @@ async fn retry_interview_round(
         session_id,
         new_round_id,
         round_index,
-        is_final,
         state,
         paths,
         db_state,
@@ -553,17 +646,10 @@ async fn create_session(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-async fn complete_session(
-    session_id: uuid::Uuid,
-    total_rounds: i32,
-    state: State<'_, Arc<DbState>>,
-) -> Result<(), String> {
-    let guard = state.db.lock().await;
-    let db = guard.as_ref().ok_or("Database not initialized")?;
-    db.complete_session(&session_id.hyphenated().to_string(), total_rounds)
-        .map_err(|e| e.to_string())
-}
+// NOTE: there is deliberately NO `complete_session` Tauri command. Session
+// lifecycle is backend-authoritative: the final round commits completed_at in
+// the same transaction as the round insert. JavaScript cannot arbitrarily set
+// total_rounds or completion state.
 
 #[tauri::command]
 async fn get_sessions(state: State<'_, Arc<DbState>>) -> Result<Vec<db::InterviewSession>, String> {
@@ -621,7 +707,6 @@ pub fn run() {
             stop_interview_round,
             get_tools_dir,
             create_session,
-            complete_session,
             get_sessions,
             get_rounds,
         ])
@@ -702,5 +787,143 @@ mod tests {
         let result = acquire_recording(&state, fake_handle()).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already active"));
+    }
+
+    // ------------------------------------------------------------------
+    // P1-2: Backend-authoritative session lifecycle and round order
+    // ------------------------------------------------------------------
+
+    fn temp_db() -> (tempfile::TempDir, db::Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("preflight.db");
+        let db = db::Database::open(&db_path).unwrap();
+        (dir, db)
+    }
+
+    fn insert_round(db: &db::Database, session: &str, index: i32, is_final: bool) {
+        db.insert_round_with_session_update(
+            session,
+            index,
+            &format!("Q{}", index),
+            &format!("A{}", index),
+            &format!("/tmp/{}.wav", index),
+            "hash",
+            5000,
+            16000,
+            1,
+            160044,
+            is_final,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn preflight_rejects_missing_session_before_audio() {
+        let (_dir, db) = temp_db();
+        let err = preflight_round(&db, "no-such-session", 0).unwrap_err();
+        assert!(
+            err.contains("does not exist"),
+            "expected missing-session error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_completed_session() {
+        let (_dir, db) = temp_db();
+        db.create_session("s1", "Test").unwrap();
+        // Final round completes the session.
+        insert_round(&db, "s1", 4, true);
+        let err = preflight_round(&db, "s1", 5).unwrap_err();
+        assert!(
+            err.contains("already completed"),
+            "expected completed-session error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_negative_round() {
+        let (_dir, db) = temp_db();
+        db.create_session("s1", "Test").unwrap();
+        let err = preflight_round(&db, "s1", -1).unwrap_err();
+        assert!(
+            err.contains("Invalid round index"),
+            "expected negative-round error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_skipped_out_of_order_round() {
+        let (_dir, db) = temp_db();
+        db.create_session("s1", "Test").unwrap();
+        insert_round(&db, "s1", 0, false);
+        // Skipping round 2 (index 1) and requesting index 2 must be rejected
+        // before any audio work.
+        let err = preflight_round(&db, "s1", 2).unwrap_err();
+        assert!(
+            err.contains("out of order"),
+            "expected out-of-order error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_duplicate_round_before_audio() {
+        let (_dir, db) = temp_db();
+        db.create_session("s1", "Test").unwrap();
+        insert_round(&db, "s1", 0, false);
+        insert_round(&db, "s1", 1, false);
+        // Re-requesting an already-persisted round must fail up front.
+        let err = preflight_round(&db, "s1", 0).unwrap_err();
+        assert!(
+            err.contains("already exists"),
+            "expected duplicate error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn preflight_derives_finality_on_backend() {
+        let (_dir, db) = temp_db();
+        db.create_session("s1", "Test").unwrap();
+        // Rounds 0..3 are never final; round 4 (EXPECTED_ROUNDS-1) is final.
+        // Each round is inserted after its preflight so the next one is the
+        // expected next logical round.
+        for index in 0..EXPECTED_ROUNDS {
+            let is_final = preflight_round(&db, "s1", index).unwrap();
+            assert_eq!(
+                is_final,
+                index == EXPECTED_ROUNDS - 1,
+                "round {} finality must be backend-derived",
+                index
+            );
+            insert_round(&db, "s1", index, is_final);
+        }
+    }
+
+    #[test]
+    fn rounds_1_to_5_update_lifecycle_correctly() {
+        let (_dir, db) = temp_db();
+        db.create_session("s1", "Test").unwrap();
+
+        // Drive the full fixed five-question flow through the backend.
+        for index in 0..EXPECTED_ROUNDS {
+            let is_final = preflight_round(&db, "s1", index).unwrap();
+            insert_round(&db, "s1", index, is_final);
+        }
+
+        let session = db.get_session("s1").unwrap().unwrap();
+        assert_eq!(session.total_rounds, 5);
+        assert!(
+            session.completed_at.is_some(),
+            "session must be completed after the final round commits"
+        );
+        assert_eq!(db.get_rounds("s1").unwrap().len(), 5);
+
+        // After completion, no further rounds may run.
+        let err = preflight_round(&db, "s1", 5).unwrap_err();
+        assert!(err.contains("already completed"));
     }
 }
