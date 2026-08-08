@@ -141,15 +141,28 @@ foreach ($tool in $manifest.tools.PSObject.Properties) {
                         Write-Status "Normalized piper.exe to canonical path" "DarkYellow"
                     }
                 }
+                # Piper requires espeak-ng-data adjacent to the executable for
+                # phonemization at runtime. The pinned archive ships it at the
+                # zip root; if a layout ever nests it, move it up so the
+                # canonical path is runnable.
+                $espeakData = Join-Path $destination "espeak-ng-data"
+                if (-not (Test-Path (Join-Path $espeakData "phontab") -PathType Leaf)) {
+                    $nestedData = Get-ChildItem -Path $destination -Directory -Filter "espeak-ng-data" -Recurse | Select-Object -First 1
+                    if ($nestedData) {
+                        Copy-Item -Path $nestedData.FullName -Destination $espeakData -Recurse -Force
+                        Write-Status "Normalized espeak-ng-data to canonical path" "DarkYellow"
+                    }
+                }
             } elseif ($name -eq "whisper") {
                 $canonicalDir = Join-Path $destination "Release"
                 $canonical = Join-Path $canonicalDir "main.exe"
                 if (-not (Test-Path $canonical -PathType Leaf)) {
-                    # Some ZIP layouts put main.exe at root — move to Release/
+                    # Some ZIP layouts put main.exe at root — move to Release/ so
+                    # no stranded duplicate remains at the archive root.
                     $rootMain = Join-Path $destination "main.exe"
                     if (Test-Path $rootMain -PathType Leaf) {
                         New-Item -ItemType Directory -Path $canonicalDir -Force | Out-Null
-                        Copy-Item -Path $rootMain -Destination $canonical -Force
+                        Move-Item -Path $rootMain -Destination $canonical -Force
                         Write-Status "Normalized main.exe to Release/main.exe" "DarkYellow"
                     } else {
                         # Search recursively
@@ -160,6 +173,12 @@ foreach ($tool in $manifest.tools.PSObject.Properties) {
                             Write-Status "Normalized main.exe to Release/main.exe" "DarkYellow"
                         }
                     }
+                }
+                # Move any remaining root-level files (e.g. companion DLLs) into
+                # Release/ so all runtime dependencies are adjacent to the
+                # canonical executable — keeping the layout runnable.
+                Get-ChildItem -Path $destination -File -Force | ForEach-Object {
+                    Move-Item -Path $_.FullName -Destination $canonicalDir -Force
                 }
             }
         } elseif ($toolType -eq "file") {

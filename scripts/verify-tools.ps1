@@ -60,6 +60,16 @@ foreach ($tool in $manifest.tools.PSObject.Properties) {
                 Write-Host "  [OK] Canonical executable: piper\piper.exe" -ForegroundColor Green
                 $pass++
             }
+            # Piper requires espeak-ng-data adjacent to the executable for
+            # phonemization at runtime. Fail before packaging if it is missing.
+            $espeakData = Join-Path $ToolsDir "piper\espeak-ng-data"
+            if (-not (Test-Path (Join-Path $espeakData "phontab") -PathType Leaf)) {
+                Write-Host "  [FAIL] Required runtime data missing: piper\espeak-ng-data\phontab" -ForegroundColor Red
+                $fail++
+            } else {
+                Write-Host "  [OK] Required runtime data: piper\espeak-ng-data\phontab" -ForegroundColor Green
+                $pass++
+            }
         } elseif ($name -eq "whisper") {
             $expectedExe = Join-Path $ToolsDir "whisper\Release\main.exe"
             if (-not (Test-Path $expectedExe -PathType Leaf)) {
@@ -67,6 +77,16 @@ foreach ($tool in $manifest.tools.PSObject.Properties) {
                 $fail++
             } else {
                 Write-Host "  [OK] Canonical executable: whisper\Release\main.exe" -ForegroundColor Green
+                $pass++
+            }
+            # All archive contents must live in Release/ next to main.exe so the
+            # executable can load any companion DLLs from the canonical path.
+            $stray = Get-ChildItem -Path (Join-Path $ToolsDir "whisper") -File -Force
+            if ($stray.Count -gt 0) {
+                Write-Host "  [FAIL] Un-normalized files in whisper root (must live in Release/): $($stray.Name -join ', ')" -ForegroundColor Red
+                $fail++
+            } else {
+                Write-Host "  [OK] Layout normalized: no companions stranded at whisper root" -ForegroundColor Green
                 $pass++
             }
         } else {

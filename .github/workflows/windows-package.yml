@@ -114,6 +114,7 @@ jobs:
             "tools\piper\piper.exe",
             "tools\piper\model.onnx",
             "tools\piper\model.onnx.json",
+            "tools\piper\espeak-ng-data\phontab",
             "tools\whisper\Release\main.exe",
             "tools\models\ggml-tiny.en.bin",
             "licenses\Piper-LICENSE.txt",

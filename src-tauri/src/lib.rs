@@ -342,100 +342,114 @@ async fn run_interview_round(
         tokio::time::Instant::now() + tokio::time::Duration::from_secs(ROUND_TIMEOUT_SECS);
 
     let mut worker_future = std::pin::pin!(worker);
-    let timed_out = tokio::select! {
-        _ = &mut worker_future => false,
-        _ = tokio::time::sleep_until(deadline) => true,
+
+    // The JoinHandle result is captured directly from the select and processed
+    // exactly once. A completed JoinHandle must never be polled again (polling
+    // a completed handle consumes/panics), so the result is bound here rather
+    // than discarded with `_` and re-awaited afterwards.
+    //   Ok(join_result) => worker finished before the deadline (success, error, or panic)
+    //   Err(_)          => the 300s deadline expired first
+    let outcome = tokio::select! {
+        result = &mut worker_future => Ok(result),
+        _ = tokio::time::sleep_until(deadline) => Err(ROUND_TIMEOUT_SECS),
     };
 
-    if timed_out {
-        // Deadline hit — signal cancellation via stop_flag
-        stop_flag.store(true, Ordering::SeqCst);
-        let _ = app.emit(
-            "interview-phase",
-            PhaseEventPayload {
-                phase: "error".to_string(),
-                question: Some(format!("Round timed out after {}s", ROUND_TIMEOUT_SECS)),
-                duration_ms: None,
-            },
-        );
+    match outcome {
+        Ok(join_result) => {
+            // Normal completion path — process the JoinHandle result exactly once.
+            phase_relay.abort();
 
-        // Await worker up to grace period — allows cooperative exit
-        let graceful = tokio::time::timeout(
-            tokio::time::Duration::from_secs(GRACE_SECS),
-            &mut worker_future,
-        )
-        .await;
+            let result = match join_result {
+                Ok(inner) => inner.map_err(|e| e.to_string()),
+                Err(join_err) => Err(format!("Interview worker failed: {}", join_err)),
+            };
 
-        if graceful.is_err() {
-            // Grace period expired — force abort and reap
-            worker_future.as_mut().abort();
-            let _ = tokio::time::timeout(
-                tokio::time::Duration::from_secs(2),
-                &mut worker_future,
-            )
-            .await;
-        }
+            match result {
+                Ok((metadata, transcription)) => {
+                    // Persist round atomically: INSERT + session total_rounds++
+                    {
+                        let guard = db_state.db.lock().await;
+                        let db = guard.as_ref().ok_or("Database not initialized")?;
+                        db.insert_round_with_session_update(
+                            &session_id.hyphenated().to_string(),
+                            round_index,
+                            &question,
+                            &transcription,
+                            &metadata.file_path,
+                            &metadata.sha256,
+                            metadata.duration_ms,
+                            metadata.sample_rate,
+                            metadata.channels,
+                            metadata.file_size_bytes,
+                        )
+                        .map_err(|e| {
+                            let msg = e.to_string();
+                            if msg.contains("UNIQUE constraint failed") {
+                                format!("Round {} already exists for this session", round_index + 1)
+                            } else {
+                                format!("Failed to persist round: {}", e)
+                            }
+                        })?;
 
-        // Clean up temp files
-        let temp_dir = paths.paths.temp_dir.join(session_id.hyphenated().to_string());
-        let _ = std::fs::remove_dir_all(temp_dir);
-
-        phase_relay.abort();
-        return Err(format!(
-            "Round timed out after {}s — processes terminated, partial artifacts cleaned up",
-            ROUND_TIMEOUT_SECS
-        ));
-    }
-
-    // Normal completion path — process JoinHandle result exactly once
-    phase_relay.abort();
-
-    // Retrieve the join result — worker_future was polled by &mut in select, still usable
-    let result = match worker_future.await {
-        Ok(inner) => inner.map_err(|e| e.to_string()),
-        Err(join_err) => Err(format!("Interview worker failed: {}", join_err)),
-    };
-
-    match result {
-        Ok((metadata, transcription)) => {
-            // Persist round atomically: INSERT OR IGNORE + session total_rounds++
-            {
-                let guard = db_state.db.lock().await;
-                let db = guard.as_ref().ok_or("Database not initialized")?;
-                db.insert_round_with_session_update(
-                    &session_id.hyphenated().to_string(),
-                    round_index,
-                    &question,
-                    &transcription,
-                    &metadata.file_path,
-                    &metadata.sha256,
-                    metadata.duration_ms,
-                    metadata.sample_rate,
-                    metadata.channels,
-                    metadata.file_size_bytes,
-                )
-                .map_err(|e| {
-                    let msg = e.to_string();
-                    if msg.contains("UNIQUE constraint failed") {
-                        format!("Round {} already exists for this session", round_index + 1)
-                    } else {
-                        format!("Failed to persist round: {}", e)
+                        // Backend-authoritative session completion: finalize immediately
+                        // after the final round is persisted successfully.
+                        if is_final {
+                            db.complete_session(
+                                &session_id.hyphenated().to_string(),
+                                round_index + 1,
+                            )
+                            .map_err(|e| format!("Failed to complete session: {}", e))?;
+                        }
                     }
-                })?;
-
-                // Backend-authoritative session completion: finalize immediately
-                // after the final round is persisted successfully.
-                if is_final {
-                    db.complete_session(&session_id.hyphenated().to_string(), round_index + 1)
-                        .map_err(|e| format!("Failed to complete session: {}", e))?;
+                    Ok(InterviewRoundResult {
+                        metadata,
+                        transcription,
+                    })
                 }
+                Err(e) => Err(e.to_string()),
             }
-            Ok(InterviewRoundResult {
-                metadata,
-                transcription,
-            })
         }
-        Err(e) => Err(e.to_string()),
+        Err(_) => {
+            // Deadline hit — signal cooperative cancellation via stop_flag.
+            stop_flag.store(true, Ordering::SeqCst);
+            let _ = app.emit(
+                "interview-phase",
+                PhaseEventPayload {
+                    phase: "error".to_string(),
+                    question: Some(format!("Round timed out after {}s", ROUND_TIMEOUT_SECS)),
+                    duration_ms: None,
+                },
+            );
+
+            // Await the SAME worker up to the 5s grace period — allows cooperative
+            // exit. If it finishes in time, its result is captured (and discarded:
+            // the round timed out regardless).
+            let graceful = tokio::select! {
+                result = &mut worker_future => Some(result),
+                _ = tokio::time::sleep(tokio::time::Duration::from_secs(GRACE_SECS)) => None,
+            };
+
+            if graceful.is_none() {
+                // Grace period expired — force abort, then await the aborted
+                // JoinHandle so worker lifecycle is fully resolved before this
+                // command returns.
+                worker_future.as_mut().abort();
+                let _ = worker_future.await;
+            }
+
+            // Clean up temp files
+            let temp_dir = paths
+                .paths
+                .temp_dir
+                .join(session_id.hyphenated().to_string());
+            let _ = std::fs::remove_dir_all(temp_dir);
+
+            phase_relay.abort();
+            Err(format!(
+                "Round timed out after {}s — processes terminated, partial artifacts cleaned up",
+                ROUND_TIMEOUT_SECS
+            ))
+        }
     }
 }
 

@@ -54,7 +54,7 @@ if exist "%TOOLS_DIR%\whisper\Release\main.exe" (
     echo   [PASS] Whisper binary exists
     set /a PASS+=1
 ) else (
-    echo   [FAIL] Whisper binary missing (expected at tools\whisper\Release\main.exe)
+    echo   [FAIL] Whisper binary missing - expected at tools\whisper\Release\main.exe
     set /a FAIL+=1
 )
 
@@ -253,7 +253,7 @@ if exist "%PORTABLE_DIR%\ai-interviewer.exe" (
     echo   [PASS] Portable exe exists
     set /a PASS+=1
 ) else (
-    echo   [FAIL] No portable directory (run tauri build first)
+    echo   [FAIL] No portable directory - run tauri build first
     set /a FAIL+=1
 )
 
@@ -336,6 +336,14 @@ if exist "%PORTABLE_DIR%\tools\piper\model.onnx.json" (
     set /a PASS+=1
 ) else (
     echo   [FAIL] Portable piper model config missing
+    set /a FAIL+=1
+)
+
+if exist "%PORTABLE_DIR%\tools\piper\espeak-ng-data\phontab" (
+    echo   [PASS] Portable piper espeak-ng-data exists
+    set /a PASS+=1
+) else (
+    echo   [FAIL] Portable piper espeak-ng-data missing
     set /a FAIL+=1
 )
 
