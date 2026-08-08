@@ -155,8 +155,8 @@ impl PiperSupervisor {
                             }
                         }
                     }
-                    // Check stop flag
-                    _ = tokio::time::sleep_until(tokio::time::Instant::now()), if stop_flag.load(Ordering::SeqCst) => {
+                    // Check stop flag — polling wake-up ensures reliable cancellation
+                    _ = crate::interview::orchestrator::wait_for_stop(stop_flag.clone()) => {
                         let _ = child.kill().await;
                         let _ = child.wait().await;
                         return Ok(());

@@ -1,20 +1,36 @@
-# AI Model Attribution
+# AI Model & Tool Attribution
 
-## Text-to-Speech: en_US-amy-medium
+## Text-to-Speech: Piper + en_US-amy-medium
 
-- **Source**: [Piper TTS](https://github.com/rhasspy/piper)
-- **Version**: 2023.11.14-2 (see Piper-LICENSE.txt)
+### Piper Executable
+- **Source**: https://github.com/rhasspy/piper
+- **Version**: 2023.11.14-2 (pinned in resources/tool-manifest.json)
 - **License**: MIT — Copyright (c) 2022 Michael Hansen
-- **Model**: en_US-amy-medium
-- **HuggingFace**: rhasspy/piper-voices
+- **See**: Piper-LICENSE.txt
+
+### Voice Model: en_US-amy-medium
+- **Source repository**: https://github.com/rhasspy/piper-voices
+- **Model file**: en_US-amy-medium.onnx (SHA-256 pinned in tool-manifest.json)
+- **Model config**: en_US-amy-medium.onnx.json
+- **HuggingFace**: rhasspy/piper-voices (en/en_US/amy/medium)
 - **Description**: English (US) female voice, medium quality neural TTS model
+- **Model license**: Distributed via the piper-voices repository; see upstream
+  repository for applicable terms. The Piper executable MIT license does not
+  automatically extend to voice model weights or training data.
 
-## Speech-to-Text: ggml-tiny.en
+## Speech-to-Text: whisper.cpp + ggml-tiny.en
 
-- **Source**: [whisper.cpp](https://github.com/ggerganov/whisper.cpp)
-- **Version**: v1.5.4 (see WhisperCPP-LICENSE.txt)
+### whisper.cpp Executable
+- **Source**: https://github.com/ggerganov/whisper.cpp
+- **Version**: v1.5.4 / cc7e72f (pinned in resources/tool-manifest.json)
 - **License**: MIT — Copyright (c) 2023 Georgi Gerganov
-- **Model**: ggml-tiny.en
+- **See**: WhisperCPP-LICENSE.txt
+
+### Model: ggml-tiny.en
+- **Source repository**: https://github.com/ggerganov/whisper.cpp
+- **Model file**: ggml-tiny.en.bin (SHA-256 pinned in tool-manifest.json)
 - **HuggingFace**: ggerganov/whisper.cpp
 - **Description**: English-only Whisper model, tiny variant, optimized for CPU inference via ggml format
-- **Original Paper**: Robust Speech Recognition via Large-Scale Weak Supervision (Radford et al., 2019)
+- **Model license**: Distributed alongside whisper.cpp under MIT; see upstream repository
+- **Original paper**: Robust Speech Recognition via Large-Scale Weak Supervision (Radford et al., 2019)
+- **Original model**: OpenAI Whisper (https://github.com/openai/whisper)

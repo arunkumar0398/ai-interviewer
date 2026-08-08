@@ -362,12 +362,11 @@ async fn run_interview_round(
             // Grace period: let workers observe stop_flag and exit cleanly
             tokio::time::sleep(tokio::time::Duration::from_secs(GRACE_SECS)).await;
 
-            // Abort if still alive
-            worker_future.abort();
-            // Brief pause for abort to propagate
+            // Abort if still alive, then await actual termination
+            worker_future.as_mut().abort();
             let _ = tokio::time::timeout(
                 tokio::time::Duration::from_secs(2),
-                std::future::pending::<()>(),
+                &mut worker_future,
             )
             .await;
 
@@ -378,7 +377,6 @@ async fn run_interview_round(
     }
 
     phase_relay.abort();
-    clear_active_recording(&state).await;
 
     if timed_out {
         return Err(format!(

@@ -171,7 +171,7 @@ pub async fn run_interview_round(
         .as_ref()
         .map(|tx| tx.try_send(InterviewPhase::Processing));
 
-    let transcription = transcribe_wav(paths, &wav_path, session_id, round_id).await?;
+    let transcription = transcribe_wav(paths, &wav_path, session_id, round_id, stop_flag).await?;
 
     let _ = phase_tx
         .as_ref()
@@ -185,12 +185,25 @@ pub async fn run_interview_round(
 /// kills on timeout or cancellation, and cleans up temp files.
 const WHISPER_TIMEOUT_SECS: u64 = 120;
 
+/// Poll the stop flag every 50ms. Returns when the flag is set.
+/// Used by both Whisper and Piper cancellation branches to ensure reliable
+/// wake-up even when the select guard is not re-evaluated on flag change.
+pub async fn wait_for_stop(flag: Arc<AtomicBool>) {
+    loop {
+        if flag.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+}
+
 /// Transcribe a WAV file using whisper.cpp — temp output isolated to temp/<session_id>/<round_id>.txt
 async fn transcribe_wav(
     paths: &crate::paths::AppPaths,
     wav_path: &std::path::Path,
     session_id: Uuid,
     round_id: Uuid,
+    stop_flag: Arc<AtomicBool>,
 ) -> anyhow::Result<String> {
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
@@ -237,6 +250,12 @@ async fn transcribe_wav(
         biased;
 
         result = child.wait() => result,
+        _ = wait_for_stop(stop_flag) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = std::fs::remove_file(&txt_path);
+            anyhow::bail!("Whisper cancelled — process killed, temp cleaned");
+        }
         _ = tokio::time::sleep_until(deadline) => {
             let _ = child.kill().await;
             let _ = child.wait().await;

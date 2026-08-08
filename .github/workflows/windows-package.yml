@@ -70,9 +70,12 @@ jobs:
         run: |
           $version = (Get-Content src-tauri/tauri.conf.json | ConvertFrom-Json).version
           $zipName = "ai-interviewer-$version-windows-x64-portable.zip"
-          New-Item -ItemType Directory -Path "portable" -Force | Out-Null
+          # Wipe any prior staging directory
+          Remove-Item -Path "portable" -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path "portable/tools" -Force | Out-Null
           Copy-Item -Path "out" -Destination "portable/out" -Recurse
-          Copy-Item -Path "tools" -Destination "portable/tools" -Recurse
+          # Copy tool contents (not the directory itself) to avoid tools/tools/ nesting
+          Copy-Item -Path "tools/*" -Destination "portable/tools/" -Recurse -Force
           Copy-Item -Path "src-tauri/target/release/ai-interviewer.exe" -Destination "portable/"
           Copy-Item -Path "LICENSE" -Destination "portable/"
           Copy-Item -Path "README.md" -Destination "portable/"
@@ -102,20 +105,30 @@ jobs:
             Write-Error "Portable ZIP suspiciously small ($size bytes)"
             exit 1
           }
-          # Verify it contains expected entries
+          # Verify it contains expected entries with exact relative paths
           $extractDir = "$env:TEMP\validate-check-$(Get-Random)"
           Expand-Archive -Path $zip -DestinationPath $extractDir -Force
-          $entries = Get-ChildItem -Path $extractDir -Recurse -File | Select-Object -ExpandProperty Name
+          $required = @(
+            "ai-interviewer.exe",
+            "tools\piper\piper.exe",
+            "tools\piper\model.onnx",
+            "tools\piper\model.onnx.json",
+            "tools\whisper\Release\main.exe",
+            "tools\models\ggml-tiny.en.bin",
+            "licenses\Piper-LICENSE.txt",
+            "licenses\WhisperCPP-LICENSE.txt",
+            "licenses\model-attribution.txt",
+            "tool-manifest.json",
+            "THIRD_PARTY_NOTICES",
+            "README.md"
+          )
           $missing = @()
-          if ($entries -notcontains "ai-interviewer.exe") { $missing += "ai-interviewer.exe" }
-          if ($entries -notcontains "LICENSE") { $missing += "LICENSE" }
-          if ($entries -notcontains "tool-manifest.json") { $missing += "tool-manifest.json" }
-          if ($entries -notcontains "README.md") { $missing += "README.md" }
-          if ($entries -notcontains "THIRD_PARTY_NOTICES") { $missing += "THIRD_PARTY_NOTICES" }
-          # Validate each required license file individually
-          if ($entries -notcontains "Piper-LICENSE.txt") { $missing += "licenses/Piper-LICENSE.txt" }
-          if ($entries -notcontains "WhisperCPP-LICENSE.txt") { $missing += "licenses/WhisperCPP-LICENSE.txt" }
-          if ($entries -notcontains "model-attribution.txt") { $missing += "licenses/model-attribution.txt" }
+          foreach ($relative in $required) {
+            $full = Join-Path $extractDir $relative
+            if (-not (Test-Path $full -PathType Leaf)) {
+              $missing += $relative
+            }
+          }
           Remove-Item -Path $extractDir -Recurse -Force -ErrorAction SilentlyContinue
           if ($missing.Count -gt 0) {
             Write-Error "Portable ZIP missing: $($missing -join ', ')"
