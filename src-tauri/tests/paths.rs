@@ -396,11 +396,7 @@ fn validate_readiness_legacy_all_present() {
     .unwrap();
     // Legacy model + config: piper-models/en_US-amy-medium.onnx(.json)
     fs::create_dir_all(tool.join("piper-models")).unwrap();
-    fs::write(
-        tool.join("piper-models").join("en_US-amy-medium.onnx"),
-        b"",
-    )
-    .unwrap();
+    fs::write(tool.join("piper-models").join("en_US-amy-medium.onnx"), b"").unwrap();
     fs::write(
         tool.join("piper-models").join("en_US-amy-medium.onnx.json"),
         b"",

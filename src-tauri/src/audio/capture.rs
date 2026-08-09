@@ -159,6 +159,43 @@ where
     Ok(total_frames)
 }
 
+/// Internal RAII cleanup for `record_to_wav` failure paths (P2-2). Removes the
+/// partial `.wav.tmp` — and any uncommitted provisional final WAV — when
+/// dropped without being committed. Missing files are ignored and cleanup
+/// never panics. Declared BEFORE the `WavWriter` so reverse declaration
+/// order drops the writer (releasing its Windows file handle) before the
+/// guard removes files.
+struct PartialWavGuard {
+    temp_path: PathBuf,
+    final_path: PathBuf,
+    committed: bool,
+}
+
+impl PartialWavGuard {
+    fn new(temp_path: PathBuf, final_path: PathBuf) -> Self {
+        Self {
+            temp_path,
+            final_path,
+            committed: false,
+        }
+    }
+
+    /// Mark the recording fully committed — the final WAV must be preserved.
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PartialWavGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let _ = std::fs::remove_file(&self.temp_path);
+        let _ = std::fs::remove_file(&self.final_path);
+    }
+}
+
 /// Start recording from the default microphone to a WAV file using cpal (WASAPI on Windows).
 /// Writes to a temp file first, then renames on success for crash recovery.
 /// Periodically flushes the writer so partial data survives a crash.
@@ -176,6 +213,11 @@ pub async fn record_to_wav(
 
     tokio::task::spawn_blocking(move || -> anyhow::Result<RecordResult> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+        // Own partial-file cleanup for EVERY failure path: any `?`/bail below
+        // unwinds with the guard armed, and because the guard is declared
+        // before the writer, the writer (holding the file handle) drops first.
+        let mut cleanup = PartialWavGuard::new(temp_path.clone(), output_path.clone());
 
         let host = cpal::default_host();
         let device = host
@@ -227,10 +269,11 @@ pub async fn record_to_wav(
 
         while !stop_flag.load(Ordering::SeqCst) {
             // Async capture failure is authoritative — stop the stream, drop
-            // the partial temp file, and fail the recording.
+            // the writer (release the file handle), and fail the recording.
+            // The armed guard removes the partial temp file.
             if let Some(msg) = error_latch.peek() {
                 drop(stream);
-                let _ = std::fs::remove_file(&temp_path);
+                drop(writer);
                 anyhow::bail!("{}", msg);
             }
             match sample_rx.recv_timeout(std::time::Duration::from_millis(100)) {
@@ -264,13 +307,12 @@ pub async fn record_to_wav(
         let dropped = overflow_watch.load(Ordering::Relaxed);
         if let Some(msg) = overflow_error(dropped) {
             // P1-2: any dropped production audio chunk fails the round. Drop
-            // the writer first so the file handles are released, then remove
-            // the partial temp file and any provisional final WAV, surface a
-            // CaptureEvent::Error, and return Err — never a successful
-            // RecordResult, so no Whisper and no DB persistence can follow.
+            // the writer first so the file handles are released; the armed
+            // guard then removes the partial temp file AND any provisional
+            // final WAV. Surface a CaptureEvent::Error and return Err — never
+            // a successful RecordResult, so no Whisper and no DB persistence
+            // can follow.
             drop(writer);
-            let _ = std::fs::remove_file(&temp_path);
-            let _ = std::fs::remove_file(&output_path);
             let _ = event_tx.try_send(CaptureEvent::Error {
                 message: msg.clone(),
             });
@@ -283,6 +325,8 @@ pub async fn record_to_wav(
 
         let duration_ms = (total_frames * 1000) / sr as u64;
         let file_size_bytes = std::fs::metadata(&output_path)?.len();
+        // Fully committed — the final WAV must be preserved.
+        cleanup.commit();
         let _ = event_tx.try_send(CaptureEvent::Stopped {
             file_path: output_path.to_string_lossy().to_string(),
             duration_ms,
@@ -534,6 +578,68 @@ mod tests {
             "must tell the user to retry, got: {}",
             msg
         );
+    }
+
+    /// P2-2: an armed cleanup guard removes the partial temp file.
+    #[test]
+    fn partial_wav_guard_armed_removes_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("round.wav.tmp");
+        let final_path = dir.path().join("round.wav");
+        std::fs::write(&temp, b"partial").unwrap();
+
+        {
+            let _guard = PartialWavGuard::new(temp.clone(), final_path.clone());
+        }
+        assert!(!temp.exists(), "armed guard must remove the temp file");
+    }
+
+    /// P2-2: an uncommitted provisional final WAV is also removed (the final
+    /// is provisional until the caller commits it — e.g. after DB commit).
+    #[test]
+    fn partial_wav_guard_armed_removes_uncommitted_final() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("round.wav.tmp");
+        let final_path = dir.path().join("round.wav");
+        std::fs::write(&temp, b"partial").unwrap();
+        std::fs::write(&final_path, b"provisional").unwrap();
+
+        {
+            let _guard = PartialWavGuard::new(temp.clone(), final_path.clone());
+        }
+        assert!(!temp.exists());
+        assert!(
+            !final_path.exists(),
+            "uncommitted provisional final must be removed"
+        );
+    }
+
+    /// P2-2: a committed guard preserves the final WAV.
+    #[test]
+    fn partial_wav_guard_committed_preserves_final() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("round.wav.tmp");
+        let final_path = dir.path().join("round.wav");
+        std::fs::write(&final_path, b"committed-evidence").unwrap();
+
+        {
+            let mut guard = PartialWavGuard::new(temp.clone(), final_path.clone());
+            guard.commit();
+        }
+        assert!(final_path.exists(), "committed final WAV must be preserved");
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"committed-evidence");
+    }
+
+    /// P2-2: cleanup of missing files is harmless and never panics.
+    #[test]
+    fn partial_wav_guard_missing_files_harmless() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("never-created.wav.tmp");
+        let final_path = dir.path().join("never-created.wav");
+
+        // Must not panic and must not error.
+        let _guard = PartialWavGuard::new(temp.clone(), final_path.clone());
+        drop(_guard);
     }
 
     /// A full sample queue never blocks the producer: the chunk is dropped and

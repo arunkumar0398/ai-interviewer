@@ -445,6 +445,7 @@ describe("Interview Page", () => {
     window.history.replaceState({}, "", `/interview?session=${handedOffSession}`);
 
     let createSessionCalls = 0;
+    let getSessionCalls = 0;
     let roundSessionId: string | null = null;
     mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
       switch (cmd) {
@@ -459,6 +460,16 @@ describe("Interview Page", () => {
             mic_test_ok: true,
             errors: [],
           });
+        case "get_session": {
+          getSessionCalls += 1;
+          return Promise.resolve({
+            id: handedOffSession,
+            candidate_name: "Alice",
+            started_at: "2026-01-01T00:00:00Z",
+            completed_at: null,
+            total_rounds: 0,
+          });
+        }
         case "create_session":
           createSessionCalls += 1;
           return Promise.resolve();
@@ -485,6 +496,10 @@ describe("Interview Page", () => {
       render(<InterviewPage />);
     });
 
+    // The handed-off session is verified against the backend first (P2-1).
+    await waitFor(() => {
+      expect(getSessionCalls).toBe(1);
+    });
     await waitFor(() => {
       expect(screen.getByText("Check Devices")).toBeInTheDocument();
     });
@@ -504,6 +519,148 @@ describe("Interview Page", () => {
     expect(roundSessionId).toBe(handedOffSession);
 
     // Restore the URL for other tests.
+    window.history.replaceState({}, "", "/");
+  });
+
+  it("rejects an invalid-UUID session handoff before any round flow (P2-1)", async () => {
+    // Not a UUID — must fail verification without any backend round call.
+    window.history.replaceState({}, "", `/interview?session=not-a-uuid`);
+
+    let roundCalls = 0;
+    let getSessionCalls = 0;
+    mockInvoke.mockImplementation((cmd: string) => {
+      switch (cmd) {
+        case "get_app_config":
+          return Promise.resolve(mockAppConfig);
+        case "get_session":
+          getSessionCalls += 1;
+          return Promise.resolve(null);
+        case "run_interview_round":
+          roundCalls += 1;
+          return Promise.resolve({
+            metadata: {
+              file_path: "/tmp/round.wav",
+              sha256: "abc123",
+              duration_ms: 5000,
+              sample_rate: 16000,
+              channels: 1,
+              file_size_bytes: 100,
+            },
+            transcription: "My answer",
+          });
+        default:
+          return Promise.reject(new Error(`Unexpected command: ${cmd}`));
+      }
+    });
+
+    await act(async () => {
+      render(<InterviewPage />);
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(/not a valid UUID/)
+      ).toBeInTheDocument();
+    });
+    expect(getSessionCalls).toBe(0);
+    expect(roundCalls).toBe(0);
+    expect(screen.queryByText("Check Devices")).not.toBeInTheDocument();
+
+    window.history.replaceState({}, "", "/");
+  });
+
+  it("rejects a missing session handoff without a round retry (P2-1)", async () => {
+    const staleSession = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    window.history.replaceState({}, "", `/interview?session=${staleSession}`);
+
+    let roundCalls = 0;
+    mockInvoke.mockImplementation((cmd: string) => {
+      switch (cmd) {
+        case "get_app_config":
+          return Promise.resolve(mockAppConfig);
+        case "get_session":
+          return Promise.resolve(null);
+        case "run_interview_round":
+          roundCalls += 1;
+          return Promise.resolve({
+            metadata: {
+              file_path: "/tmp/round.wav",
+              sha256: "abc123",
+              duration_ms: 5000,
+              sample_rate: 16000,
+              channels: 1,
+              file_size_bytes: 100,
+            },
+            transcription: "My answer",
+          });
+        default:
+          return Promise.reject(new Error(`Unexpected command: ${cmd}`));
+      }
+    });
+
+    await act(async () => {
+      render(<InterviewPage />);
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(/invalid or expired/)
+      ).toBeInTheDocument();
+    });
+    expect(roundCalls).toBe(0);
+    // A stale handoff is NOT turned into a round retry.
+    expect(screen.queryByText("Retry")).not.toBeInTheDocument();
+
+    window.history.replaceState({}, "", "/");
+  });
+
+  it("blocks rounds for a completed session handoff (P2-1)", async () => {
+    const doneSession = "11111111-2222-3333-4444-555555555555";
+    window.history.replaceState({}, "", `/interview?session=${doneSession}`);
+
+    let roundCalls = 0;
+    mockInvoke.mockImplementation((cmd: string) => {
+      switch (cmd) {
+        case "get_app_config":
+          return Promise.resolve(mockAppConfig);
+        case "get_session":
+          return Promise.resolve({
+            id: doneSession,
+            candidate_name: "Alice",
+            started_at: "2026-01-01T00:00:00Z",
+            completed_at: "2026-01-01T00:10:00Z",
+            total_rounds: 5,
+          });
+        case "run_interview_round":
+          roundCalls += 1;
+          return Promise.resolve({
+            metadata: {
+              file_path: "/tmp/round.wav",
+              sha256: "abc123",
+              duration_ms: 5000,
+              sample_rate: 16000,
+              channels: 1,
+              file_size_bytes: 100,
+            },
+            transcription: "My answer",
+          });
+        default:
+          return Promise.reject(new Error(`Unexpected command: ${cmd}`));
+      }
+    });
+
+    await act(async () => {
+      render(<InterviewPage />);
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("Session Already Completed")
+      ).toBeInTheDocument();
+    });
+    expect(roundCalls).toBe(0);
+    expect(screen.queryByText("Start Interview")).not.toBeInTheDocument();
+
     window.history.replaceState({}, "", "/");
   });
 

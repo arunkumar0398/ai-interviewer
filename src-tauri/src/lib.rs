@@ -121,6 +121,14 @@ impl<T: Send + 'static> RecordingGuard<T> {
     }
 }
 
+/// Bounded cooperative-shutdown grace for the RecordingGuard drop safety net
+/// (P1-1). After the stop flag is set, the nested blocking capture is given
+/// this long to observe the flag and terminate NORMALLY. Only when the grace
+/// expires is the outer worker force-aborted. 5s comfortably exceeds the
+/// ~100ms capture-loop poll interval while keeping an unexpected-drop cleanup
+/// bounded.
+const RECORDING_DROP_GRACE_SECS: u64 = 5;
+
 impl<T: Send + 'static> Drop for RecordingGuard<T> {
     fn drop(&mut self) {
         if self.armed.load(Ordering::SeqCst) {
@@ -128,12 +136,29 @@ impl<T: Send + 'static> Drop for RecordingGuard<T> {
             let worker = self.worker.take();
             let state = self.state.clone();
             // Spawn on the runtime; this runs even on panic. The slot is
-            // cleared ONLY after the worker has terminated (abort + await),
-            // so the slot can never be freed while a detached worker is alive.
+            // cleared ONLY after the worker's lifecycle is resolved. The real
+            // microphone work runs in a NESTED spawn_blocking task, so the
+            // worker is first given a bounded cooperative grace period to
+            // observe the stop flag and terminate normally — aborting the
+            // outer async task alone would NOT prove the blocking capture has
+            // stopped (the outer task can resolve while the blocking closure
+            // is still finishing). Only if the grace expires is the worker
+            // force-aborted (and awaited) before the slot is released.
             tokio::runtime::Handle::current().spawn(async move {
                 if let Some(handle) = worker {
-                    handle.abort();
-                    let _ = handle.await;
+                    let deadline = tokio::time::Instant::now()
+                        + std::time::Duration::from_secs(RECORDING_DROP_GRACE_SECS);
+                    loop {
+                        if handle.is_finished() {
+                            break;
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            handle.abort();
+                            let _ = handle.await;
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
                 }
                 clear_active_recording(&state).await;
             });
@@ -458,7 +483,9 @@ fn validate_question(question: &str) -> Result<String, String> {
     if question.is_empty() {
         return Err("Question cannot be empty".to_string());
     }
-    if question.len() > MAX_QUESTION_LEN {
+    // P3: the limit is CHARACTERS, not UTF-8 bytes — `chars().count()` keeps
+    // the error message truthful for multibyte text.
+    if question.chars().count() > MAX_QUESTION_LEN {
         return Err(format!(
             "Question too long (max {} characters)",
             MAX_QUESTION_LEN
@@ -921,6 +948,22 @@ async fn create_session(
 // the same transaction as the round insert. JavaScript cannot arbitrarily set
 // total_rounds or completion state.
 
+/// Typed lookup of a single session by ID (P2-1). The Interview page uses
+/// this to VERIFY a Dashboard-handed-off session before any round flow: a
+/// missing session returns Ok(None) (stale/invalid handoff), a completed
+/// session returns the session with completed_at set, and an unparseable
+/// session id is rejected by the Uuid type before this command is reached.
+#[tauri::command]
+async fn get_session(
+    session_id: uuid::Uuid,
+    state: State<'_, Arc<DbState>>,
+) -> Result<Option<db::InterviewSession>, String> {
+    let guard = state.db.lock().await;
+    let db = guard.as_ref().ok_or("Database not initialized")?;
+    db.get_session(&session_id.hyphenated().to_string())
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn get_sessions(state: State<'_, Arc<DbState>>) -> Result<Vec<db::InterviewSession>, String> {
     let guard = state.db.lock().await;
@@ -978,6 +1021,7 @@ pub fn run() {
             stop_interview_round,
             get_tools_dir,
             create_session,
+            get_session,
             get_sessions,
             get_rounds,
         ])
@@ -1084,6 +1128,104 @@ mod tests {
             state.handle.lock().await.is_none(),
             "slot must be cleared only after the worker terminated"
         );
+    }
+
+    /// P1-1: the drop safety net uses the REAL nested topology (outer
+    /// tokio::spawn -> spawn_blocking -> loops until stop observed). Dropping
+    /// an armed guard sets the stop flag and gives the nested blocking
+    /// capture a bounded cooperative grace period; the slot stays occupied
+    /// until the blocking worker has actually terminated, so a second acquire
+    /// cannot succeed early, and only after termination is the slot cleared
+    /// and reusable.
+    #[tokio::test]
+    async fn recording_guard_drop_waits_for_nested_blocking_worker() {
+        let state = Arc::new(RecordingState {
+            handle: Mutex::new(None),
+        });
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        acquire_recording(&state, fake_handle()).await.unwrap();
+
+        let stop_seen = Arc::new(tokio::sync::Notify::new());
+        let (terminated_tx, terminated_rx) = tokio::sync::oneshot::channel::<()>();
+
+        {
+            let mut guard = RecordingGuard::new(state.clone(), stop.clone());
+            let worker = {
+                let blocking_stop = stop.clone();
+                let blocking_release = release.clone();
+                let stop_seen = stop_seen.clone();
+                let terminated_tx = terminated_tx;
+                tokio::spawn(async move {
+                    // Outer async worker awaiting the nested blocking capture.
+                    let blocking_stop = blocking_stop.clone();
+                    let blocking_release = blocking_release.clone();
+                    let stop_seen = stop_seen.clone();
+                    let terminated_tx = terminated_tx;
+                    let blocking = tokio::task::spawn_blocking(move || {
+                        // Nested physical capture: loop until stop observed.
+                        while !blocking_stop.load(Ordering::SeqCst) {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                        // Stop observed — signal, then "still finishing"
+                        // (unwinding the capture) until released.
+                        stop_seen.notify_waiters();
+                        while !blocking_release.load(Ordering::SeqCst) {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                    });
+                    let _ = blocking.await;
+                    // Blocking worker fully terminated.
+                    let _ = terminated_tx.send(());
+                })
+            };
+            guard.attach_worker(worker);
+            // Dropped while armed — unexpected drop/panic of the outer command.
+        }
+
+        // 1. Drop set the stop flag and the nested blocking worker observed it.
+        tokio::time::timeout(std::time::Duration::from_secs(5), stop_seen.notified())
+            .await
+            .expect("drop must set stop and the blocking worker must observe it");
+        assert!(stop.load(Ordering::SeqCst), "drop must set the stop flag");
+
+        // 2-3. Blocking worker still alive -> slot still occupied; a second
+        // acquire must fail.
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(
+            state.handle.lock().await.is_some(),
+            "slot must stay occupied while the nested blocking worker is alive"
+        );
+        let second = acquire_recording(&state, fake_handle()).await;
+        assert!(
+            second.is_err() && second.unwrap_err().contains("already active"),
+            "second acquire must not succeed while the cancelled worker is alive"
+        );
+
+        // 4. Release the blocking worker -> it terminates -> outer worker
+        // finishes -> cleanup clears the slot.
+        release.store(true, Ordering::SeqCst);
+        match tokio::time::timeout(std::time::Duration::from_secs(5), terminated_rx).await {
+            Ok(Ok(())) => {}
+            _ => panic!("blocking worker must terminate after release"),
+        }
+        // Wait for the cleanup task to clear the slot after termination.
+        let mut cleared = false;
+        for _ in 0..200 {
+            if state.handle.lock().await.is_none() {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            cleared,
+            "slot must be cleared only after worker termination"
+        );
+
+        // 5. Slot is reusable.
+        acquire_recording(&state, fake_handle()).await.unwrap();
+        assert!(state.handle.lock().await.is_some());
     }
 
     /// P2-1: take_result captures the worker's JoinHandle result exactly once.
@@ -1417,5 +1559,35 @@ mod tests {
     fn validate_question_accepts_and_trims() {
         let trimmed = validate_question("  Tell me about yourself.  ").unwrap();
         assert_eq!(trimmed, "Tell me about yourself.");
+    }
+
+    /// P3: the limit is characters, so a multibyte string whose byte length
+    /// exceeds the limit but whose character count is within it is accepted.
+    #[test]
+    fn validate_question_limits_characters_not_bytes() {
+        // Each character is 4 UTF-8 bytes; 4000 chars = 16000 bytes, but only
+        // 4000 chars — well under the 10_000-character limit.
+        let multibyte = "\u{1F600}".repeat(4_000);
+        assert!(
+            multibyte.len() > MAX_QUESTION_LEN,
+            "sanity: bytes exceed limit"
+        );
+        assert!(validate_question(&multibyte).is_ok());
+
+        // Past the character limit it is rejected regardless of byte width.
+        let too_many = "\u{1F600}".repeat(MAX_QUESTION_LEN + 1);
+        let err = validate_question(&too_many).unwrap_err();
+        assert!(
+            err.contains("too long"),
+            "character-over-limit must be rejected, got: {}",
+            err
+        );
+    }
+
+    /// P3: ASCII boundary — exactly at the limit passes, one past fails.
+    #[test]
+    fn validate_question_ascii_boundary() {
+        assert!(validate_question(&"x".repeat(MAX_QUESTION_LEN)).is_ok());
+        assert!(validate_question(&"x".repeat(MAX_QUESTION_LEN + 1)).is_err());
     }
 }

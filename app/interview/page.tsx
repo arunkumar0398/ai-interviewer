@@ -34,6 +34,14 @@ interface InterviewRoundResult {
   transcription: string;
 }
 
+interface InterviewSession {
+  id: string;
+  candidate_name: string;
+  started_at: string;
+  completed_at: string | null;
+  total_rounds: number;
+}
+
 interface ToolsStatus {
   piper: boolean;
   whisper: boolean;
@@ -102,11 +110,24 @@ export default function InterviewPage() {
   // Backend-authoritative session lifecycle: tracks whether create_session
   // has been called and whether the session is ready for round execution. A
   // handed-off session was already created by the Dashboard, so it starts
-  // ready and create_session is never called for it.
-  type SessionInitState = "idle" | "creating" | "ready" | "error";
+  // VERIFYING (P2-1): the backend is asked whether the session exists and is
+  // incomplete BEFORE any round flow. create_session is never called for a
+  // handed-off session; invalid/missing/completed handoffs never reach the
+  // round invoke.
+  type SessionInitState =
+    | "idle"
+    | "creating"
+    | "verifying"
+    | "ready"
+    | "error"
+    | "completed";
   const [sessionInitState, setSessionInitState] = useState<SessionInitState>(
-    handedOffSession ? "ready" : "idle"
+    handedOffSession ? "verifying" : "idle"
   );
+  // Synchronous marker set by the handoff-verification effect BEFORE the
+  // tools-check effect's async continuation can run, so a rejected handoff is
+  // never overwritten by the independent tools/device-check phase flow.
+  const handoffFailedRef = useRef(false);
 
   // Ref-based guard to prevent concurrent double-starts while session creation
   // or round startup is in progress. Must outlive async callbacks.
@@ -167,6 +188,9 @@ export default function InterviewPage() {
       try {
         const config = await invoke<AppConfig>("get_app_config");
         if (cancelled) return;
+        // A rejected session handoff is authoritative — do not override its
+        // error phase with the tools/device-check flow (P2-1).
+        if (handoffFailedRef.current) return;
 
         if (config.readiness.ready) {
           setToolsStatus({ piper: true, whisper: true, model: true });
@@ -190,6 +214,64 @@ export default function InterviewPage() {
     init();
     return () => { cancelled = true; };
   }, []);
+
+  // P2-1: verify a Dashboard-handed-off session BEFORE any round flow. The
+  // handoff is validated as a UUID, then checked against the DB: missing
+  // session -> stale/invalid handoff error; completed session -> explicit
+  // completed state; valid + incomplete -> ready. An invalid handoff is never
+  // turned into a round retry (no RetryTarget is set).
+  useEffect(() => {
+    const sessionParam = handedOffSession;
+    if (!sessionParam) return;
+    let cancelled = false;
+
+    async function verifyHandoff(sessionId: string) {
+      const uuidRe =
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      if (!uuidRe.test(sessionId)) {
+        if (cancelled) return;
+        handoffFailedRef.current = true;
+        setSessionInitState("error");
+        setPhase("error");
+        setRetryTarget(null);
+        setError(
+          "Invalid session link: the session identifier is not a valid UUID. Please create a new session from the Dashboard."
+        );
+        return;
+      }
+      try {
+        const session = await invoke<InterviewSession | null>("get_session", {
+          sessionId,
+        });
+        if (cancelled) return;
+        if (!session) {
+          handoffFailedRef.current = true;
+          setSessionInitState("error");
+          setPhase("error");
+          setRetryTarget(null);
+          setError(
+            "This session link is invalid or expired — no matching session was found. Please create a new session from the Dashboard."
+          );
+          return;
+        }
+        if (session.completed_at) {
+          setSessionInitState("completed");
+          return;
+        }
+        setSessionInitState("ready");
+      } catch (e) {
+        if (cancelled) return;
+        handoffFailedRef.current = true;
+        setSessionInitState("error");
+        setPhase("error");
+        setRetryTarget(null);
+        setError(`Failed to verify session: ${String(e)}`);
+      }
+    }
+
+    verifyHandoff(sessionParam);
+    return () => { cancelled = true; };
+  }, [handedOffSession]);
 
   // P2-1: in-flight guard — a rapid double-click must not start a second
   // device check. The backend also rejects overlap via the shared recording
@@ -242,8 +324,14 @@ export default function InterviewPage() {
 
     // Prevent concurrent double-starts while session creation or round startup
     if (isStartingRound.current) return;
-    // Never execute a round while session initialization is pending or failed.
-    if (sessionInitState === "creating" || sessionInitState === "error") return;
+    // Never execute a round while session initialization is pending, being
+    // verified, or failed (P2-1: a handed-off session must be verified first).
+    if (
+      sessionInitState === "creating" ||
+      sessionInitState === "verifying" ||
+      sessionInitState === "error"
+    )
+      return;
     isStartingRound.current = true;
 
     try {
@@ -423,8 +511,38 @@ export default function InterviewPage() {
           </div>
         )}
 
-        {/* Device Check */}
-        {(phase === "device-check" || phase === "ready") && (
+        {/* Handed-off session verification (P2-1) */}
+        {sessionInitState === "verifying" && (
+          <div className="text-zinc-600 dark:text-zinc-400">
+            Verifying session...
+          </div>
+        )}
+
+        {/* Handed-off session already completed (P2-1) */}
+        {sessionInitState === "completed" && (
+          <div className="w-full max-w-md border rounded-lg p-4 dark:border-zinc-800">
+            <h2 className="text-lg font-medium mb-3 dark:text-zinc-200">
+              Session Already Completed
+            </h2>
+            <p className="text-sm text-zinc-600 dark:text-zinc-400 mb-4">
+              This interview session has already been completed. No further
+              rounds can be started.
+            </p>
+            <a
+              href="/dashboard"
+              className="inline-block px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 text-sm"
+            >
+              Back to Dashboard
+            </a>
+          </div>
+        )}
+
+        {/* Device Check — shown only when the session can actually proceed
+            (idle: direct /interview flow; ready: handoff verified or session
+            created). Never during handoff verification, errors, or a
+            completed session (P2-1). */}
+        {(phase === "device-check" || phase === "ready") &&
+          (sessionInitState === "idle" || sessionInitState === "ready") && (
           <div className="w-full max-w-md border rounded-lg p-4 dark:border-zinc-800">
             <h2 className="text-lg font-medium mb-3 dark:text-zinc-200">
               Device Check
@@ -583,13 +701,20 @@ export default function InterviewPage() {
           <div className="w-full max-w-md p-4 bg-red-50 border border-red-200 rounded text-red-700 text-sm">
             <p className="font-medium mb-1">Error</p>
             <p>{error}</p>
-            {retryTarget && (
+            {retryTarget ? (
               <button
                 onClick={handleRetry}
                 className="mt-3 px-3 py-1 bg-red-600 text-white rounded text-xs hover:bg-red-700"
               >
                 Retry
               </button>
+            ) : (
+              <a
+                href="/dashboard"
+                className="inline-block mt-3 px-3 py-1 bg-zinc-600 text-white rounded text-xs hover:bg-zinc-700"
+              >
+                Back to Dashboard
+              </a>
             )}
           </div>
         )}

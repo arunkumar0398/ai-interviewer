@@ -148,6 +148,70 @@ pub fn uuid_to_path(id: &Uuid) -> String {
     id.hyphenated().to_string()
 }
 
+/// One coherent Piper runtime layout. Readiness and runtime selection must
+/// agree on which layout is in use — a mixed canonical/legacy tree must NOT
+/// report ready (P1-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PiperLayout {
+    Canonical,
+    Legacy,
+}
+
+/// Resolve which Piper layout is selected, mirroring the runtime resolver
+/// (`resolve_tools` prefers the canonical executable). Returns `None` when no
+/// Piper executable exists in either layout.
+pub fn resolve_piper_layout(tool_dir: &Path) -> Option<PiperLayout> {
+    let piper_dir = tool_dir.join("piper");
+    if piper_dir.join("piper.exe").exists() {
+        Some(PiperLayout::Canonical)
+    } else if piper_dir.join("piper").join("piper.exe").exists() {
+        Some(PiperLayout::Legacy)
+    } else {
+        None
+    }
+}
+
+/// (relative asset path, issue code, message) triples for the canonical
+/// layout `tools/piper/<name>`.
+const CANONICAL_PIPER_ASSETS: &[(&str, &str, &str)] = &[
+    (
+        "piper.exe",
+        "PIPER_BINARY_MISSING",
+        "Piper TTS binary not found",
+    ),
+    ("model.onnx", "PIPER_MODEL_MISSING", "Piper model not found"),
+    (
+        "model.onnx.json",
+        "PIPER_MODEL_CONFIG_MISSING",
+        "Piper model config not found",
+    ),
+    (
+        "espeak-ng.dll",
+        "PIPER_ESPEAK_DLL_MISSING",
+        "Piper espeak-ng DLL not found",
+    ),
+    (
+        "piper_phonemize.dll",
+        "PIPER_PHONEMIZE_DLL_MISSING",
+        "Piper phonemize DLL not found",
+    ),
+    (
+        "onnxruntime.dll",
+        "PIPER_ONNX_RUNTIME_MISSING",
+        "Piper ONNX runtime DLL not found",
+    ),
+    (
+        "onnxruntime_providers_shared.dll",
+        "PIPER_ONNX_PROVIDER_MISSING",
+        "Piper ONNX provider DLL not found",
+    ),
+    (
+        "espeak-ng-data/phontab",
+        "PIPER_ESPEAK_DATA_MISSING",
+        "Piper espeak-ng data not found",
+    ),
+];
+
 impl AppPaths {
     /// Return the recordings directory for a specific session.
     pub fn session_recordings_dir(&self, session_id: Uuid) -> PathBuf {
@@ -251,115 +315,98 @@ impl AppPaths {
     }
 
     /// Validate that critical binaries, models, AND Piper's required runtime
-    /// companions are present (P2-3). Packaging requires the full Piper
+    /// companions are present (P2-3/P1-2). Packaging requires the full Piper
     /// runtime (espeak-ng.dll, piper_phonemize.dll, onnxruntime.dll,
     /// onnxruntime_providers_shared.dll, espeak-ng-data/) — a damaged or
     /// hand-supplied AI_INTERVIEWER_TOOLS directory that only has the exe
     /// would otherwise report `ready = true` and then fail at runtime.
-    /// Supports both the canonical layout (tools/piper/*) and the legacy
-    /// layout (tools/piper/piper/* + tools/piper-models/*). Returns the
-    /// aggregate readiness state — callers decide whether to surface errors
-    /// or degrade gracefully.
+    ///
+    /// Readiness resolves ONE coherent Piper layout first (canonical
+    /// preferred, matching the runtime resolver) and validates every required
+    /// asset against that selected layout only. A mixed tree — canonical
+    /// executable with only legacy DLLs, or a canonical model paired with a
+    /// legacy config — must NOT report ready. Returns the aggregate readiness
+    /// state — callers decide whether to surface errors or degrade gracefully.
     pub fn validate_readiness(&self) -> AppReadiness {
         let mut issues = Vec::new();
 
-        // Piper assets: canonical tools/piper/<name>, legacy tools/piper/piper/<name>
-        check_piper_asset(
-            &mut issues,
-            self.tool_dir.join("piper").join("piper.exe"),
-            Some(self.tool_dir.join("piper").join("piper").join("piper.exe")),
-            "PIPER_BINARY_MISSING",
-            "Piper TTS binary not found",
-        );
-        // Piper model: canonical tools/piper/model.onnx; legacy tools/piper-models/en_US-amy-medium.onnx
-        check_piper_asset(
-            &mut issues,
-            self.tool_dir.join("piper").join("model.onnx"),
-            Some(
-                self.tool_dir
-                    .join("piper-models")
-                    .join("en_US-amy-medium.onnx"),
-            ),
-            "PIPER_MODEL_MISSING",
-            "Piper model not found",
-        );
-        check_piper_asset(
-            &mut issues,
-            self.tool_dir.join("piper").join("model.onnx.json"),
-            Some(
-                self.tool_dir
-                    .join("piper-models")
-                    .join("en_US-amy-medium.onnx.json"),
-            ),
-            "PIPER_MODEL_CONFIG_MISSING",
-            "Piper model config not found",
-        );
-        check_piper_asset(
-            &mut issues,
-            self.tool_dir.join("piper").join("espeak-ng.dll"),
-            Some(
-                self.tool_dir
-                    .join("piper")
-                    .join("piper")
-                    .join("espeak-ng.dll"),
-            ),
-            "PIPER_ESPEAK_DLL_MISSING",
-            "Piper espeak-ng DLL not found",
-        );
-        check_piper_asset(
-            &mut issues,
-            self.tool_dir.join("piper").join("piper_phonemize.dll"),
-            Some(
-                self.tool_dir
-                    .join("piper")
-                    .join("piper")
-                    .join("piper_phonemize.dll"),
-            ),
-            "PIPER_PHONEMIZE_DLL_MISSING",
-            "Piper phonemize DLL not found",
-        );
-        check_piper_asset(
-            &mut issues,
-            self.tool_dir.join("piper").join("onnxruntime.dll"),
-            Some(
-                self.tool_dir
-                    .join("piper")
-                    .join("piper")
-                    .join("onnxruntime.dll"),
-            ),
-            "PIPER_ONNX_RUNTIME_MISSING",
-            "Piper ONNX runtime DLL not found",
-        );
-        check_piper_asset(
-            &mut issues,
-            self.tool_dir
-                .join("piper")
-                .join("onnxruntime_providers_shared.dll"),
-            Some(
-                self.tool_dir
-                    .join("piper")
-                    .join("piper")
-                    .join("onnxruntime_providers_shared.dll"),
-            ),
-            "PIPER_ONNX_PROVIDER_MISSING",
-            "Piper ONNX provider DLL not found",
-        );
-        check_piper_asset(
-            &mut issues,
-            self.tool_dir
-                .join("piper")
-                .join("espeak-ng-data")
-                .join("phontab"),
-            Some(
-                self.tool_dir
-                    .join("piper")
-                    .join("piper")
-                    .join("espeak-ng-data")
-                    .join("phontab"),
-            ),
-            "PIPER_ESPEAK_DATA_MISSING",
-            "Piper espeak-ng data not found",
-        );
+        // Resolve the selected Piper layout, then validate against it.
+        match resolve_piper_layout(&self.tool_dir) {
+            Some(PiperLayout::Canonical) => {
+                let piper_dir = self.tool_dir.join("piper");
+                for (asset, code, message) in CANONICAL_PIPER_ASSETS {
+                    let path = piper_dir.join(asset);
+                    if !path.exists() {
+                        issues.push(AppConfigurationIssue {
+                            code: (*code).into(),
+                            message: (*message).into(),
+                            expected_path: Some(path.display().to_string()),
+                        });
+                    }
+                }
+            }
+            Some(PiperLayout::Legacy) => {
+                // All runtime companions come from the same legacy runtime
+                // directory (the model/config pair lives in piper-models/).
+                let legacy_piper_dir = self.tool_dir.join("piper").join("piper");
+                for (asset, code, message) in CANONICAL_PIPER_ASSETS {
+                    if *asset == "model.onnx" || *asset == "model.onnx.json" {
+                        continue;
+                    }
+                    let path = legacy_piper_dir.join(asset);
+                    if !path.exists() {
+                        issues.push(AppConfigurationIssue {
+                            code: (*code).into(),
+                            message: (*message).into(),
+                            expected_path: Some(path.display().to_string()),
+                        });
+                    }
+                }
+                // Supported legacy model/config pair lives in piper-models/.
+                let models_dir = self.tool_dir.join("piper-models");
+                let model = models_dir.join("en_US-amy-medium.onnx");
+                let config = models_dir.join("en_US-amy-medium.onnx.json");
+                if !model.exists() {
+                    issues.push(AppConfigurationIssue {
+                        code: "PIPER_MODEL_MISSING".into(),
+                        message: "Piper model not found".into(),
+                        expected_path: Some(model.display().to_string()),
+                    });
+                }
+                if !config.exists() {
+                    issues.push(AppConfigurationIssue {
+                        code: "PIPER_MODEL_CONFIG_MISSING".into(),
+                        message: "Piper model config not found".into(),
+                        expected_path: Some(config.display().to_string()),
+                    });
+                }
+            }
+            None => {
+                // No Piper executable in either layout. Report the canonical
+                // expectations (binary, model, config) as missing.
+                let piper_dir = self.tool_dir.join("piper");
+                for (asset, code, message) in [
+                    (
+                        "piper.exe",
+                        "PIPER_BINARY_MISSING",
+                        "Piper TTS binary not found",
+                    ),
+                    ("model.onnx", "PIPER_MODEL_MISSING", "Piper model not found"),
+                    (
+                        "model.onnx.json",
+                        "PIPER_MODEL_CONFIG_MISSING",
+                        "Piper model config not found",
+                    ),
+                ] {
+                    let path = piper_dir.join(asset);
+                    issues.push(AppConfigurationIssue {
+                        code: code.into(),
+                        message: message.into(),
+                        expected_path: Some(path.display().to_string()),
+                    });
+                }
+            }
+        }
 
         // Whisper binary: tools/whisper/Release/main.exe
         let whisper_path = self
@@ -389,25 +436,6 @@ impl AppPaths {
             ready: issues.is_empty(),
             issues,
         }
-    }
-}
-
-/// Push a single Piper-asset issue when neither the canonical nor the legacy
-/// path exists. `expected_path` reports the canonical location.
-fn check_piper_asset(
-    issues: &mut Vec<AppConfigurationIssue>,
-    canonical: std::path::PathBuf,
-    legacy: Option<std::path::PathBuf>,
-    code: &str,
-    message: &str,
-) {
-    let exists = canonical.exists() || legacy.map(|p| p.exists()).unwrap_or(false);
-    if !exists {
-        issues.push(AppConfigurationIssue {
-            code: code.into(),
-            message: message.into(),
-            expected_path: Some(canonical.display().to_string()),
-        });
     }
 }
 
@@ -820,8 +848,8 @@ mod tests {
                 .issues
                 .iter()
                 .find(|i| i.code == code)
-                .unwrap_or_else(|| panic!("missing issue code {} for {}", code, asset));            // Compare the final path component (asset may contain a subdir
-            // like "espeak-ng-data/phontab", and separators differ per OS).
+                .unwrap_or_else(|| panic!("missing issue code {} for {}", code, asset)); // Compare the final path component (asset may contain a subdir
+                                                                                         // like "espeak-ng-data/phontab", and separators differ per OS).
             let file_name = asset.rsplit('/').next().unwrap_or(asset);
             assert!(
                 issue
@@ -869,12 +897,8 @@ mod tests {
         }
     }
 
-    /// The legacy layout, when fully populated, is still valid (P2-3).
-    #[test]
-    fn validate_readiness_legacy_layout_fully_validated() {
-        let tmp = tempfile::tempdir().unwrap();
-        let tool = tmp.path().join("tools");
-
+    /// Build the complete legacy runtime tree used by the readiness tests.
+    fn create_legacy_runtime(tool: &std::path::Path) {
         fs::create_dir_all(tool.join("piper").join("piper").join("espeak-ng-data")).unwrap();
         for name in [
             "piper.exe",
@@ -904,6 +928,179 @@ mod tests {
         fs::write(tool.join("whisper").join("Release").join("main.exe"), b"").unwrap();
         fs::create_dir_all(tool.join("models")).unwrap();
         fs::write(tool.join("models").join("ggml-tiny.en.bin"), b"").unwrap();
+    }
+
+    /// P1-2: a mixed tree — canonical executable with only legacy DLLs — must
+    /// NOT report ready. Readiness resolves the canonical layout (selected by
+    /// the runtime resolver) and refuses to borrow companions from legacy.
+    #[test]
+    fn validate_readiness_rejects_canonical_exe_with_only_legacy_dlls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("tools");
+
+        // Canonical exe/model/config present, but NO canonical DLLs.
+        fs::create_dir_all(tool.join("piper").join("espeak-ng-data")).unwrap();
+        fs::write(tool.join("piper").join("piper.exe"), b"").unwrap();
+        fs::write(tool.join("piper").join("model.onnx"), b"").unwrap();
+        fs::write(tool.join("piper").join("model.onnx.json"), b"").unwrap();
+        fs::write(
+            tool.join("piper").join("espeak-ng-data").join("phontab"),
+            b"",
+        )
+        .unwrap();
+        // Only the LEGACY runtime directory has the DLLs.
+        fs::create_dir_all(tool.join("piper").join("piper")).unwrap();
+        for name in [
+            "espeak-ng.dll",
+            "piper_phonemize.dll",
+            "onnxruntime.dll",
+            "onnxruntime_providers_shared.dll",
+        ] {
+            fs::write(tool.join("piper").join("piper").join(name), b"").unwrap();
+        }
+        fs::create_dir_all(tool.join("whisper").join("Release")).unwrap();
+        fs::write(tool.join("whisper").join("Release").join("main.exe"), b"").unwrap();
+        fs::create_dir_all(tool.join("models")).unwrap();
+        fs::write(tool.join("models").join("ggml-tiny.en.bin"), b"").unwrap();
+
+        assert_eq!(
+            resolve_piper_layout(&tool),
+            Some(PiperLayout::Canonical),
+            "canonical exe selects the canonical layout"
+        );
+        let paths = AppPaths::from_tool_dir(tool, tmp.path().join("data")).unwrap();
+        let readiness = paths.validate_readiness();
+        assert!(
+            !readiness.ready,
+            "mixed canonical exe + legacy DLLs must not be ready"
+        );
+        for code in [
+            "PIPER_ESPEAK_DLL_MISSING",
+            "PIPER_PHONEMIZE_DLL_MISSING",
+            "PIPER_ONNX_RUNTIME_MISSING",
+            "PIPER_ONNX_PROVIDER_MISSING",
+        ] {
+            assert!(
+                readiness.issues.iter().any(|i| i.code == code),
+                "missing canonical companion issue {} must be reported",
+                code
+            );
+        }
+    }
+
+    /// P1-2: canonical model paired with only a legacy config is incoherent
+    /// and must NOT report ready.
+    #[test]
+    fn validate_readiness_rejects_canonical_model_with_only_legacy_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("tools");
+
+        // Canonical runtime WITHOUT the canonical config.
+        fs::create_dir_all(tool.join("piper").join("espeak-ng-data")).unwrap();
+        for name in [
+            "piper.exe",
+            "model.onnx",
+            "espeak-ng.dll",
+            "piper_phonemize.dll",
+            "onnxruntime.dll",
+            "onnxruntime_providers_shared.dll",
+        ] {
+            fs::write(tool.join("piper").join(name), b"").unwrap();
+        }
+        fs::write(
+            tool.join("piper").join("espeak-ng-data").join("phontab"),
+            b"",
+        )
+        .unwrap();
+        // Only the LEGACY model config exists.
+        fs::create_dir_all(tool.join("piper-models")).unwrap();
+        fs::write(
+            tool.join("piper-models").join("en_US-amy-medium.onnx.json"),
+            b"",
+        )
+        .unwrap();
+        fs::create_dir_all(tool.join("whisper").join("Release")).unwrap();
+        fs::write(tool.join("whisper").join("Release").join("main.exe"), b"").unwrap();
+        fs::create_dir_all(tool.join("models")).unwrap();
+        fs::write(tool.join("models").join("ggml-tiny.en.bin"), b"").unwrap();
+
+        let paths = AppPaths::from_tool_dir(tool, tmp.path().join("data")).unwrap();
+        let readiness = paths.validate_readiness();
+        assert!(
+            !readiness.ready,
+            "canonical model + legacy-only config must not be ready"
+        );
+        assert!(
+            readiness
+                .issues
+                .iter()
+                .any(|i| i.code == "PIPER_MODEL_CONFIG_MISSING"),
+            "missing canonical model config must be reported"
+        );
+    }
+
+    /// P1-2: when both layouts are valid, canonical remains selected, and the
+    /// layout resolver agrees with the runtime resolver.
+    #[test]
+    fn resolve_piper_layout_agrees_with_runtime_resolver() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("tools");
+
+        // Canonical only.
+        create_canonical_runtime(&tool);
+        assert_eq!(resolve_piper_layout(&tool), Some(PiperLayout::Canonical));
+        let resolved = resolve_tools(&tool);
+        assert_eq!(
+            resolved.piper_bin,
+            Some(tool.join("piper").join("piper.exe"))
+        );
+
+        // Both layouts valid -> canonical still selected.
+        create_legacy_runtime(&tool);
+        assert_eq!(
+            resolve_piper_layout(&tool),
+            Some(PiperLayout::Canonical),
+            "canonical must remain selected when both layouts are valid"
+        );
+        let resolved = resolve_tools(&tool);
+        assert_eq!(
+            resolved.piper_bin,
+            Some(tool.join("piper").join("piper.exe")),
+            "runtime resolver must agree: canonical exe selected"
+        );
+        assert_eq!(
+            resolved.piper_model,
+            Some(tool.join("piper").join("model.onnx"))
+        );
+
+        // Legacy only (no canonical exe) -> legacy selected.
+        let tmp2 = tempfile::tempdir().unwrap();
+        let tool2 = tmp2.path().join("tools");
+        create_legacy_runtime(&tool2);
+        assert_eq!(resolve_piper_layout(&tool2), Some(PiperLayout::Legacy));
+        let resolved = resolve_tools(&tool2);
+        assert_eq!(
+            resolved.piper_bin,
+            Some(tool2.join("piper").join("piper").join("piper.exe"))
+        );
+        assert_eq!(
+            resolved.piper_model,
+            Some(tool2.join("piper-models").join("en_US-amy-medium.onnx"))
+        );
+
+        // No exe anywhere -> no layout.
+        let tmp3 = tempfile::tempdir().unwrap();
+        let tool3 = tmp3.path().join("tools");
+        fs::create_dir_all(&tool3).unwrap();
+        assert_eq!(resolve_piper_layout(&tool3), None);
+    }
+
+    /// The legacy layout, when fully populated, is still valid (P2-3).
+    #[test]
+    fn validate_readiness_legacy_layout_fully_validated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("tools");
+        create_legacy_runtime(&tool);
 
         let paths = AppPaths::from_tool_dir(tool, tmp.path().join("data")).unwrap();
         let readiness = paths.validate_readiness();
