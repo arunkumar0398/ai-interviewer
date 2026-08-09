@@ -318,9 +318,17 @@ async fn transcribe_wav(
         }
     };
 
-    let status = wait_result.inspect_err(|_| {
-        let _ = std::fs::remove_file(&txt_path);
-    })?;
+    let status = match wait_result {
+        Ok(status) => status,
+        Err(e) => {
+            // Child state is uncertain after a wait error — terminate and
+            // reap explicitly before propagating (P2-2); kill_on_drop stays
+            // only as defense-in-depth.
+            terminate_child(&mut child).await;
+            let _ = std::fs::remove_file(&txt_path);
+            anyhow::bail!("Whisper wait error: {}", e);
+        }
+    };
     if !status.success() {
         // Non-zero exit — remove the partial transcript and surface stderr.
         let _ = std::fs::remove_file(&txt_path);

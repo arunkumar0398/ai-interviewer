@@ -224,10 +224,35 @@ async fn list_audio_devices() -> Result<Vec<String>, String> {
 
 #[tauri::command]
 async fn check_audio_devices(
+    state: State<'_, Arc<RecordingState>>,
     paths: State<'_, PathsState>,
 ) -> Result<interview::device_check::DeviceCheckResult, String> {
     let (tx, _rx) = mpsc::channel(32);
-    Ok(interview::device_check::run_device_check(paths.paths.temp_dir.clone(), tx).await)
+
+    // P2-1: route the device-test microphone capture through the SAME
+    // exclusive capture-ownership mechanism as interview recording. A device
+    // check cannot overlap an interview round (or another device check); the
+    // slot is released deterministically on success, error, and timeout.
+    let handle = audio::capture::RecordingHandle {
+        stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    acquire_recording(&state, handle).await?;
+
+    // Safety net for panic/cancellation: clears the slot on drop if not
+    // explicitly cleared below.
+    let recording_guard = RecordingGuard {
+        state: state.inner().clone(),
+        armed: std::sync::atomic::AtomicBool::new(true),
+    };
+
+    let result = interview::device_check::run_device_check(paths.paths.temp_dir.clone(), tx).await;
+
+    // Release the slot on every outcome (success, error, timeout) and disarm
+    // the safety net.
+    clear_active_recording(&state).await;
+    recording_guard.disarm();
+
+    Ok(result)
 }
 
 /// Result of a single interview round
@@ -264,10 +289,29 @@ fn preflight_round(
         return Err(format!("Invalid round index {}", round_index));
     }
 
+    // P2-4: validate that persisted round history is contiguous from zero
+    // BEFORE deriving the next expected round. Count-based logic alone could
+    // accept a duplicate/out-of-order round after malformed stored indexes
+    // (e.g. [0, 2] would make len()==2 look like the next expected round is
+    // 2, silently skipping index 1).
     let existing = db
         .get_rounds(session_id_str)
         .map_err(|e| format!("Failed to load session rounds: {}", e))?;
+    for (expected, round) in existing.iter().enumerate() {
+        if round.round_index != expected as i32 {
+            return Err("Session round history is inconsistent".to_string());
+        }
+    }
     let next_expected = existing.len() as i32;
+
+    // A request beyond the fixed question count can never be valid.
+    if round_index >= EXPECTED_ROUNDS {
+        return Err(format!(
+            "Round {} is beyond the expected {} rounds",
+            round_index + 1,
+            EXPECTED_ROUNDS
+        ));
+    }
     if round_index < next_expected {
         return Err(format!(
             "Round {} already exists for this session",
@@ -438,12 +482,11 @@ async fn run_interview_round(
                 Err(join_err) => Err(format!("Interview worker failed: {}", join_err)),
             };
 
-            // Worker has fully terminated — release the recording slot
-            // deterministically and disarm the safety net.
-            clear_active_recording(&state).await;
-            recording_guard.disarm();
-
-            match result {
+            // RecordingState is held until persistence FULLY finishes (P1-1):
+            // a concurrent request for the same logical round cannot acquire
+            // the slot and start TTS/audio work while this request is between
+            // worker completion and DB COMMIT.
+            let round_result = match result {
                 Ok((metadata, transcription, mut evidence)) => {
                     // Persist round atomically: round INSERT + session
                     // total_rounds increment + completed_at (when final) commit
@@ -514,8 +557,17 @@ async fn run_interview_round(
                         }
                     }
                 }
-                Err(e) => Err(e.to_string()),
-            }
+                Err(e) => Err(e),
+            };
+
+            // Persistence has fully finished (COMMIT or failure) — only NOW
+            // release the recording slot deterministically and disarm the
+            // safety net. Every controlled path (success or error) clears the
+            // slot exactly once.
+            clear_active_recording(&state).await;
+            recording_guard.disarm();
+
+            round_result
         }
         Err(_) => {
             // Deadline hit — signal cooperative cancellation via stop_flag.
@@ -789,6 +841,45 @@ mod tests {
         assert!(result.unwrap_err().contains("already active"));
     }
 
+    /// P1-1: the recording slot stays held across the persistence window. A
+    /// concurrent request for the same logical round (Request B) cannot
+    /// acquire the slot and start TTS/audio work while Request A is between
+    /// worker completion and DB COMMIT. The slot is released exactly once,
+    /// only after persistence finishes.
+    #[tokio::test]
+    async fn recording_slot_held_through_persistence_window() {
+        let state = Arc::new(RecordingState {
+            handle: Mutex::new(None),
+        });
+        let handle = fake_handle();
+        acquire_recording(&state, handle.clone()).await.unwrap();
+        let guard = RecordingGuard {
+            state: state.clone(),
+            armed: std::sync::atomic::AtomicBool::new(true),
+        };
+
+        // Request A's worker has completed but its DB transaction has NOT
+        // committed yet (persistence window open — slot still held).
+        let state_b = state.clone();
+        let request_b =
+            tokio::spawn(async move { acquire_recording(&state_b, fake_handle()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let result_b = request_b.await.unwrap();
+        assert!(
+            result_b.is_err(),
+            "Request B must not acquire the slot during A's persistence window"
+        );
+        assert!(result_b.unwrap_err().contains("already active"));
+
+        // Persistence COMMITs -> slot cleared exactly once -> B can retry.
+        clear_active_recording(&state).await;
+        guard.disarm();
+        drop(guard);
+
+        acquire_recording(&state, fake_handle()).await.unwrap();
+        assert!(state.handle.lock().await.is_some());
+    }
+
     // ------------------------------------------------------------------
     // P1-2: Backend-authoritative session lifecycle and round order
     // ------------------------------------------------------------------
@@ -880,6 +971,49 @@ mod tests {
         assert!(
             err.contains("already exists"),
             "expected duplicate error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn preflight_accepts_next_expected_after_contiguous_history() {
+        let (_dir, db) = temp_db();
+        db.create_session("s1", "Test").unwrap();
+        insert_round(&db, "s1", 0, false);
+        insert_round(&db, "s1", 1, false);
+        // [0, 1] -> the next expected logical round is 2.
+        let is_final = preflight_round(&db, "s1", 2).unwrap();
+        assert!(!is_final);
+    }
+
+    #[test]
+    fn preflight_rejects_gapped_stored_history() {
+        let (_dir, db) = temp_db();
+        db.create_session("s1", "Test").unwrap();
+        insert_round(&db, "s1", 0, false);
+        insert_round(&db, "s1", 2, false); // index 1 missing — malformed history
+        let err = preflight_round(&db, "s1", 3).unwrap_err();
+        assert!(
+            err.contains("inconsistent"),
+            "gapped history must be rejected before audio, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_round_beyond_expected_count() {
+        let (_dir, db) = temp_db();
+        db.create_session("s1", "Test").unwrap();
+        // Rounds 0..EXPECTED_ROUNDS-2 committed; next expected is the final
+        // round (EXPECTED_ROUNDS-1). Requesting EXPECTED_ROUNDS (one past the
+        // last) must be rejected.
+        for index in 0..EXPECTED_ROUNDS - 1 {
+            insert_round(&db, "s1", index, false);
+        }
+        let err = preflight_round(&db, "s1", EXPECTED_ROUNDS).unwrap_err();
+        assert!(
+            err.contains("beyond the expected"),
+            "round beyond EXPECTED_ROUNDS must be rejected, got: {}",
             err
         );
     }

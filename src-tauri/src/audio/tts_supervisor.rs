@@ -1,5 +1,5 @@
 use crate::audio::pipe::{terminate_child, StderrDrain};
-use crate::audio::playback::await_playback;
+use crate::audio::playback::{await_playback, PLAYBACK_TIMEOUT_SECS};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -242,6 +242,10 @@ impl PiperSupervisor {
                     continue 'restart;
                 }
                 Ok(Err(e)) => {
+                    // Child state is uncertain after a wait error — terminate
+                    // and reap explicitly before propagating (P2-2);
+                    // kill_on_drop stays only as defense-in-depth.
+                    terminate_child(&mut child).await;
                     let stderr_text = match &stderr_drain {
                         Some(d) => d.text().await,
                         None => String::new(),
@@ -307,10 +311,16 @@ async fn play_raw_pcm_async(
 
         let samples_arc = Arc::new(samples);
         let samples_clone = samples_arc.clone();
-        let mut pos = 0usize;
+
+        // Actual playback progress, shared between the output callback and the
+        // completion wait (P2-3): success requires the callback to consume
+        // EVERY sample. Elapsed expected duration alone is never proof of
+        // successful playback.
+        let position = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pos_clone = position.clone();
 
         // Latch for asynchronous output-stream errors. The error callback
-        // writes here; `await_playback` observes it so a device failure after
+        // writes here; the playback loop observes it so a device failure after
         // stream.play() succeeds still fails TTS (P1-5). `TtsEvent::Finished`
         // is therefore never emitted after a failed playback.
         let playback_err: Arc<std::sync::Mutex<Option<String>>> =
@@ -319,14 +329,16 @@ async fn play_raw_pcm_async(
         let stream = device.build_output_stream(
             &config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                for sample in data.iter_mut() {
-                    if pos < samples_clone.len() {
-                        *sample = samples_clone[pos] as f32 / 32768.0;
-                        pos += 1;
+                let start = pos_clone.load(std::sync::atomic::Ordering::Relaxed);
+                for (i, sample) in data.iter_mut().enumerate() {
+                    let idx = start + i;
+                    *sample = if idx < samples_clone.len() {
+                        samples_clone[idx] as f32 / 32768.0
                     } else {
-                        *sample = 0.0;
-                    }
+                        0.0 // silence after end
+                    };
                 }
+                pos_clone.fetch_add(data.len(), std::sync::atomic::Ordering::Relaxed);
             },
             move |err| {
                 eprintln!("Output stream error: {}", err);
@@ -342,14 +354,20 @@ async fn play_raw_pcm_async(
 
         stream.play()?;
 
-        // Wait for playback to finish or stop, surfacing async device errors
-        // as authoritative failures.
-        let total_duration_ms =
-            (samples_arc.len() as f64 / sample_rate as f64 * 1000.0) as u64 + 200;
+        // Wait for ACTUAL sample progress to complete, surfacing async device
+        // errors as authoritative failures. The absolute deadline bounds a
+        // stalled output device (no progress -> Err, never success).
+        let total_samples = samples_arc.len();
         let deadline =
-            std::time::Instant::now() + std::time::Duration::from_millis(total_duration_ms);
+            std::time::Instant::now() + std::time::Duration::from_secs(PLAYBACK_TIMEOUT_SECS);
 
-        await_playback(&playback_err, Some(&stop_flag_clone), deadline)?;
+        await_playback(
+            &playback_err,
+            Some(&stop_flag_clone),
+            deadline,
+            &position,
+            total_samples,
+        )?;
 
         drop(stream);
         Ok(())

@@ -174,8 +174,18 @@ export default function InterviewPage() {
     return () => { cancelled = true; };
   }, []);
 
+  // P2-1: in-flight guard — a rapid double-click must not start a second
+  // device check. The backend also rejects overlap via the shared recording
+  // slot, but the UI should not even attempt it. The ref is synchronous (no
+  // stale-closure window); the state disables the button visually.
+  const deviceCheckRunning = useRef(false);
+  const [deviceCheckBusy, setDeviceCheckBusy] = useState(false);
+
   // Run device check
   const handleDeviceCheck = useCallback(async () => {
+    if (deviceCheckRunning.current) return;
+    deviceCheckRunning.current = true;
+    setDeviceCheckBusy(true);
     setPhase("device-check");
     try {
       const result = await invoke<DeviceCheckResult>("check_audio_devices");
@@ -198,6 +208,9 @@ export default function InterviewPage() {
       setPhase("error");
       setError(String(e));
       setRetryTarget({ kind: "device-check" });
+    } finally {
+      deviceCheckRunning.current = false;
+      setDeviceCheckBusy(false);
     }
   }, []);
 
@@ -416,9 +429,10 @@ export default function InterviewPage() {
             ) : (
               <button
                 onClick={handleDeviceCheck}
-                className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700"
+                disabled={deviceCheckBusy}
+                className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
               >
-                Check Devices
+                {deviceCheckBusy ? "Checking…" : "Check Devices"}
               </button>
             )}
           </div>

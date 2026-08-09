@@ -12,12 +12,15 @@ fn make_test_paths() -> AppPaths {
 }
 
 // ---------------------------------------------------------------------------
-// Command contract tests: verify return types and error paths for all
-// Tauri commands without spinning up a full Tauri app.
+// Helper-behavior tests. These validate the path/db helpers the Tauri
+// commands call, NOT the Tauri IPC boundary itself (which would require a
+// running app instance). Command-boundary input/UUID validation is covered
+// by the preflight unit tests in lib.rs and the frontend invoke-mock suite
+// in tests/interview.test.tsx.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn contract_session_recordings_dir_returns_path() {
+fn paths_helper_session_recordings_dir_isolates_session_id() {
     let paths = make_test_paths();
     let session_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
     let result = paths.session_recordings_dir(session_id);
@@ -27,7 +30,7 @@ fn contract_session_recordings_dir_returns_path() {
 }
 
 #[test]
-fn contract_round_audio_path_returns_path() {
+fn paths_helper_round_audio_path_contains_session_and_round_ids() {
     let paths = make_test_paths();
     let session_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
     let round_id = Uuid::parse_str("660e8400-e29b-41d4-a716-446655440001").unwrap();
@@ -38,7 +41,7 @@ fn contract_round_audio_path_returns_path() {
 }
 
 #[test]
-fn contract_play_round_audio_rejects_nonexistent_file() {
+fn paths_helper_round_audio_path_is_nonexistent_before_recording() {
     let paths = make_test_paths();
     let session_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
     let round_id = Uuid::parse_str("660e8400-e29b-41d4-a716-446655440001").unwrap();
@@ -47,7 +50,7 @@ fn contract_play_round_audio_rejects_nonexistent_file() {
 }
 
 #[test]
-fn contract_generate_tts_rejects_empty_text() {
+fn paths_helper_tts_output_path_does_not_preexist() {
     let _paths = make_test_paths();
     let tts_dir = _paths.tts_dir.clone();
     std::fs::create_dir_all(&tts_dir).unwrap();
@@ -56,13 +59,13 @@ fn contract_generate_tts_rejects_empty_text() {
 }
 
 #[test]
-fn contract_get_tools_dir_returns_tool_path() {
+fn paths_helper_tool_dir_resolves() {
     let paths = make_test_paths();
     assert!(paths.tool_dir.exists() || !paths.tool_dir.to_string_lossy().is_empty());
 }
 
 #[test]
-fn contract_get_sessions_returns_empty_vec() {
+fn db_helper_get_sessions_empty_on_fresh_db() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("test.db");
     let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
@@ -71,7 +74,7 @@ fn contract_get_sessions_returns_empty_vec() {
 }
 
 #[test]
-fn contract_get_rounds_returns_empty_vec() {
+fn db_helper_get_rounds_empty_on_fresh_db() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("test.db");
     let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
@@ -82,7 +85,7 @@ fn contract_get_rounds_returns_empty_vec() {
 }
 
 #[test]
-fn contract_to_app_config_has_required_fields() {
+fn paths_helper_app_config_has_required_fields() {
     let paths = make_test_paths();
     let config = paths.to_app_config();
     assert!(!config.tool_dir.is_empty());
@@ -92,7 +95,7 @@ fn contract_to_app_config_has_required_fields() {
 }
 
 #[test]
-fn contract_validate_readiness_reports_tool_presence() {
+fn paths_helper_validate_readiness_reports_missing_tools() {
     let paths = make_test_paths();
     let readiness = paths.validate_readiness();
     assert!(!readiness.ready);
@@ -100,7 +103,7 @@ fn contract_validate_readiness_reports_tool_presence() {
 }
 
 #[test]
-fn contract_path_resolution_portable_exe_dir_subdir() {
+fn paths_helper_resolution_prefers_exe_dir_and_app_data_dir() {
     let tmp = tempdir().unwrap();
     let exe_dir = tmp.path().join("app");
     let app_data_dir = tmp.path().join("data");
@@ -119,18 +122,18 @@ fn contract_path_resolution_portable_exe_dir_subdir() {
 }
 
 #[test]
-fn contract_database_rejects_empty_candidate_name() {
+fn db_helper_accepts_empty_candidate_name_at_db_layer() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("test.db");
     let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
-    // Database itself allows empty names; validation is at the Tauri command layer.
-    // So this is not an error — we just verify the operation completes.
+    // The DB layer itself allows empty names; empty-name validation is a
+    // frontend/command concern, so this asserts the DB operation completes.
     let result = db.create_session("550e8400-e29b-41d4-a716-446655440000", "");
     assert!(result.is_ok());
 }
 
 #[test]
-fn contract_database_rejects_duplicate_session_id() {
+fn db_helper_rejects_duplicate_session_id() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("test.db");
     let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
@@ -141,11 +144,11 @@ fn contract_database_rejects_duplicate_session_id() {
 }
 
 #[test]
-fn contract_database_complete_nonexistent_session() {
+fn db_helper_complete_session_rejects_missing_session() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("test.db");
     let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
-    // complete_session now returns an error when the session does not exist.
+    // complete_session returns an error when the session does not exist.
     let result = db.complete_session("550e8400-e29b-41d4-a716-446655440000", 5);
     assert!(result.is_err());
 }

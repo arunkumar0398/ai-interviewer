@@ -69,6 +69,21 @@ impl SampleQueue {
     }
 }
 
+/// P1-2 overflow policy: any dropped production audio chunk fails the
+/// recording. Returns the user-facing error message when `dropped > 0` and
+/// None when nothing was lost. A WAV missing part of the candidate's answer
+/// must never be transcribed or persisted as valid evidence.
+fn overflow_error(dropped: u64) -> Option<String> {
+    if dropped > 0 {
+        Some(format!(
+            "Audio capture lost {} chunk(s); recording discarded. Please retry the round.",
+            dropped
+        ))
+    } else {
+        None
+    }
+}
+
 /// Thread-safe latch for asynchronous capture errors. Written from the
 /// real-time error callback; observed by the recording loop so a device
 /// failure becomes an AUTHORITATIVE operation failure instead of a silent
@@ -237,13 +252,20 @@ pub async fn record_to_wav(
         }
 
         drop(stream);
-        // Overflow is observable/loggable — the loss is counted, never hidden.
         let dropped = overflow_watch.load(Ordering::Relaxed);
-        if dropped > 0 {
-            eprintln!(
-                "[capture] recording finished with {} dropped chunk(s) (sample queue full)",
-                dropped
-            );
+        if let Some(msg) = overflow_error(dropped) {
+            // P1-2: any dropped production audio chunk fails the round. Drop
+            // the writer first so the file handles are released, then remove
+            // the partial temp file and any provisional final WAV, surface a
+            // CaptureEvent::Error, and return Err — never a successful
+            // RecordResult, so no Whisper and no DB persistence can follow.
+            drop(writer);
+            let _ = std::fs::remove_file(&temp_path);
+            let _ = std::fs::remove_file(&output_path);
+            let _ = event_tx.try_send(CaptureEvent::Error {
+                message: msg.clone(),
+            });
+            anyhow::bail!("{}", msg);
         }
         writer.finalize()?;
 
@@ -307,7 +329,9 @@ pub async fn record_test_clip(
     temp_dir: PathBuf,
     event_tx: mpsc::Sender<CaptureEvent>,
 ) -> anyhow::Result<PathBuf> {
-    let tmp_path = temp_dir.join(format!("device_test_{}.wav", std::process::id()));
+    // P2-1: UUID-based name so concurrent device checks can never target the
+    // same path (a PID alone is not unique across concurrent checks).
+    let tmp_path = temp_dir.join(format!("device_test_{}.wav", uuid::Uuid::new_v4()));
     let path_clone = tmp_path.clone();
 
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
@@ -469,6 +493,29 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("Error"));
         assert!(json.contains("test error"));
+    }
+
+    /// P1-2: the overflow policy fails production capture on ANY dropped
+    /// chunk — incomplete evidence can never be marked successful.
+    #[test]
+    fn overflow_policy_fails_recording_on_any_dropped_chunk() {
+        assert!(overflow_error(0).is_none(), "no loss must not fail");
+        let msg = overflow_error(2).unwrap();
+        assert!(
+            msg.contains("lost 2 chunk(s)"),
+            "must report the dropped count, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("recording discarded"),
+            "must clearly discard the recording, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("Please retry the round"),
+            "must tell the user to retry, got: {}",
+            msg
+        );
     }
 
     /// A full sample queue never blocks the producer: the chunk is dropped and

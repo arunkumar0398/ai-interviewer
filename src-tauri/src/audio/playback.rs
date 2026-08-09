@@ -10,7 +10,9 @@ use tokio::sync::mpsc;
 const PIPER_SAMPLE_RATE: u32 = 22050;
 
 /// Maximum time allowed for a single playback operation before it is cancelled.
-const PLAYBACK_TIMEOUT_SECS: u64 = 120;
+/// Shared with the Piper supervisor's raw-PCM playback, which uses the same
+/// absolute bound for a stalled output device.
+pub(crate) const PLAYBACK_TIMEOUT_SECS: u64 = 120;
 
 /// Process-level timeout for standalone TTS generation. The child process owner
 /// enforces this directly — any outer timeout is only defense-in-depth.
@@ -28,24 +30,30 @@ pub enum PlaybackEvent {
     Error { message: String },
 }
 
-/// Wait for playback to finish, be cancelled, or fail. The output-stream error
-/// callback latches the first device error into `playback_err`; observing it
-/// here makes asynchronous playback failures AUTHORITATIVE — the function
-/// returns Err, and callers must never emit Finished/Completed after an error.
-/// Elapsed playback duration alone is NOT treated as proof of success.
-/// Returns Ok when the wall-clock deadline passes (playback finished) or the
-/// stop flag is set (cancelled).
+/// Wait for playback to finish, be cancelled, or fail. Completion is based on
+/// ACTUAL sample progress (P2-3): success only once the output callback has
+/// consumed `total_samples` samples. Elapsed expected duration alone is NOT
+/// proof of successful playback — a stalled output device (no progress) or a
+/// latched output-stream error fails the operation.
+/// Returns Ok on completion or controlled cancellation (stop flag); Err on a
+/// latched output error or when the absolute `deadline` passes without
+/// progress.
 pub fn await_playback(
     playback_err: &std::sync::Mutex<Option<String>>,
     stop_flag: Option<&AtomicBool>,
     deadline: std::time::Instant,
+    position: &std::sync::atomic::AtomicUsize,
+    total_samples: usize,
 ) -> anyhow::Result<()> {
     loop {
         if let Some(msg) = playback_err.lock().map(|g| g.clone()).unwrap_or_default() {
             anyhow::bail!("{}", msg);
         }
-        if std::time::Instant::now() >= deadline {
+        if position.load(Ordering::Relaxed) >= total_samples {
             return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("Playback timed out — output device did not make progress");
         }
         if let Some(flag) = stop_flag {
             if flag.load(Ordering::SeqCst) {
@@ -290,6 +298,10 @@ pub async fn generate_tts(
             }
         }
         Ok(Err(e)) => {
+            // Child state is uncertain after a wait error — terminate and
+            // reap explicitly before propagating (P2-2); kill_on_drop stays
+            // only as defense-in-depth.
+            crate::audio::pipe::terminate_child(&mut child).await;
             let _ = std::fs::remove_file(&output_path);
             anyhow::bail!("TTS process wait error: {}", e);
         }
@@ -370,9 +382,10 @@ mod tests {
         let err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
         *err.lock().unwrap() = Some("Output stream error: simulated device failure".to_string());
         let stop = Arc::new(AtomicBool::new(false));
+        let position = std::sync::atomic::AtomicUsize::new(0);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
 
-        let result = await_playback(&err, Some(&stop), deadline);
+        let result = await_playback(&err, Some(&stop), deadline, &position, 1000);
         assert!(result.is_err(), "latched output error must fail playback");
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -382,25 +395,47 @@ mod tests {
         );
     }
 
-    /// P1-5: without an error, playback runs until the deadline and returns Ok.
+    /// P2-3: playback completes successfully only when the output callback has
+    /// consumed every sample — actual sample progress, not elapsed duration.
     #[test]
-    fn await_playback_returns_ok_until_deadline() {
+    fn await_playback_succeeds_once_position_reaches_total() {
         let err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
         let stop = Arc::new(AtomicBool::new(false));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(30);
+        let position = std::sync::atomic::AtomicUsize::new(44100); // fully consumed
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
 
-        let result = await_playback(&err, Some(&stop), deadline);
-        assert!(result.is_ok());
+        let result = await_playback(&err, Some(&stop), deadline, &position, 44100);
+        assert!(result.is_ok(), "position >= total must be success");
     }
 
-    /// P1-5: cancellation (stop flag) still returns Ok without an error.
+    /// P2-3: a stalled output device (no sample progress) until the absolute
+    /// deadline is an error, never a success.
+    #[test]
+    fn await_playback_errors_when_position_stalls_until_deadline() {
+        let err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        let stop = Arc::new(AtomicBool::new(false));
+        let position = std::sync::atomic::AtomicUsize::new(0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+
+        let result = await_playback(&err, Some(&stop), deadline, &position, 44100);
+        assert!(result.is_err(), "stalled playback must time out");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("timed out"),
+            "timeout error must be explicit, got: {}",
+            msg
+        );
+    }
+
+    /// P1-5: cancellation (stop flag) returns Ok without an error.
     #[test]
     fn await_playback_returns_ok_on_stop() {
         let err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
         let stop = Arc::new(AtomicBool::new(true));
+        let position = std::sync::atomic::AtomicUsize::new(0);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
 
-        let result = await_playback(&err, Some(&stop), deadline);
+        let result = await_playback(&err, Some(&stop), deadline, &position, 1000);
         assert!(result.is_ok());
     }
 }
