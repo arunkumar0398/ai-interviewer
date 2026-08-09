@@ -201,18 +201,23 @@ pub async fn run_interview_round(
         }
     };
 
+    // RC-1: the outer provisional evidence guard is armed immediately after
+    // capture SUCCEEDS — BEFORE any post-capture cancellation check. When
+    // the user clicks Stop Round during recording, the capture exits
+    // normally (auto-stop observed the main stop flag) and renamed its temp
+    // to the final WAV; without the guard the round would return stopped
+    // while leaving an orphan final WAV with no DB round. The guard owns
+    // only THIS invocation's newly-created file (record_to_wav rejected any
+    // pre-existing final, so the path cannot have pre-existed), so dropping
+    // it on the stop/checksum/transcription/DB failure paths removes only
+    // this invocation's evidence. It must NOT be armed before
+    // record_to_wav() — that would let a rejected collision delete a
+    // pre-existing committed WAV on unwind.
+    let provisional = UnpersistedAudio::new(record_result.file_path.clone());
+
     if stop_flag.load(Ordering::SeqCst) {
         anyhow::bail!("Interview stopped during recording");
     }
-
-    // RC-1: the evidence guard is created ONLY after capture succeeded — the
-    // WAV at `wav_path` was created by THIS invocation (record_to_wav
-    // rejected any pre-existing final, and its PartialWavGuard cleaned up
-    // every failed path). Arming the guard earlier would let a rejected
-    // collision (existing committed WAV + reused round_id) delete the
-    // pre-existing evidence on unwind. From here on, any pre-commit failure
-    // (checksum, transcription, stop) deletes only THIS invocation's WAV.
-    let provisional = UnpersistedAudio::new(wav_path.clone());
 
     // Phase 4: Compute audio metadata and checksum from RecordResult
     let sha256 = sha256_file(&record_result.file_path)?;
@@ -406,6 +411,41 @@ mod tests {
         }
 
         assert!(wav.exists(), "committed WAV must be retained");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RC-1 stop-round evidence lifecycle (Test A): a capture that SUCCEEDS
+    /// (the temp was finalized and renamed to the final WAV) followed by a
+    /// post-capture stop must NOT leave an orphan final WAV. The orchestrator
+    /// arms the outer evidence guard immediately after capture success and
+    /// BEFORE the stop check, so a stopped round drops the armed guard,
+    /// which removes only the newly-created WAV. This mirrors the
+    /// orchestrator ordering exactly.
+    #[test]
+    fn stopped_round_removes_newly_created_final_wav() {
+        let dir = std::env::temp_dir().join("unpersisted_audio_stop_round_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let wav = dir.join("round.wav");
+        // Capture succeeded: the temp was renamed to the final WAV.
+        std::fs::write(&wav, b"recorded-audio").unwrap();
+
+        // The orchestrator arms the evidence guard immediately after capture
+        // success, BEFORE the post-capture stop check (RC-1).
+        let provisional = UnpersistedAudio::new(wav.clone());
+        // Post-capture stop -> bail -> guard drops -> WAV removed.
+        drop(provisional);
+
+        assert!(
+            !wav.exists(),
+            "stopped round must not leave an orphan final WAV"
+        );
+        assert!(
+            !wav.with_extension("wav.tmp").exists(),
+            "no stale temp may remain after a stopped round"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

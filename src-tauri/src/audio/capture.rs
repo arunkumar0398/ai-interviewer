@@ -594,12 +594,12 @@ pub fn production_stream_supported(mut ranges: impl Iterator<Item = (u16, u32, u
     })
 }
 
-/// RC-4/RC-5: prove the PRODUCTION Piper playback path actually works on the
-/// default output device. Production playback (`PiperSupervisor::speak`)
-/// builds `default_output_device()` with a mono, 22050 Hz stream and plays
-/// it — Device Check must validate that exact path, not merely that SOME
-/// output device exists. Three steps, all inside ONE internally-bounded
-/// blocking probe:
+/// RC-4/RC-5/RC-2/RC-3: prove the PRODUCTION Piper playback path actually
+/// works on the default output device. Production playback
+/// (`PiperSupervisor::speak`) builds `default_output_device()` with a mono,
+/// 22050 Hz stream and plays it — Device Check must validate that exact
+/// path, not merely that SOME output device exists. Three steps, all inside
+/// ONE blocking probe tracked by `completion`:
 ///   1. fast range check — supported configs must cover mono 22050 Hz;
 ///   2. build the EXACT production `StreamConfig`;
 ///   3. `stream.play()` and observe real output-callback progress (a tiny
@@ -607,17 +607,34 @@ pub fn production_stream_supported(mut ranges: impl Iterator<Item = (u16, u32, u
 ///      delivers samples; a stalled device or an async output error fails
 ///      readiness.
 ///
-/// Lifecycle ownership (RC-5): the probe is a SINGLE `spawn_blocking`
-/// closure that is internally bounded (2s progress deadline) and drops its
-/// stream on EVERY exit path, so the caller's direct await can never
-/// silently detach a still-running probe or leave an orphan output stream.
-/// The wait reuses the production `await_playback` loop (same sample-
-/// progress semantics as real question playback).
-pub async fn validate_production_playback_stream() -> anyhow::Result<String> {
-    // Directly awaited — no external timeout wrapper, so the probe is never
-    // detached while still running; the closure itself is bounded.
-    tokio::task::spawn_blocking(|| {
+/// Lifecycle ownership (RC-2): `completion` is the OUTPUT-probe lifecycle
+/// signal — `mark_scheduled()` runs BEFORE `spawn_blocking` (no await in
+/// between) and the closure signals Finished on EVERY exit, so the owning
+/// recording slot stays occupied until the real output stream has actually
+/// ended, even if the outer async device-check worker is aborted.
+///
+/// Wall-clock contract (RC-3): the CALLBACK-PROGRESS wait is bounded by a
+/// 2s deadline, but the native driver calls that precede it
+/// (`default_output_device()`, `name()`, `supported_output_configs()`,
+/// `build_output_stream()`, `play()`) are NOT independently bounded — a
+/// hung native audio call cannot be force-cancelled. If that happens, the
+/// probe's completion keeps the audio-probe lease (recording slot) occupied
+/// until the native worker actually exits; the slot is never released while
+/// the output probe may still be alive.
+pub async fn validate_production_playback_stream(
+    completion: CaptureCompletion,
+) -> anyhow::Result<String> {
+    // RC-2: mark Scheduled BEFORE spawn_blocking (no await between) so a
+    // queued-but-not-started probe still owns the slot.
+    completion.mark_scheduled();
+
+    tokio::task::spawn_blocking(move || {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+        // Signal Finished on EVERY exit path (success, ?, bail, panic) —
+        // the slot owner waits on this before releasing the slot.
+        let _lifecycle = BlockingCaptureLifecycle(completion.clone());
+
         let host = cpal::default_host();
         let device = host
             .default_output_device()

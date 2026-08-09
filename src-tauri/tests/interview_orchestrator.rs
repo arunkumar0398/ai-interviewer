@@ -113,6 +113,7 @@ async fn device_check_handles_no_devices() {
         tx,
         stop_flag,
         ai_interviewer_lib::audio::capture::CaptureCompletion::new(),
+        ai_interviewer_lib::audio::capture::CaptureCompletion::new(),
     )
     .await;
 

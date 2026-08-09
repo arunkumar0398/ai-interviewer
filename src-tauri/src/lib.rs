@@ -47,22 +47,32 @@ async fn clear_active_recording(state: &RecordingState) {
 }
 
 /// Owner of the recording-slot lease, the worker's stop flag, the worker's
-/// JoinHandle (P2-1), AND the physical capture lifecycle signal (P1-1). Every
-/// controlled path clears RecordingState explicitly (after the worker has
-/// fully terminated) and disarms the guard, so the slot is freed
-/// deterministically. If the guard is dropped while still armed — an
-/// unexpected drop or panic of the outer command — Drop sets the stop flag,
-/// waits for the REAL blocking capture to terminate (bounded cooperative
-/// grace, then force-abort of the outer wrapper, then waiting out the
-/// blocking worker), and ONLY THEN clears the slot. A bare JoinHandle drop
-/// would detach the task and let the slot be cleared while the worker is
-/// still alive; aborting the outer wrapper alone does not prove the nested
-/// `spawn_blocking` capture has stopped — the slot is never freed while the
-/// physical capture may still be alive.
+/// JoinHandle (P2-1), AND the physical worker lifecycle signals (P1-1 +
+/// RC-2): one for the microphone capture (input probe) and one for the
+/// speaker probe (output probe). Every controlled path clears
+/// RecordingState explicitly (after the worker has fully terminated) and
+/// disarms the guard, so the slot is freed deterministically. If the guard
+/// is dropped while still armed — an unexpected drop or panic of the outer
+/// command — Drop sets the stop flag, waits for EVERY scheduled REAL
+/// blocking worker to terminate (bounded cooperative grace, then
+/// force-abort of the outer wrapper, then waiting out the blocking
+/// workers), and ONLY THEN clears the slot. A bare JoinHandle drop would
+/// detach the task and let the slot be cleared while a worker is still
+/// alive; aborting the outer wrapper alone does not prove the nested
+/// `spawn_blocking` closures have stopped — the slot is never freed while
+/// any physical input/output worker owned by the operation may still be
+/// alive.
 struct RecordingGuard<T: Send + 'static> {
     state: Arc<RecordingState>,
     stop: Arc<std::sync::atomic::AtomicBool>,
+    /// Physical MICROPHONE-capture lifecycle signal (input probe).
     completion: audio::capture::CaptureCompletion,
+    /// Physical SPEAKER-probe lifecycle signal (output probe, RC-2). The
+    /// device check also starts a real output stream; if the owning command
+    /// is cancelled while that probe is inside spawn_blocking, the blocking
+    /// output task can outlive the outer worker — so the slot must stay
+    /// occupied until BOTH completions are resolved.
+    output_completion: audio::capture::CaptureCompletion,
     worker: Option<tokio::task::JoinHandle<T>>,
     armed: std::sync::atomic::AtomicBool,
     /// Drop-safety-net cooperative grace. Tests shrink this to exercise the
@@ -76,6 +86,7 @@ impl<T: Send + 'static> RecordingGuard<T> {
             state,
             stop,
             completion: audio::capture::CaptureCompletion::new(),
+            output_completion: audio::capture::CaptureCompletion::new(),
             worker: None,
             armed: std::sync::atomic::AtomicBool::new(true),
             drop_grace: std::time::Duration::from_secs(RECORDING_DROP_GRACE_SECS),
@@ -86,6 +97,13 @@ impl<T: Send + 'static> RecordingGuard<T> {
     /// so `record_to_wav` / `record_test_clip` can report termination.
     fn completion(&self) -> audio::capture::CaptureCompletion {
         self.completion.clone()
+    }
+
+    /// Clone of the SPEAKER-probe lifecycle signal (RC-2), handed to the
+    /// device-check worker so `validate_production_playback_stream` can
+    /// report termination of its real output stream.
+    fn output_completion(&self) -> audio::capture::CaptureCompletion {
+        self.output_completion.clone()
     }
 
     /// Give the guard ownership of the spawned worker so a dropped command
@@ -153,69 +171,92 @@ impl<T: Send + 'static> Drop for RecordingGuard<T> {
             let worker = self.worker.take();
             let state = self.state.clone();
             let completion = self.completion.clone();
+            let output_completion = self.output_completion.clone();
             let grace = self.drop_grace;
             // Spawn on the runtime; this runs even on panic. The slot is
-            // cleared ONLY after the worker's lifecycle is resolved AND the
-            // real physical capture (if one was in flight) has terminated:
+            // cleared ONLY after the worker's lifecycle is resolved AND every
+            // physical worker the operation may have started has terminated:
+            // the microphone capture (input probe) AND the speaker probe
+            // (output probe, RC-2). A device check starts a real output
+            // stream; aborting the outer async wrapper cannot kill an
+            // already-submitted spawn_blocking closure, so the slot stays
+            // occupied until EACH Scheduled-but-not-Finished completion
+            // signals termination:
             //  1. stop flag set;
-            //  2. bounded cooperative grace for the blocking capture to
-            //     observe stop and exit normally (signalling `completion`);
+            //  2. bounded cooperative grace for the scheduled blocking
+            //     workers to observe stop and exit normally;
             //  3. if the grace expires, force-abort the outer wrapper
             //     (best effort — aborting an async task cannot kill an
             //     already-running spawn_blocking closure) and await it;
-            //  4. the slot STAYS occupied until the blocking capture signals
-            //     termination — overlapping physical capture is never
-            //     allowed, so a stuck capture keeps the slot reserved.
-            // A worker that never started a capture (e.g. aborted during
+            //  4. the slot STAYS occupied until every scheduled blocking
+            //     worker signals termination — overlapping physical
+            //     capture/playback is never allowed, so a stuck native
+            //     audio worker keeps the slot reserved (RC-3).
+            // A worker that never scheduled anything (e.g. aborted during
             // TTS) has nothing to wait for and is simply aborted/awaited.
             tokio::runtime::Handle::current().spawn(async move {
                 if let Some(handle) = worker.as_ref() {
-                    match completion.state() {
-                        // The blocking closure has fully exited — nothing
-                        // physical can still run.
-                        audio::capture::CaptureState::Finished => {}
-                        // A capture is Scheduled (submitted) but not
-                        // Finished: the closure may be running OR still
-                        // queued on a busy blocking pool. Either way the
-                        // slot stays occupied. Cooperative grace first; only
-                        // if it expires is the outer wrapper aborted, and
-                        // even then the slot is held until the REAL blocking
-                        // closure terminates — overlapping physical capture
-                        // is never allowed.
-                        audio::capture::CaptureState::Scheduled => {
-                            if tokio::time::timeout(grace, completion.wait()).await.is_ok() {
-                                // Physical capture finished within the
-                                // grace. Resolve the OUTER wrapper too
-                                // (RC-7): the slot clears only after BOTH
-                                // the physical capture and the owned outer
-                                // JoinHandle are fully resolved.
-                                if let Some(h) = worker {
-                                    let _ = h.await;
-                                }
-                            } else {
-                                handle.abort();
-                                if let Some(h) = worker {
-                                    let _ = h.await;
-                                }
-                                completion.wait().await;
+                    // Every physical worker that is Scheduled but not
+                    // Finished must be waited out before the slot frees.
+                    let pending: Vec<audio::capture::CaptureCompletion> = {
+                        let mut v = Vec::new();
+                        if completion.scheduled() {
+                            v.push(completion.clone());
+                        }
+                        if output_completion.scheduled() {
+                            v.push(output_completion.clone());
+                        }
+                        v
+                    };
+
+                    if !pending.is_empty() {
+                        // Bounded cooperative grace across all scheduled
+                        // workers.
+                        let mut grace_expired = false;
+                        for c in &pending {
+                            if tokio::time::timeout(grace, c.wait()).await.is_err() {
+                                grace_expired = true;
                             }
                         }
-                        // No capture scheduled yet. The outer wrapper is the
+                        if grace_expired {
+                            // Force-abort the outer wrapper (cannot kill the
+                            // blocking closures), await it, then wait out
+                            // EVERY real worker — overlapping physical
+                            // capture/playback is never allowed (RC-2/RC-3).
+                            handle.abort();
+                            if let Some(h) = worker {
+                                let _ = h.await;
+                            }
+                            for c in &pending {
+                                c.wait().await;
+                            }
+                        } else {
+                            // All physical workers finished within the
+                            // grace. Resolve the OUTER wrapper too (RC-7):
+                            // the slot clears only after both the physical
+                            // workers and the owned outer JoinHandle are
+                            // fully resolved.
+                            if let Some(h) = worker {
+                                let _ = h.await;
+                            }
+                        }
+                    } else {
+                        // Nothing scheduled yet. The outer wrapper is the
                         // whole lifecycle so far: abort and await it. But the
                         // worker may have raced to submit spawn_blocking
                         // between our state read and the abort landing — the
                         // submission is synchronous, so an abort cannot stop
                         // it. Re-check AFTER the outer worker is confirmed
-                        // dead (its JoinHandle resolved): a capture that
+                        // dead (its JoinHandle resolved): a worker that
                         // became Scheduled in the meantime must be waited
                         // out before the slot is freed.
-                        audio::capture::CaptureState::NotScheduled => {
-                            handle.abort();
-                            if let Some(h) = worker {
-                                let _ = h.await;
-                            }
-                            if completion.scheduled() {
-                                completion.wait().await;
+                        handle.abort();
+                        if let Some(h) = worker {
+                            let _ = h.await;
+                        }
+                        for c in [&completion, &output_completion] {
+                            if c.scheduled() {
+                                c.wait().await;
                             }
                         }
                     }
@@ -497,8 +538,16 @@ async fn check_audio_devices(
     let temp_dir = paths.paths.temp_dir.clone();
     let worker_stop = stop_flag.clone();
     let completion = recording_guard.completion();
+    let speaker_completion = recording_guard.output_completion();
     let worker = tokio::spawn(async move {
-        interview::device_check::run_device_check(temp_dir, tx, worker_stop, completion).await
+        interview::device_check::run_device_check(
+            temp_dir,
+            tx,
+            worker_stop,
+            completion,
+            speaker_completion,
+        )
+        .await
     });
     recording_guard.attach_worker(worker);
 
@@ -1987,6 +2036,114 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         assert!(cleared, "slot must clear after the outer worker resolves");
+
+        // Reusable.
+        acquire_recording(&state, fake_handle()).await.unwrap();
+        assert!(state.handle.lock().await.is_some());
+    }
+
+    /// RC-2: the SPEAKER probe (output probe) lifecycle is tracked by its own
+    /// CaptureCompletion. If the outer device-check task is cancelled while
+    /// the speaker probe is inside spawn_blocking, the blocking output worker
+    /// can outlive the outer worker — the slot must stay occupied until the
+    /// real output probe signals Finished, and becomes reusable only then
+    /// (no audio slot reuse until the probe physically ends, RC-3).
+    #[tokio::test]
+    async fn recording_guard_drop_waits_for_speaker_probe_output_completion() {
+        let state = Arc::new(RecordingState {
+            handle: Mutex::new(None),
+        });
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The probe cannot BEGIN executing (and therefore cannot signal
+        // Finished) until the test opens the gate.
+        let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let began = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        acquire_recording(&state, fake_handle()).await.unwrap();
+
+        let output_completion_for_test;
+        {
+            let mut guard = RecordingGuard::new(state.clone(), stop.clone());
+            guard.drop_grace = std::time::Duration::from_millis(150);
+            let output_completion = guard.output_completion();
+            output_completion_for_test = output_completion.clone();
+            let worker = {
+                let blocking_stop = stop.clone();
+                let blocking_gate = gate.clone();
+                let blocking_began = began.clone();
+                let output_completion = output_completion.clone();
+                tokio::spawn(async move {
+                    // The device-check worker starts the speaker probe:
+                    // mark_scheduled BEFORE spawn_blocking (RC-2).
+                    output_completion.mark_scheduled();
+                    let probe = tokio::task::spawn_blocking(move || {
+                        // Simulate a queued output probe: it may not begin
+                        // (and cannot signal Finished) until the gate opens.
+                        while !blocking_gate.load(Ordering::SeqCst) {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        blocking_began.store(true, Ordering::SeqCst);
+                        while !blocking_stop.load(Ordering::SeqCst) {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        // Output probe fully terminated — signal completion.
+                        output_completion.signal();
+                    });
+                    let _ = probe.await;
+                })
+            };
+            guard.attach_worker(worker);
+
+            // Wait until the speaker probe is EXPLICITLY Scheduled (submitted
+            // but not started) before dropping.
+            let mut scheduled = false;
+            for _ in 0..200 {
+                if output_completion_for_test.state() == CaptureState::Scheduled {
+                    scheduled = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert!(scheduled, "speaker probe must reach Scheduled before drop");
+            // Dropped while armed — cancellation of the outer device-check
+            // command while the speaker probe is queued/running.
+        }
+
+        // Grace (150ms) expired, outer wrapper aborted and awaited; the
+        // speaker probe is still gated (never began, never signalled
+        // Finished) -> the slot must STILL be occupied and a second acquire
+        // must fail.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(
+            !began.load(Ordering::SeqCst),
+            "speaker probe must still be gated while the slot is held"
+        );
+        assert!(
+            state.handle.lock().await.is_some(),
+            "slot must stay occupied while the speaker probe is unresolved"
+        );
+        let second = acquire_recording(&state, fake_handle()).await;
+        assert!(
+            second.is_err() && second.unwrap_err().contains("already active"),
+            "second acquire must fail while the speaker probe is unresolved"
+        );
+
+        // Open the gate: the probe begins, observes stop, terminates, and
+        // signals Finished. ONLY then may the slot clear (RC-3: no slot
+        // reuse until the probe physically ends).
+        gate.store(true, Ordering::SeqCst);
+        let mut cleared = false;
+        for _ in 0..300 {
+            if state.handle.lock().await.is_none() {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            cleared,
+            "slot must clear only after the speaker probe physically ends"
+        );
+        assert_eq!(output_completion_for_test.state(), CaptureState::Finished);
 
         // Reusable.
         acquire_recording(&state, fake_handle()).await.unwrap();

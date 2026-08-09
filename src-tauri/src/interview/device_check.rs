@@ -28,6 +28,7 @@ pub async fn run_device_check(
     event_tx: mpsc::Sender<CaptureEvent>,
     stop_flag: Arc<AtomicBool>,
     completion: CaptureCompletion,
+    speaker_completion: CaptureCompletion,
 ) -> DeviceCheckResult {
     let mut errors = Vec::new();
 
@@ -69,9 +70,12 @@ pub async fn run_device_check(
     // playback must be able to create its exact stream (mono, 22050 Hz) on it.
     // Validate silently and bounded; if the production stream cannot be
     // created, speaker readiness FAILS so the interview cannot start into a
-    // first question the candidate could not hear.
+    // first question the candidate could not hear. The speaker probe is
+    // tracked by `speaker_completion` (RC-2): the owning command keeps the
+    // recording slot occupied until the real output stream has actually
+    // ended.
     if speaker_available {
-        match validate_production_playback_stream().await {
+        match validate_production_playback_stream(speaker_completion).await {
             Ok(_) => {}
             Err(e) => {
                 errors.push(format!("Speaker not ready for interview playback: {}", e));
