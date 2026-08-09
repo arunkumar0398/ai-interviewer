@@ -3,44 +3,35 @@
 import { useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
-interface RecordingResult {
-  path: string;
+interface AudioTestResult {
   duration_ms: number;
+  file_size_bytes: number;
 }
 
 export default function Home() {
-  const [recordingState, setRecordingState] = useState<"idle" | "recording" | "stopped">("idle");
-  const [result, setResult] = useState<RecordingResult | null>(null);
+  const [testState, setTestState] = useState<"idle" | "testing">("idle");
+  const [result, setResult] = useState<AudioTestResult | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const handleRecord = useCallback(async () => {
+  // Bounded, self-cleaning microphone test (P1-2): the backend records to a
+  // TEMP file, auto-stops after a hard 10s wall-clock bound, and deletes the
+  // WAV before returning. No orphan persistent recording can be created and
+  // no backend microphone operation can run unbounded — navigating away
+  // cannot leave a stray capture running.
+  const handleAudioTest = useCallback(async () => {
     setError(null);
     setResult(null);
-
-    if (recordingState === "recording") {
-      try {
-        await invoke("stop_recording");
-        setRecordingState("stopped");
-      } catch (e) {
-        setError(String(e));
-      }
-      return;
-    }
+    setTestState("testing");
 
     try {
-      setRecordingState("recording");
-      const result = await invoke<RecordingResult>("start_recording", {
-        sessionId: crypto.randomUUID(),
-        roundId: crypto.randomUUID(),
-        sampleRate: 16000,
-      });
-      setResult(result);
-      setRecordingState("stopped");
+      const testResult = await invoke<AudioTestResult>("run_audio_test");
+      setResult(testResult);
     } catch (e) {
       setError(String(e));
-      setRecordingState("idle");
+    } finally {
+      setTestState("idle");
     }
-  }, [recordingState]);
+  }, []);
 
   return (
     <div className="flex flex-col min-h-screen bg-zinc-50 dark:bg-black font-sans">
@@ -86,7 +77,7 @@ export default function Home() {
               Dashboard
             </h2>
             <p className="text-sm text-zinc-500 dark:text-zinc-400">
-              View past sessions and manage questions.
+              View past sessions and start interviews.
             </p>
           </a>
         </div>
@@ -96,28 +87,37 @@ export default function Home() {
           <h2 className="text-lg font-medium mb-3 dark:text-zinc-200">
             Audio Test
           </h2>
+          <p className="text-sm text-zinc-500 dark:text-zinc-400 mb-3">
+            Records a short clip to verify the microphone. The recording is
+            temporary and deleted automatically (max 10 seconds).
+          </p>
           <div className="flex items-center gap-4">
             <button
-              onClick={handleRecord}
-              className={`px-6 py-3 rounded-full font-medium text-white transition-colors ${
-                recordingState === "recording"
-                  ? "bg-red-600 hover:bg-red-700 animate-pulse"
+              onClick={handleAudioTest}
+              disabled={testState === "testing"}
+              className={`px-6 py-3 rounded-full font-medium text-white transition-colors disabled:opacity-60 ${
+                testState === "testing"
+                  ? "bg-red-600 animate-pulse"
                   : "bg-indigo-600 hover:bg-indigo-700"
               }`}
             >
-              {recordingState === "recording" ? "Stop Recording" : "Start Recording"}
+              {testState === "testing" ? "Testing…" : "Run Audio Test"}
             </button>
-            {recordingState === "recording" && (
+            {testState === "testing" && (
               <div className="flex items-center gap-2">
                 <div className="w-3 h-3 rounded-full bg-red-500 animate-pulse" />
-                <span className="text-sm text-zinc-600 dark:text-zinc-400">Recording...</span>
+                <span className="text-sm text-zinc-600 dark:text-zinc-400">
+                  Testing microphone… (auto-stops after 10s)
+                </span>
               </div>
             )}
           </div>
           {result && (
             <div className="mt-3 text-sm text-zinc-600 dark:text-zinc-400">
-              <p>Saved: {result.path}</p>
-              <p>Duration: {result.duration_ms}ms</p>
+              <p>Captured {(result.duration_ms / 1000).toFixed(1)}s of audio ({result.file_size_bytes} bytes)</p>
+              <p className="text-xs text-zinc-400 mt-1">
+                Temporary recording deleted — nothing was saved.
+              </p>
             </div>
           )}
         </div>

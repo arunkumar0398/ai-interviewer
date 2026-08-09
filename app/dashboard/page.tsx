@@ -40,9 +40,11 @@ export default function DashboardPage() {
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
   const [rounds, setRounds] = useState<InterviewRound[]>([]);
   const [candidateName, setCandidateName] = useState("");
-  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  // The active interview session created here (id + candidate name). The
+  // session id is handed to /interview so the interview runs against THIS
+  // session — the interview page must not create a second, orphan session.
+  const [activeSession, setActiveSession] = useState<{ id: string; name: string } | null>(null);
   const [dbReady, setDbReady] = useState(false);
-  const [questions, setQuestions] = useState<string[]>(QUESTIONS);
 
   const loadSessions = async () => {
     try {
@@ -84,27 +86,12 @@ export default function DashboardPage() {
         sessionId,
         candidateName: candidateName.trim(),
       });
-      setActiveSessionId(sessionId);
+      setActiveSession({ id: sessionId, name: candidateName.trim() });
       setCandidateName("");
       loadSessions();
     } catch (e) {
       console.error("Failed to create session:", e);
     }
-  };
-
-  const addQuestion = () => {
-    setQuestions([...questions, ""]);
-  };
-
-  const updateQuestion = (index: number, value: string) => {
-    const updated = [...questions];
-    updated[index] = value;
-    setQuestions(updated);
-  };
-
-  const removeQuestion = (index: number) => {
-    if (questions.length <= 1) return;
-    setQuestions(questions.filter((_, i) => i !== index));
   };
 
   return (
@@ -130,75 +117,58 @@ export default function DashboardPage() {
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">
                   Candidate Name
-                </label>
-                <input
-                  type="text"
-                  value={candidateName}
-                  onChange={(e) => setCandidateName(e.target.value)}
-                  placeholder="Enter candidate name"
-                  className="w-full border rounded-lg px-3 py-2 text-sm"
-                  disabled={!!activeSessionId}
-                />
-              </div>
-              <button
-                onClick={startNewSession}
-                disabled={!dbReady || !candidateName.trim() || !!activeSessionId}
-                className="w-full bg-blue-600 text-white rounded-lg px-4 py-2 text-sm font-medium hover:bg-blue-700 disabled:bg-gray-300"
-              >
-                {activeSessionId ? "Session Active" : "Start Interview"}
-              </button>
-              {activeSessionId && (
-                <div className="bg-green-50 border border-green-200 rounded-lg p-3 text-sm">
-                  <p className="font-medium text-green-800">Session Active</p>
-                  <p className="text-green-600 text-xs mt-1">
-                    ID: {activeSessionId.slice(0, 20)}...
-                  </p>
-                  <p className="text-xs text-gray-500 mt-1">
-                    Go to{" "}
-                    <Link href="/interview" className="text-blue-600 underline">
-                      /interview
-                    </Link>{" "}
-                    to run the interview
-                  </p>
+                </label>                  <input
+                    type="text"
+                    value={candidateName}
+                    onChange={(e) => setCandidateName(e.target.value)}
+                    placeholder="Enter candidate name"
+                    className="w-full border rounded-lg px-3 py-2 text-sm"
+                    disabled={!!activeSession}
+                  />
                 </div>
-              )}
+                <button
+                  onClick={startNewSession}
+                  disabled={!dbReady || !candidateName.trim() || !!activeSession}
+                  className="w-full bg-blue-600 text-white rounded-lg px-4 py-2 text-sm font-medium hover:bg-blue-700 disabled:bg-gray-300"
+                >
+                  {activeSession ? "Session Active" : "Start Interview"}
+                </button>
+                {activeSession && (
+                  <div className="bg-green-50 border border-green-200 rounded-lg p-3 text-sm">
+                    <p className="font-medium text-green-800">Session Active</p>
+                    <p className="text-green-600 text-xs mt-1">
+                      Candidate: {activeSession.name}
+                    </p>
+                    <p className="text-xs text-gray-500 mt-1">
+                      Go to{" "}
+                      <Link
+                        href={`/interview?session=${activeSession.id}&name=${encodeURIComponent(activeSession.name)}`}
+                        className="text-blue-600 underline"
+                      >
+                        /interview
+                      </Link>{" "}
+                      to run the interview — it will continue this session
+                    </p>
+                  </div>
+                )}
             </div>
           </div>
 
-          {/* Center: Question Bank */}
+          {/* Center: Question Bank (read-only in this version) */}
           <div className="bg-white rounded-lg shadow p-6">
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-lg font-semibold">Question Bank</h2>
-              <button
-                onClick={addQuestion}
-                className="text-blue-600 hover:text-blue-800 text-sm font-medium"
-              >
-                + Add
-              </button>
-            </div>
-            <div className="space-y-3 max-h-96 overflow-y-auto">
-              {questions.map((q, i) => (
-                <div key={i} className="flex gap-2">
-                  <span className="text-xs text-gray-400 mt-2 w-5">
-                    {i + 1}.
-                  </span>
-                  <input
-                    type="text"
-                    value={q}
-                    onChange={(e) => updateQuestion(i, e.target.value)}
-                    className="flex-1 border rounded px-2 py-1 text-sm"
-                    placeholder={`Question ${i + 1}`}
-                  />
-                  <button
-                    onClick={() => removeQuestion(i)}
-                    className="text-red-400 hover:text-red-600 text-sm px-1"
-                    disabled={questions.length <= 1}
-                  >
-                    x
-                  </button>
-                </div>
+            <h2 className="text-lg font-semibold mb-4">Question Bank</h2>
+            <p className="text-xs text-gray-400 mb-3">
+              Questions are fixed in this version (5 rounds, matching the
+              backend interview contract). Customization arrives with a later
+              template/session-snapshot feature.
+            </p>
+            <ol className="space-y-2 max-h-96 overflow-y-auto list-decimal list-inside">
+              {QUESTIONS.map((q, i) => (
+                <li key={i} className="text-sm text-gray-700">
+                  {q}
+                </li>
               ))}
-            </div>
+            </ol>
           </div>
 
           {/* Right: Past Sessions */}

@@ -88,14 +88,32 @@ export default function InterviewPage() {
   const [isStopping, setIsStopping] = useState(false);
   const [retryTarget, setRetryTarget] = useState<RetryTarget | null>(null);
 
-  // Stable session ID for the entire interview flow (one session across all rounds)
-  const [sessionId] = useState(() => crypto.randomUUID());
+  // When the Recruiter Dashboard created the session, it hands it off here via
+  // ?session=<uuid>&name=<name>: the interview then continues THAT session
+  // instead of creating a second, orphan one (P1-1). The handoff is read
+  // synchronously (the query string is static for the page lifetime) and
+  // nothing derived from it is rendered, so the static prerender is
+  // unaffected. No setState-in-effect is needed.
+  const handoff = (() => {
+    if (typeof window === "undefined") return { session: null, name: null };
+    const params = new URLSearchParams(window.location.search);
+    return { session: params.get("session"), name: params.get("name") };
+  })();
+
+  // Stable session ID for the entire interview flow (one session across all
+  // rounds): the Dashboard's session when handed off, otherwise a fresh one.
+  const [sessionId] = useState(() => handoff.session ?? crypto.randomUUID());
   const sessionIdRef = useRef(sessionId);
+  const [candidateName] = useState(handoff.name ?? "Candidate");
 
   // Backend-authoritative session lifecycle: tracks whether create_session
-  // has been called and whether the session is ready for round execution.
+  // has been called and whether the session is ready for round execution. A
+  // handed-off session was already created by the Dashboard, so it starts
+  // ready and create_session is never called for it.
   type SessionInitState = "idle" | "creating" | "ready" | "error";
-  const [sessionInitState, setSessionInitState] = useState<SessionInitState>("idle");
+  const [sessionInitState, setSessionInitState] = useState<SessionInitState>(
+    handoff.session ? "ready" : "idle"
+  );
 
   // Ref-based guard to prevent concurrent double-starts while session creation
   // or round startup is in progress. Must outlive async callbacks.
@@ -133,8 +151,14 @@ export default function InterviewPage() {
           setPhase("ready");
           break;
         case "error":
-          setPhase("error");
-          if (question) setError(question);
+          // A stop-during-round is a controlled cancellation, not a failure:
+          // return to ready (matching the invoke rejection handling below).
+          if (question && question.toLowerCase().includes("stopped")) {
+            setPhase("ready");
+          } else {
+            setPhase("error");
+            if (question) setError(question);
+          }
           break;
       }
     });
@@ -230,15 +254,17 @@ export default function InterviewPage() {
     isStartingRound.current = true;
 
     try {
-      // Backend-authoritative session lifecycle: create session before first round.
-      // After create_session succeeds, proceed immediately into round execution —
-      // no stale-state gate. The ref guard above prevents re-entry.
+      // Backend-authoritative session lifecycle: create session before first
+      // round — but only when no session was handed off by the Dashboard (the
+      // Dashboard already created it). After create_session succeeds, proceed
+      // immediately into round execution. The ref guard above prevents
+      // re-entry.
       if (sessionInitState === "idle") {
         setSessionInitState("creating");
         try {
           await invoke("create_session", {
-            sessionId,
-            candidateName: "Candidate",
+            sessionId: sessionIdRef.current,
+            candidateName,
           });
           setSessionInitState("ready");
         } catch (e) {
@@ -258,7 +284,7 @@ export default function InterviewPage() {
       const roundId = crypto.randomUUID();
       const result = await invoke<InterviewRoundResult>("run_interview_round", {
         question,
-        sessionId,
+        sessionId: sessionIdRef.current,
         roundId,
         roundIndex: currentRound,
       });
@@ -277,7 +303,7 @@ export default function InterviewPage() {
     } finally {
       isStartingRound.current = false;
     }
-  }, [currentRound, sessionId, sessionInitState]);
+  }, [currentRound, sessionInitState, candidateName]);
 
   // Retry handler — only redoes the failed operation
   const handleRetry = useCallback(async () => {
@@ -319,8 +345,8 @@ export default function InterviewPage() {
         // transition to ready; the user then starts the first round.
         try {
           await invoke("create_session", {
-            sessionId,
-            candidateName: "Candidate",
+            sessionId: sessionIdRef.current,
+            candidateName,
           });
           setSessionInitState("ready");
           setPhase("ready");
@@ -339,7 +365,7 @@ export default function InterviewPage() {
             "retry_interview_round",
             {
               question: retryTarget.question,
-              sessionId,
+              sessionId: sessionIdRef.current,
               roundIndex: currentRound,
             }
           );
@@ -354,7 +380,7 @@ export default function InterviewPage() {
         break;
       }
     }
-  }, [retryTarget, currentRound, sessionId, handleDeviceCheck]);
+  }, [retryTarget, currentRound, handleDeviceCheck, candidateName]);
 
   // Stop current round
   const handleStop = useCallback(async () => {

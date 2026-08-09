@@ -64,7 +64,11 @@ jobs:
           pwsh scripts/verify-tools.ps1 -ManifestPath resources/tool-manifest.json -ToolsDir tools
 
       - name: Build Tauri app
-        run: npx tauri build
+        # --no-bundle: this workflow ships a portable ZIP, not installers.
+        # Building MSI/NSIS here downloads WiX/NSIS, produces installers that
+        # are immediately discarded, and falsely suggests they are part of the
+        # supported distribution.
+        run: npx tauri build --no-bundle
 
       - name: Create portable package
         run: |
@@ -158,6 +162,19 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Release gate — voice-model licensing must be resolved
+        shell: pwsh
+        run: |
+          if (Select-String -Path resources/licenses/model-attribution.txt -Pattern 'RELEASE BLOCKER' -Quiet) {
+            Write-Error "Release blocked: resources/licenses/model-attribution.txt still marks the Piper voice model with a RELEASE BLOCKER. Resolve the voice-model distribution terms (or switch to a voice with documented redistribution rights) before publishing a release."
+            exit 1
+          }
+          Write-Host "Release gate passed: no RELEASE BLOCKER marker in model attribution."
+
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:

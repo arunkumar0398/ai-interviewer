@@ -1,5 +1,7 @@
 use crate::audio::pipe::{terminate_child, StderrDrain};
-use crate::audio::playback::{await_playback, PLAYBACK_TIMEOUT_SECS};
+use crate::audio::playback::{
+    await_playback, pcm_bytes_to_samples, PlaybackOutcome, PLAYBACK_TIMEOUT_SECS,
+};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -207,15 +209,21 @@ impl PiperSupervisor {
                         // Play the collected PCM data. A playback failure must
                         // surface as an error: the candidate did not actually
                         // hear the question, so the round must not continue.
-                        if let Err(e) =
-                            play_raw_pcm_async(&pcm_data, sample_rate, stop_flag.clone()).await
-                        {
-                            let _ = event_tx.try_send(TtsEvent::Error {
-                                message: format!("Playback failed: {}", e),
-                            });
-                            return Err(anyhow::anyhow!("Playback failed: {}", e));
+                        let outcome = play_raw_pcm_async(&pcm_data, sample_rate, stop_flag.clone())
+                            .await
+                            .map_err(|e| {
+                                let _ = event_tx.try_send(TtsEvent::Error {
+                                    message: format!("Playback failed: {}", e),
+                                });
+                                anyhow::anyhow!("Playback failed: {}", e)
+                            })?;
+                        // P2-4: Finished is only truthful after ACTUAL playback
+                        // completion. A stop during playback is Cancelled — the
+                        // orchestrator observes the stop flag and aborts the
+                        // round; no Finished is emitted.
+                        if matches!(outcome, PlaybackOutcome::Completed) {
+                            let _ = event_tx.try_send(TtsEvent::Finished { duration_ms: 0 });
                         }
-                        let _ = event_tx.try_send(TtsEvent::Finished { duration_ms: 0 });
                         return Ok(());
                     }
                     // Non-zero exit — may need restart
@@ -275,27 +283,24 @@ impl PiperSupervisor {
 }
 
 /// Play raw 16-bit PCM from a pre-collected buffer via cpal output device.
+/// Returns the distinct outcome (Completed vs Cancelled) so callers only
+/// report Finished after actual playback completion (P2-4).
 /// Moves the entire cpal Stream lifecycle into spawn_blocking so the
 /// !Send Stream never crosses an async await point.
 async fn play_raw_pcm_async(
     pcm_data: &[u8],
     sample_rate: u32,
     stop_flag: Arc<AtomicBool>,
-) -> anyhow::Result<()> {
-    // Convert bytes to i16 samples
-    let samples: Vec<i16> = pcm_data
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]))
-        .collect();
-
-    if samples.is_empty() {
-        return Ok(());
-    }
+) -> anyhow::Result<PlaybackOutcome> {
+    // Reject empty/malformed PCM BEFORE any device work (P1-3): Piper exiting
+    // 0 with zero audio must never be reported as successfully spoken — the
+    // candidate heard nothing, so the round must fail, not proceed.
+    let samples = pcm_bytes_to_samples(pcm_data)?;
 
     // Move the entire cpal Stream lifecycle into spawn_blocking so the
     // !Send Stream never crosses an async await point.
     let stop_flag_clone = stop_flag.clone();
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || -> anyhow::Result<PlaybackOutcome> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
         let host = cpal::default_host();
@@ -361,7 +366,7 @@ async fn play_raw_pcm_async(
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_secs(PLAYBACK_TIMEOUT_SECS);
 
-        await_playback(
+        let outcome = await_playback(
             &playback_err,
             Some(&stop_flag_clone),
             deadline,
@@ -370,11 +375,9 @@ async fn play_raw_pcm_async(
         )?;
 
         drop(stream);
-        Ok(())
+        Ok(outcome)
     })
-    .await??;
-
-    Ok(())
+    .await?
 }
 
 /// Verify that Piper binary exists and model file is present

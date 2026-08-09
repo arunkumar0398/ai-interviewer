@@ -436,4 +436,106 @@ describe("Interview Page", () => {
       expect(screen.queryByText("Device Check")).not.toBeInTheDocument();
     });
   });
+
+  it("adopts the Dashboard session from the URL — no second create_session (P1-1)", async () => {
+    const handedOffSession = "11111111-2222-3333-4444-555555555555";
+    // Simulate the Dashboard's handoff link: /interview?session=<uuid>&name=Alice
+    window.history.replaceState(
+      {},
+      "",
+      `/interview?session=${handedOffSession}&name=Alice`
+    );
+
+    let createSessionCalls = 0;
+    let roundSessionId: string | null = null;
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      switch (cmd) {
+        case "get_app_config":
+          return Promise.resolve(mockAppConfig);
+        case "check_audio_devices":
+          return Promise.resolve({
+            mic_available: true,
+            mic_name: "Mic",
+            speaker_available: true,
+            speaker_name: "Speaker",
+            mic_test_ok: true,
+            errors: [],
+          });
+        case "create_session":
+          createSessionCalls += 1;
+          return Promise.resolve();
+        case "run_interview_round": {
+          roundSessionId = (args?.sessionId as string) ?? null;
+          return Promise.resolve({
+            metadata: {
+              file_path: "/tmp/round.wav",
+              sha256: "abc123",
+              duration_ms: 5000,
+              sample_rate: 16000,
+              channels: 1,
+              file_size_bytes: 100,
+            },
+            transcription: "My answer",
+          });
+        }
+        default:
+          return Promise.reject(new Error(`Unexpected command: ${cmd}`));
+      }
+    });
+
+    await act(async () => {
+      render(<InterviewPage />);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Check Devices")).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText("Check Devices"));
+
+    // Ready — the handed-off session was created by the Dashboard, so the
+    // Interview page must NOT call create_session again.
+    await waitFor(() => {
+      expect(screen.getByText("Start Interview")).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText("Start Interview"));
+
+    await waitFor(() => {
+      expect(screen.getByText("Round 1 Complete")).toBeInTheDocument();
+    });
+    expect(createSessionCalls).toBe(0);
+    expect(roundSessionId).toBe(handedOffSession);
+
+    // Restore the URL for other tests.
+    window.history.replaceState({}, "", "/");
+  });
+
+  it("returns to ready on a stopped round error event (P2-3)", async () => {
+    mockInvoke.mockResolvedValueOnce(mockAppConfig);
+
+    await act(async () => {
+      render(<InterviewPage />);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Device Check")).toBeInTheDocument();
+    });
+
+    const callback = mockListenCallbacks.get("interview-phase");
+    expect(callback).toBeDefined();
+
+    // A stop during the round is a controlled cancellation, not an error.
+    act(() => {
+      callback!({
+        payload: {
+          phase: "error",
+          question: "Interview stopped during TTS",
+        },
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Start Interview")).toBeInTheDocument();
+    });
+    expect(screen.queryByText("Error")).not.toBeInTheDocument();
+  });
 });

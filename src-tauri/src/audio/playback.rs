@@ -30,38 +30,66 @@ pub enum PlaybackEvent {
     Error { message: String },
 }
 
+/// Distinct outcome of a playback operation (P2-4). Cancellation (stop flag)
+/// is NOT success: callers must only report "Finished" for `Completed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackOutcome {
+    Completed,
+    Cancelled,
+}
+
 /// Wait for playback to finish, be cancelled, or fail. Completion is based on
 /// ACTUAL sample progress (P2-3): success only once the output callback has
 /// consumed `total_samples` samples. Elapsed expected duration alone is NOT
 /// proof of successful playback — a stalled output device (no progress) or a
 /// latched output-stream error fails the operation.
-/// Returns Ok on completion or controlled cancellation (stop flag); Err on a
-/// latched output error or when the absolute `deadline` passes without
-/// progress.
+/// Returns Ok(Completed) when every sample was consumed, Ok(Cancelled) on a
+/// controlled stop, and Err on a latched output error or when the absolute
+/// `deadline` passes without progress.
 pub fn await_playback(
     playback_err: &std::sync::Mutex<Option<String>>,
     stop_flag: Option<&AtomicBool>,
     deadline: std::time::Instant,
     position: &std::sync::atomic::AtomicUsize,
     total_samples: usize,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<PlaybackOutcome> {
     loop {
         if let Some(msg) = playback_err.lock().map(|g| g.clone()).unwrap_or_default() {
             anyhow::bail!("{}", msg);
         }
         if position.load(Ordering::Relaxed) >= total_samples {
-            return Ok(());
+            return Ok(PlaybackOutcome::Completed);
         }
         if std::time::Instant::now() >= deadline {
             anyhow::bail!("Playback timed out — output device did not make progress");
         }
         if let Some(flag) = stop_flag {
             if flag.load(Ordering::SeqCst) {
-                return Ok(());
+                return Ok(PlaybackOutcome::Cancelled);
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+}
+
+/// Convert Piper's raw 16-bit little-endian PCM into samples, REJECTING
+/// empty or malformed output (P1-3). Piper exiting 0 with zero PCM must never
+/// be reported as successfully spoken: the candidate heard nothing. An odd
+/// byte length means truncated/corrupt output and is equally rejected.
+pub(crate) fn pcm_bytes_to_samples(pcm: &[u8]) -> anyhow::Result<Vec<i16>> {
+    if pcm.is_empty() {
+        anyhow::bail!("Piper produced no audio output");
+    }
+    if !pcm.len().is_multiple_of(2) {
+        anyhow::bail!(
+            "Piper produced malformed audio (odd byte length {})",
+            pcm.len()
+        );
+    }
+    Ok(pcm
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect())
 }
 
 /// Play a WAV file through the system speakers using cpal.
@@ -317,7 +345,13 @@ pub async fn generate_tts(
     }
 
     // Piper outputs raw PCM (16-bit signed, mono, PIPER_SAMPLE_RATE Hz).
-    // Wrap it in a proper WAV file using hound.
+    // Reject empty/malformed output BEFORE creating the WAV (P1-3): a zero-
+    // audio "success" must never produce an empty WAV or be reported as
+    // spoken. Clean up the output path on rejection.
+    let samples = pcm_bytes_to_samples(&raw_pcm).inspect_err(|_| {
+        let _ = std::fs::remove_file(&output_path);
+    })?;
+
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate: PIPER_SAMPLE_RATE,
@@ -327,9 +361,7 @@ pub async fn generate_tts(
 
     let mut writer = hound::WavWriter::create(&output_path, spec)?;
 
-    // Convert raw bytes to i16 samples
-    for chunk in raw_pcm.chunks_exact(2) {
-        let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+    for sample in samples {
         writer.write_sample(sample)?;
     }
 
@@ -405,7 +437,11 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
 
         let result = await_playback(&err, Some(&stop), deadline, &position, 44100);
-        assert!(result.is_ok(), "position >= total must be success");
+        assert_eq!(
+            result.unwrap(),
+            PlaybackOutcome::Completed,
+            "position >= total must be Completed"
+        );
     }
 
     /// P2-3: a stalled output device (no sample progress) until the absolute
@@ -427,15 +463,49 @@ mod tests {
         );
     }
 
-    /// P1-5: cancellation (stop flag) returns Ok without an error.
+    /// P2-4: cancellation (stop flag) is a DISTINCT outcome — never
+    /// "Completed", so callers must not emit Finished on a cancelled playback.
     #[test]
-    fn await_playback_returns_ok_on_stop() {
+    fn await_playback_returns_cancelled_on_stop() {
         let err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
         let stop = Arc::new(AtomicBool::new(true));
         let position = std::sync::atomic::AtomicUsize::new(0);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
 
         let result = await_playback(&err, Some(&stop), deadline, &position, 1000);
-        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            PlaybackOutcome::Cancelled,
+            "stop must yield Cancelled, not Completed"
+        );
+    }
+
+    /// P1-3: zero PCM from Piper is an explicit failure, never silent success.
+    #[test]
+    fn pcm_bytes_to_samples_rejects_empty_output() {
+        let err = pcm_bytes_to_samples(&[]).unwrap_err();
+        assert!(
+            err.to_string().contains("no audio output"),
+            "empty PCM must be rejected explicitly, got: {}",
+            err
+        );
+    }
+
+    /// P1-3: truncated (odd-length) PCM is an explicit failure.
+    #[test]
+    fn pcm_bytes_to_samples_rejects_odd_length() {
+        let err = pcm_bytes_to_samples(&[0u8, 0u8, 0u8]).unwrap_err();
+        assert!(
+            err.to_string().contains("odd byte length"),
+            "odd-length PCM must be rejected, got: {}",
+            err
+        );
+    }
+
+    /// P1-3: valid even-length PCM parses into i16 samples.
+    #[test]
+    fn pcm_bytes_to_samples_parses_even_length() {
+        let samples = pcm_bytes_to_samples(&[0x01, 0x00, 0xFF, 0xFF]).unwrap();
+        assert_eq!(samples, vec![1i16, -1i16]);
     }
 }

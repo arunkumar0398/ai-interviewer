@@ -412,7 +412,12 @@ pub async fn record_test_clip(
         let total_frames = match collected {
             Ok(frames) => frames,
             Err(e) => {
-                // Clean the partial temp file; the caller surfaces the error.
+                // Windows file-handle ordering (P2-2): drop the writer FIRST
+                // so its file handle is released, THEN remove the partial
+                // file. Removing a file while the writer still holds the
+                // handle commonly fails on Windows and leaves a stray
+                // device_test_*.wav behind.
+                drop(writer);
                 let _ = std::fs::remove_file(&path_clone);
                 return Err(e);
             }
@@ -438,9 +443,11 @@ pub async fn record_test_clip(
     })
     .await??;
 
-    // Verify the file was created and has content
+    // Verify the file was created and has content. A too-short clip is a
+    // failed test, not evidence: delete the file so nothing is left behind.
     let metadata = std::fs::metadata(&tmp_path)?;
     if metadata.len() < 100 {
+        let _ = std::fs::remove_file(&tmp_path);
         anyhow::bail!("Test clip too short ({} bytes)", metadata.len());
     }
 

@@ -46,35 +46,106 @@ async fn clear_active_recording(state: &RecordingState) {
     *guard = None;
 }
 
-/// Scope guard that clears RecordingState when dropped. This is only a
-/// panic/cancellation safety net: every controlled path clears RecordingState
-/// explicitly (and disarms the guard) before returning, so the slot is free
-/// deterministically — no spawned task, no timing dependence.
-struct RecordingGuard {
+/// Owner of the recording-slot lease, the worker's stop flag, AND the worker's
+/// JoinHandle (P2-1). Every controlled path clears RecordingState explicitly
+/// (after the worker has fully terminated) and disarms the guard, so the slot
+/// is freed deterministically. If the guard is dropped while still armed — an
+/// unexpected drop or panic of the outer command — Drop sets the stop flag,
+/// aborts and awaits the worker, and ONLY THEN clears the slot. A bare
+/// JoinHandle drop would detach the task and let the slot be cleared while
+/// the worker is still alive; this guard closes that lifecycle gap.
+struct RecordingGuard<T: Send + 'static> {
     state: Arc<RecordingState>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<tokio::task::JoinHandle<T>>,
     armed: std::sync::atomic::AtomicBool,
 }
 
-impl RecordingGuard {
+impl<T: Send + 'static> RecordingGuard<T> {
+    fn new(state: Arc<RecordingState>, stop: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self {
+            state,
+            stop,
+            worker: None,
+            armed: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    /// Give the guard ownership of the spawned worker so a dropped command
+    /// can abort/await it before releasing the slot.
+    fn attach_worker(&mut self, handle: tokio::task::JoinHandle<T>) {
+        self.worker = Some(handle);
+    }
+
+    /// Resolves when the owned worker has finished (if any). Polled via
+    /// select!/timeout — it never consumes the JoinHandle, so cancellation can
+    /// still abort the worker afterwards.
+    async fn wait_worker(&self) {
+        loop {
+            match &self.worker {
+                Some(handle) if !handle.is_finished() => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                _ => return,
+            }
+        }
+    }
+
+    /// Capture the worker's result exactly once (normal completion path).
+    async fn take_result(&mut self) -> Option<Result<T, tokio::task::JoinError>> {
+        match self.worker.take() {
+            Some(handle) => Some(handle.await),
+            None => None,
+        }
+    }
+
+    /// Request abort of the owned worker (timeout path after the grace period
+    /// expires).
+    fn abort_worker(&self) {
+        if let Some(handle) = &self.worker {
+            handle.abort();
+        }
+    }
+
+    /// Await the (aborted) worker so its lifecycle is fully resolved.
+    async fn await_worker(&mut self) {
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.await;
+        }
+    }
+
     /// Disarm the safety net after explicit cleanup has run, so Drop does not
-    /// schedule a redundant async clear.
+    /// schedule a redundant clear/abort.
     fn disarm(&self) {
         self.armed.store(false, Ordering::SeqCst);
     }
 }
 
-impl Drop for RecordingGuard {
+impl<T: Send + 'static> Drop for RecordingGuard<T> {
     fn drop(&mut self) {
         if self.armed.load(Ordering::SeqCst) {
+            self.stop.store(true, Ordering::SeqCst);
+            let worker = self.worker.take();
             let state = self.state.clone();
-            // Spawn the async clear on the runtime; this runs even on panic.
-            // clone() ensures the Arc keeps the state alive past the guard's lifetime.
+            // Spawn on the runtime; this runs even on panic. The slot is
+            // cleared ONLY after the worker has terminated (abort + await),
+            // so the slot can never be freed while a detached worker is alive.
             tokio::runtime::Handle::current().spawn(async move {
+                if let Some(handle) = worker {
+                    handle.abort();
+                    let _ = handle.await;
+                }
                 clear_active_recording(&state).await;
             });
         }
     }
 }
+
+/// Maximum duration a raw `start_recording` command may run. The UI no longer
+/// uses this command (the Home audio test is bounded + temp via
+/// `run_audio_test`), but as a public command it must still be hard-bounded:
+/// it auto-stops after this budget even if nothing ever calls stop_recording.
+const START_RECORDING_MAX_SECS: u64 = 60;
 
 #[tauri::command]
 async fn start_recording(
@@ -100,6 +171,11 @@ async fn start_recording(
     // Atomic acquire — single lock, check-and-set
     acquire_recording(&state, handle).await?;
 
+    // P2-1: the guard owns the slot lease, stop flag, and worker JoinHandle.
+    // If this command is dropped mid-flight, the worker is stopped/aborted
+    // and awaited BEFORE the slot is released — never detached and leaked.
+    let mut recording_guard = RecordingGuard::new(state.inner().clone(), stop_flag.clone());
+
     let path_clone = path.clone();
     let event_tx = tx.clone();
     let stop_clone = stop_flag.clone();
@@ -108,20 +184,112 @@ async fn start_recording(
     let worker = tokio::spawn(async move {
         audio::capture::record_to_wav(path_clone, sr, 1, event_tx, stop_clone).await
     });
+    recording_guard.attach_worker(worker);
     drop(tx);
 
-    // Wait for worker completion or channel events
-    let join_result = worker.await;
+    // Hard wall-clock bound (P1-2): auto-stop after START_RECORDING_MAX_SECS
+    // even if the UI never calls stop_recording — the command cannot run
+    // forever with a backend microphone handle open.
+    let max_stop = stop_flag.clone();
+    let timer = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(START_RECORDING_MAX_SECS)).await;
+        max_stop.store(true, Ordering::SeqCst);
+    });
+
+    let join_result = recording_guard.take_result().await;
+    timer.abort();
+
+    // Release the slot and disarm the guard on EVERY outcome before
+    // propagating any error.
     clear_active_recording(&state).await;
+    recording_guard.disarm();
 
     // Check for join failure (panic/cancellation)
-    let record_result = join_result
-        .map_err(|e| format!("Recording worker failed: {}", e))?
-        .map_err(|e| e.to_string())?;
+    let record_result = match join_result {
+        Some(Ok(result)) => result.map_err(|e| e.to_string()),
+        Some(Err(e)) => Err(format!("Recording worker failed: {}", e)),
+        None => Err("Recording worker handle lost".to_string()),
+    }?;
 
     Ok(RecordingResult {
         path: record_result.file_path.to_string_lossy().to_string(),
         duration_ms: record_result.duration_ms,
+    })
+}
+
+/// Result of a bounded microphone test
+#[derive(serde::Serialize)]
+struct AudioTestResult {
+    duration_ms: u64,
+    file_size_bytes: u64,
+}
+
+/// Bounded, self-cleaning microphone test (P1-2). Records to the TEMP
+/// directory (never the persistent recordings/ tree), auto-stops after a hard
+/// 10s wall-clock bound, and DELETES the WAV before returning. The Home page
+/// Audio Test uses this instead of `start_recording`, so a test can never
+/// create orphan persistent recordings and can never leave a backend
+/// microphone operation running unbounded.
+#[tauri::command]
+async fn run_audio_test(
+    state: State<'_, Arc<RecordingState>>,
+    paths: State<'_, PathsState>,
+) -> Result<AudioTestResult, String> {
+    let (tx, _rx) = mpsc::channel(32);
+
+    let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handle = audio::capture::RecordingHandle {
+        stop: stop_flag.clone(),
+    };
+    acquire_recording(&state, handle).await?;
+
+    // Same exclusive-slot ownership as interview recording and device checks:
+    // an audio test can never overlap another capture.
+    let mut recording_guard = RecordingGuard::new(state.inner().clone(), stop_flag.clone());
+
+    let tmp_path = paths
+        .paths
+        .temp_dir
+        .join(format!("audio_test_{}.wav", uuid::Uuid::new_v4()));
+
+    let path_clone = tmp_path.clone();
+    let event_tx = tx.clone();
+    let stop_clone = stop_flag.clone();
+    let worker = tokio::spawn(async move {
+        audio::capture::record_to_wav(path_clone, 16000, 1, event_tx, stop_clone).await
+    });
+    recording_guard.attach_worker(worker);
+
+    // Hard wall-clock bound: the test auto-stops after AUDIO_TEST_MAX_SECS
+    // even if the UI never calls stop_recording.
+    const AUDIO_TEST_MAX_SECS: u64 = 10;
+    let max_stop = stop_flag.clone();
+    let timer = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(AUDIO_TEST_MAX_SECS)).await;
+        max_stop.store(true, Ordering::SeqCst);
+    });
+
+    let join_result = recording_guard.take_result().await;
+    timer.abort();
+
+    // The test never persists evidence: delete the temp WAV (and any partial
+    // temp file) regardless of outcome.
+    let _ = std::fs::remove_file(&tmp_path);
+    let _ = std::fs::remove_file(tmp_path.with_extension("wav.tmp"));
+
+    // Release the slot and disarm the guard on EVERY outcome.
+    clear_active_recording(&state).await;
+    recording_guard.disarm();
+
+    let record_result = match join_result {
+        Some(Ok(result)) => result.map_err(|e| e.to_string()),
+        Some(Err(e)) => Err(format!("Audio test worker failed: {}", e)),
+        None => Err("Audio test worker handle lost".to_string()),
+    }?;
+
+    Ok(AudioTestResult {
+        duration_ms: record_result.duration_ms,
+        file_size_bytes: record_result.file_size_bytes,
     })
 }
 
@@ -233,17 +401,16 @@ async fn check_audio_devices(
     // exclusive capture-ownership mechanism as interview recording. A device
     // check cannot overlap an interview round (or another device check); the
     // slot is released deterministically on success, error, and timeout.
+    let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handle = audio::capture::RecordingHandle {
-        stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        stop: stop_flag.clone(),
     };
     acquire_recording(&state, handle).await?;
 
-    // Safety net for panic/cancellation: clears the slot on drop if not
-    // explicitly cleared below.
-    let recording_guard = RecordingGuard {
-        state: state.inner().clone(),
-        armed: std::sync::atomic::AtomicBool::new(true),
-    };
+    // Safety net for panic/cancellation: owns the slot lease and clears it on
+    // drop if not explicitly cleared below. No worker is attached here — the
+    // device test capture is internally bounded (wall-clock deadline).
+    let recording_guard = RecordingGuard::<()>::new(state.inner().clone(), stop_flag);
 
     let result = interview::device_check::run_device_check(paths.paths.temp_dir.clone(), tx).await;
 
@@ -373,10 +540,13 @@ async fn run_interview_round(
     // Safety-net guard: clears RecordingState on any early return, panic, or
     // cancellation. Every controlled path below clears RecordingState
     // explicitly (after the worker has fully terminated) and disarms it.
-    let recording_guard = RecordingGuard {
-        state: state.inner().clone(),
-        armed: std::sync::atomic::AtomicBool::new(true),
-    };
+    // Owner of the slot lease + stop flag + worker JoinHandle (P2-1). Every
+    // controlled path below clears RecordingState explicitly (after the worker
+    // has fully terminated) and disarms it. If this command is dropped or
+    // panics while the guard is armed, Drop sets the stop flag, aborts and
+    // awaits the worker, and only then clears the slot — the slot can never
+    // be freed while a detached worker is still alive.
+    let mut recording_guard = RecordingGuard::new(state.inner().clone(), stop_flag.clone());
 
     let paths_clone = paths.paths.clone();
     let stop_clone = stop_flag.clone();
@@ -447,6 +617,7 @@ async fn run_interview_round(
         )
         .await
     });
+    recording_guard.attach_worker(worker);
 
     // Full-round deadline + cooperative shutdown
     const ROUND_TIMEOUT_SECS: u64 = 300;
@@ -455,182 +626,190 @@ async fn run_interview_round(
     let deadline =
         tokio::time::Instant::now() + tokio::time::Duration::from_secs(ROUND_TIMEOUT_SECS);
 
-    let mut worker_future = std::pin::pin!(worker);
-
-    // The JoinHandle result is captured directly from the select and processed
-    // exactly once. A completed JoinHandle must never be polled again (polling
-    // a completed handle consumes/panics), so the result is bound here rather
-    // than discarded with `_` and re-awaited afterwards.
-    //   Ok(join_result) => worker finished before the deadline (success, error, or panic)
-    //   Err(_)          => the 300s deadline expired first
-    let outcome = tokio::select! {
-        result = &mut worker_future => Ok(result),
-        _ = tokio::time::sleep_until(deadline) => Err(ROUND_TIMEOUT_SECS),
+    // Wait for the worker (polling its JoinHandle without consuming it) or the
+    // deadline. The JoinHandle result is captured exactly once afterwards via
+    // take_result() — the same handle is still owned by the guard for the
+    // timeout/abort path.
+    let timed_out = tokio::select! {
+        _ = recording_guard.wait_worker() => false,
+        _ = tokio::time::sleep_until(deadline) => true,
     };
 
-    match outcome {
-        Ok(join_result) => {
-            // Normal completion path — process the JoinHandle result exactly once.
-            // The worker's phase_tx sender is dropped when the worker finishes,
-            // so awaiting the relay lets every queued event flush before any
-            // final event is emitted by the persistence-owning layer. Never
-            // abort it here: a queued "complete"/final event must not be lost.
-            let _ = phase_relay.await;
+    if !timed_out {
+        // Normal completion path — capture the JoinHandle result exactly once.
+        // The worker's phase_tx sender is dropped when the worker finishes,
+        // so awaiting the relay lets every queued event flush before any
+        // final event is emitted by the persistence-owning layer. Never
+        // abort it here: a queued "complete"/final event must not be lost.
+        let _ = phase_relay.await;
 
-            let result = match join_result {
-                Ok(inner) => inner.map_err(|e| e.to_string()),
-                Err(join_err) => Err(format!("Interview worker failed: {}", join_err)),
-            };
+        let join_result = recording_guard.take_result().await;
+        let result = match join_result {
+            Some(Ok(inner)) => inner.map_err(|e| e.to_string()),
+            Some(Err(join_err)) => Err(format!("Interview worker failed: {}", join_err)),
+            None => Err("Interview worker handle lost".to_string()),
+        };
 
-            // RecordingState is held until persistence FULLY finishes (P1-1):
-            // a concurrent request for the same logical round cannot acquire
-            // the slot and start TTS/audio work while this request is between
-            // worker completion and DB COMMIT.
-            let round_result = match result {
-                Ok((metadata, transcription, mut evidence)) => {
-                    // Persist round atomically: round INSERT + session
-                    // total_rounds increment + completed_at (when final) commit
-                    // in ONE transaction. The WAV stays provisional (evidence
-                    // armed) until this COMMIT succeeds.
-                    let persist_result: Result<i64, String> = (async {
-                        let guard = db_state.db.lock().await;
-                        let db = guard
-                            .as_ref()
-                            .ok_or_else(|| "Database not initialized".to_string())?;
-                        db.insert_round_with_session_update(
-                            &session_id_str,
-                            round_index,
-                            &question,
-                            &transcription,
-                            &metadata.file_path,
-                            &metadata.sha256,
-                            metadata.duration_ms,
-                            metadata.sample_rate,
-                            metadata.channels,
-                            metadata.file_size_bytes,
-                            is_final,
-                        )
-                        .map_err(|e| {
-                            let msg = e.to_string();
-                            if msg.contains("UNIQUE constraint failed") {
-                                format!("Round {} already exists for this session", round_index + 1)
-                            } else {
-                                format!("Failed to persist round: {}", e)
-                            }
-                        })
+        // RecordingState is held until persistence FULLY finishes (P1-1):
+        // a concurrent request for the same logical round cannot acquire
+        // the slot and start TTS/audio work while this request is between
+        // worker completion and DB COMMIT.
+        let round_result = match result {
+            Ok((metadata, transcription, mut evidence)) => {
+                // Persist round atomically: round INSERT + session
+                // total_rounds increment + completed_at (when final) commit
+                // in ONE transaction. The WAV stays provisional (evidence
+                // armed) until this COMMIT succeeds.
+                let persist_result: Result<i64, String> = (async {
+                    let guard = db_state.db.lock().await;
+                    let db = guard
+                        .as_ref()
+                        .ok_or_else(|| "Database not initialized".to_string())?;
+                    db.insert_round_with_session_update(
+                        &session_id_str,
+                        round_index,
+                        &question,
+                        &transcription,
+                        &metadata.file_path,
+                        &metadata.sha256,
+                        metadata.duration_ms,
+                        metadata.sample_rate,
+                        metadata.channels,
+                        metadata.file_size_bytes,
+                        is_final,
+                    )
+                    .map_err(|e| {
+                        let msg = e.to_string();
+                        if msg.contains("UNIQUE constraint failed") {
+                            format!("Round {} already exists for this session", round_index + 1)
+                        } else {
+                            format!("Failed to persist round: {}", e)
+                        }
                     })
-                    .await;
+                })
+                .await;
 
-                    match persist_result {
-                        Ok(_) => {
-                            // Durable: disarm the evidence guard (WAV retained)
-                            // and only NOW emit "complete" — it means the round
-                            // is durably persisted.
-                            evidence.commit();
-                            let _ = app.emit(
-                                "interview-phase",
-                                PhaseEventPayload {
-                                    phase: "complete".to_string(),
-                                    question: None,
-                                    duration_ms: None,
-                                },
-                            );
-                            Ok(InterviewRoundResult {
-                                metadata,
-                                transcription,
-                            })
-                        }
-                        Err(e) => {
-                            // Persistence failed — evidence is still armed and
-                            // drops at the end of this arm, deleting the WAV
-                            // and any partial temp file. "complete" is NEVER
-                            // emitted for an unpersisted round.
-                            let _ = app.emit(
-                                "interview-phase",
-                                PhaseEventPayload {
-                                    phase: "error".to_string(),
-                                    question: Some(e.clone()),
-                                    duration_ms: None,
-                                },
-                            );
-                            Err(e)
-                        }
+                match persist_result {
+                    Ok(_) => {
+                        // Durable: disarm the evidence guard (WAV retained)
+                        // and only NOW emit "complete" — it means the round
+                        // is durably persisted.
+                        evidence.commit();
+                        let _ = app.emit(
+                            "interview-phase",
+                            PhaseEventPayload {
+                                phase: "complete".to_string(),
+                                question: None,
+                                duration_ms: None,
+                            },
+                        );
+                        Ok(InterviewRoundResult {
+                            metadata,
+                            transcription,
+                        })
+                    }
+                    Err(e) => {
+                        // Persistence failed — evidence is still armed and
+                        // drops at the end of this arm, deleting the WAV
+                        // and any partial temp file. "complete" is NEVER
+                        // emitted for an unpersisted round.
+                        let _ = app.emit(
+                            "interview-phase",
+                            PhaseEventPayload {
+                                phase: "error".to_string(),
+                                question: Some(e.clone()),
+                                duration_ms: None,
+                            },
+                        );
+                        Err(e)
                     }
                 }
-                Err(e) => Err(e),
-            };
-
-            // Persistence has fully finished (COMMIT or failure) — only NOW
-            // release the recording slot deterministically and disarm the
-            // safety net. Every controlled path (success or error) clears the
-            // slot exactly once.
-            clear_active_recording(&state).await;
-            recording_guard.disarm();
-
-            round_result
-        }
-        Err(_) => {
-            // Deadline hit — signal cooperative cancellation via stop_flag.
-            stop_flag.store(true, Ordering::SeqCst);
-            let _ = app.emit(
-                "interview-phase",
-                PhaseEventPayload {
-                    phase: "error".to_string(),
-                    question: Some(format!("Round timed out after {}s", ROUND_TIMEOUT_SECS)),
-                    duration_ms: None,
-                },
-            );
-
-            // Await the SAME worker up to the 5s grace period — allows cooperative
-            // exit. If it finishes in time, its result is captured (and discarded:
-            // the round timed out regardless).
-            let graceful = tokio::select! {
-                result = &mut worker_future => Some(result),
-                _ = tokio::time::sleep(tokio::time::Duration::from_secs(GRACE_SECS)) => None,
-            };
-
-            if graceful.is_none() {
-                // Grace period expired — force abort, then await the aborted
-                // JoinHandle so worker lifecycle is fully resolved before this
-                // command returns.
-                worker_future.as_mut().abort();
-                let _ = worker_future.await;
             }
+            Err(e) => {
+                // P2-3: every round termination must produce ONE terminal
+                // backend event. The worker failed (TTS, recording,
+                // checksum, transcription) — emit error before returning.
+                // The relay was drained above, so this is the last word.
+                let _ = app.emit(
+                    "interview-phase",
+                    PhaseEventPayload {
+                        phase: "error".to_string(),
+                        question: Some(e.clone()),
+                        duration_ms: None,
+                    },
+                );
+                Err(e)
+            }
+        };
 
-            // Worker has fully terminated (cooperatively or aborted) — release
-            // the recording slot deterministically and disarm the safety net.
-            clear_active_recording(&state).await;
-            recording_guard.disarm();
+        // Persistence has fully finished (COMMIT or failure) — only NOW
+        // release the recording slot deterministically and disarm the
+        // safety net. Every controlled path (success or error) clears the
+        // slot exactly once.
+        clear_active_recording(&state).await;
+        recording_guard.disarm();
 
-            // Drain the relay so queued phase events flush BEFORE the final
-            // error event below — the timeout error must be the last word.
-            let _ = phase_relay.await;
-            let _ = app.emit(
-                "interview-phase",
-                PhaseEventPayload {
-                    phase: "error".to_string(),
-                    question: Some(format!("Round timed out after {}s", ROUND_TIMEOUT_SECS)),
-                    duration_ms: None,
-                },
-            );
+        round_result
+    } else {
+        // Deadline hit — signal cooperative cancellation via stop_flag.
+        stop_flag.store(true, Ordering::SeqCst);
+        let _ = app.emit(
+            "interview-phase",
+            PhaseEventPayload {
+                phase: "error".to_string(),
+                question: Some(format!("Round timed out after {}s", ROUND_TIMEOUT_SECS)),
+                duration_ms: None,
+            },
+        );
 
-            // The round never committed — remove provisional artifacts: the
-            // WAV for this round_id, its partial temp file, and the session
-            // temp transcript directory.
-            let wav_path = paths.paths.round_audio_path(session_id, round_id);
-            let _ = std::fs::remove_file(&wav_path);
-            let _ = std::fs::remove_file(wav_path.with_extension("wav.tmp"));
-            let temp_dir = paths
-                .paths
-                .temp_dir
-                .join(session_id.hyphenated().to_string());
-            let _ = std::fs::remove_dir_all(temp_dir);
+        // Await the SAME worker up to the 5s grace period — allows
+        // cooperative exit.
+        let graceful = tokio::select! {
+            _ = recording_guard.wait_worker() => true,
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(GRACE_SECS)) => false,
+        };
 
-            Err(format!(
-                "Round timed out after {}s — processes terminated, partial artifacts cleaned up",
-                ROUND_TIMEOUT_SECS
-            ))
+        if !graceful {
+            // Grace period expired — force abort, then await the aborted
+            // JoinHandle so worker lifecycle is fully resolved before this
+            // command returns.
+            recording_guard.abort_worker();
+            recording_guard.await_worker().await;
         }
+
+        // Worker has fully terminated (cooperatively or aborted) — release
+        // the recording slot deterministically and disarm the safety net.
+        clear_active_recording(&state).await;
+        recording_guard.disarm();
+
+        // Drain the relay so queued phase events flush BEFORE the final
+        // error event below — the timeout error must be the last word.
+        let _ = phase_relay.await;
+        let _ = app.emit(
+            "interview-phase",
+            PhaseEventPayload {
+                phase: "error".to_string(),
+                question: Some(format!("Round timed out after {}s", ROUND_TIMEOUT_SECS)),
+                duration_ms: None,
+            },
+        );
+
+        // The round never committed — remove provisional artifacts: the
+        // WAV for this round_id, its partial temp file, and the session
+        // temp transcript directory.
+        let wav_path = paths.paths.round_audio_path(session_id, round_id);
+        let _ = std::fs::remove_file(&wav_path);
+        let _ = std::fs::remove_file(wav_path.with_extension("wav.tmp"));
+        let temp_dir = paths
+            .paths
+            .temp_dir
+            .join(session_id.hyphenated().to_string());
+        let _ = std::fs::remove_dir_all(temp_dir);
+
+        Err(format!(
+            "Round timed out after {}s — processes terminated, partial artifacts cleaned up",
+            ROUND_TIMEOUT_SECS
+        ))
     }
 }
 
@@ -750,6 +929,7 @@ pub fn run() {
             get_app_config,
             start_recording,
             stop_recording,
+            run_audio_test,
             play_round_audio,
             generate_tts,
             list_audio_devices,
@@ -776,6 +956,13 @@ mod tests {
         }
     }
 
+    fn new_guard(
+        state: &Arc<RecordingState>,
+    ) -> (RecordingGuard<()>, Arc<std::sync::atomic::AtomicBool>) {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (RecordingGuard::<()>::new(state.clone(), stop.clone()), stop)
+    }
+
     /// Controlled path: after the worker terminates, the command explicitly
     /// clears RecordingState and disarms the guard, so a second round can
     /// acquire the recording slot immediately — no spawned-task timing.
@@ -787,10 +974,7 @@ mod tests {
         let handle = fake_handle();
 
         acquire_recording(&state, handle.clone()).await.unwrap();
-        let guard = RecordingGuard {
-            state: state.clone(),
-            armed: std::sync::atomic::AtomicBool::new(true),
-        };
+        let (guard, _stop) = new_guard(&state);
 
         // Same ordering as the controlled completion/timeout paths in
         // run_interview_round: worker done -> explicit clear -> disarm.
@@ -815,15 +999,106 @@ mod tests {
         acquire_recording(&state, handle.clone()).await.unwrap();
 
         {
-            let guard = RecordingGuard {
-                state: state.clone(),
-                armed: std::sync::atomic::AtomicBool::new(true),
-            };
+            let (guard, _stop) = new_guard(&state);
             drop(guard);
         }
         // Let the spawned safety-net clear task run.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(state.handle.lock().await.is_none());
+    }
+
+    /// P2-1: a guard dropped while armed with a live worker sets the stop
+    /// flag, terminates the worker, and clears the slot ONLY after
+    /// termination — the slot can never be freed while a detached worker is
+    /// still alive (a bare JoinHandle drop would detach the task).
+    #[tokio::test]
+    async fn recording_guard_drop_with_live_worker_terminates_before_clearing() {
+        let state = Arc::new(RecordingState {
+            handle: Mutex::new(None),
+        });
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        acquire_recording(&state, fake_handle()).await.unwrap();
+
+        {
+            let mut guard = RecordingGuard::new(state.clone(), stop.clone());
+            let worker_stop = stop.clone();
+            let worker = tokio::spawn(async move {
+                // A worker that runs until the stop flag is set.
+                while !worker_stop.load(Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                "done"
+            });
+            guard.attach_worker(worker);
+            // Dropped while still armed — simulates panic/drop of the outer
+            // command before the worker completed.
+        }
+
+        // Give the drop-spawned cleanup task time to run.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert!(
+            stop.load(Ordering::SeqCst),
+            "drop must set the stop flag so the worker terminates"
+        );
+        assert!(
+            state.handle.lock().await.is_none(),
+            "slot must be cleared only after the worker terminated"
+        );
+    }
+
+    /// P2-1: take_result captures the worker's JoinHandle result exactly once.
+    #[tokio::test]
+    async fn recording_guard_take_result_captures_once() {
+        let state = Arc::new(RecordingState {
+            handle: Mutex::new(None),
+        });
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        acquire_recording(&state, fake_handle()).await.unwrap();
+        let mut guard = RecordingGuard::new(state.clone(), stop.clone());
+
+        let worker = tokio::spawn(async { 42 });
+        guard.attach_worker(worker);
+        guard.wait_worker().await;
+
+        let first = guard.take_result().await;
+        assert!(matches!(first, Some(Ok(42))));
+        // The result was captured exactly once — a second take is empty.
+        assert!(guard.take_result().await.is_none());
+
+        clear_active_recording(&state).await;
+        guard.disarm();
+    }
+
+    /// P2-1: abort_worker + await_worker (the timeout path's force-abort
+    /// sequence) fully resolves the worker lifecycle and consumes the handle.
+    #[tokio::test]
+    async fn recording_guard_abort_then_await_resolves_worker() {
+        let state = Arc::new(RecordingState {
+            handle: Mutex::new(None),
+        });
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        acquire_recording(&state, fake_handle()).await.unwrap();
+        let mut guard = RecordingGuard::new(state.clone(), stop.clone());
+
+        let worker_stop = stop.clone();
+        let worker = tokio::spawn(async move {
+            while !worker_stop.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            "done"
+        });
+        guard.attach_worker(worker);
+
+        guard.abort_worker();
+        guard.await_worker().await;
+        assert!(
+            guard.take_result().await.is_none(),
+            "aborted handle is consumed by await_worker"
+        );
+
+        clear_active_recording(&state).await;
+        guard.disarm();
     }
 
     /// Acquire rejects while a slot is held, mirroring the duplicate-round
@@ -853,10 +1128,7 @@ mod tests {
         });
         let handle = fake_handle();
         acquire_recording(&state, handle.clone()).await.unwrap();
-        let guard = RecordingGuard {
-            state: state.clone(),
-            armed: std::sync::atomic::AtomicBool::new(true),
-        };
+        let (guard, _stop) = new_guard(&state);
 
         // Request A's worker has completed but its DB transaction has NOT
         // committed yet (persistence window open — slot still held).

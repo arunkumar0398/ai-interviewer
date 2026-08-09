@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import DashboardPage from "../app/dashboard/page";
 
 const mockInvoke = vi.fn();
@@ -73,13 +73,15 @@ describe("Dashboard Page", () => {
     });
   });
 
-  it("renders Add button for questions", async () => {
+  it("does not render question editing controls (read-only bank)", async () => {
     mockInvoke.mockResolvedValue([]);
     render(<DashboardPage />);
 
     await waitFor(() => {
-      expect(screen.getByText("+ Add")).toBeInTheDocument();
+      expect(screen.getByText("Question Bank")).toBeInTheDocument();
     });
+    expect(screen.queryByText("+ Add")).not.toBeInTheDocument();
+    expect(screen.queryByPlaceholderText(/Question \d/)).not.toBeInTheDocument();
   });
 
   it("shows Start Interview button disabled initially", async () => {
@@ -121,7 +123,7 @@ describe("Dashboard Page", () => {
     });
   });
 
-  it("shows 5 default questions in the question bank", async () => {
+  it("shows 5 default questions read-only in the question bank", async () => {
     mockInvoke.mockResolvedValue([]);
     render(<DashboardPage />);
 
@@ -129,8 +131,61 @@ describe("Dashboard Page", () => {
       expect(screen.getByText("Question Bank")).toBeInTheDocument();
     });
 
-    // Check default questions are present as input values
-    const inputs = screen.getAllByPlaceholderText(/Question \d/);
-    expect(inputs.length).toBeGreaterThanOrEqual(5);
+    // Default questions are listed read-only.
+    for (const q of [
+      "Tell me about yourself and your background.",
+      "What is your experience with Rust or systems programming?",
+      "Describe a challenging technical problem you solved recently.",
+      "How do you approach debugging complex issues?",
+      "What interests you about this role?",
+    ]) {
+      expect(screen.getByText(q)).toBeInTheDocument();
+    }
+  });
+
+  it("hands the created session id and candidate name to /interview", async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_app_config") {
+        return Promise.resolve({
+          tool_dir: "/fake/tools",
+          recordings_dir: "/fake/recordings",
+          db_path: "/fake/interviewer.db",
+          is_portable: false,
+        });
+      }
+      if (cmd === "get_sessions") {
+        return Promise.resolve([]);
+      }
+      if (cmd === "create_session") {
+        return Promise.resolve();
+      }
+      return Promise.reject(new Error(`Unexpected command: ${cmd}`));
+    });
+
+    render(<DashboardPage />);
+
+    await waitFor(() => {
+      expect(screen.getByText("New Interview")).toBeInTheDocument();
+    });
+
+    fireEvent.change(screen.getByPlaceholderText("Enter candidate name"), {
+      target: { value: "Alice" },
+    });
+    fireEvent.click(screen.getByText("Start Interview"));
+
+    // Session created, then the handoff link carries id + name.
+    await waitFor(() => {
+      const link = screen.getByText("/interview").closest("a");
+      expect(link).toHaveAttribute(
+        "href",
+        expect.stringMatching(/^\/interview\?session=[0-9a-f-]+&name=Alice$/)
+      );
+    });
+    const createCall = mockInvoke.mock.calls.find(([cmd]) => cmd === "create_session");
+    expect(createCall).toBeDefined();
+    const args = createCall![1] as { sessionId: string; candidateName: string };
+    expect(args.candidateName).toBe("Alice");
+    const link = screen.getByText("/interview").closest("a");
+    expect(link!.getAttribute("href")).toContain(`session=${args.sessionId}`);
   });
 });
