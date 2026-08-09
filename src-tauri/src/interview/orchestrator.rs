@@ -43,6 +43,7 @@ pub struct AudioMetadata {
 /// automatically. `owns_wav` is defense-in-depth: a guard created for a path
 /// that pre-existed (e.g. a colliding round_id that `record_to_wav`
 /// rejected) must never delete that pre-existing committed evidence.
+#[derive(Debug)]
 pub struct UnpersistedAudio {
     wav_path: std::path::PathBuf,
     owns_wav: bool,
@@ -94,11 +95,39 @@ fn sha256_file(path: &Path) -> anyhow::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// Post-capture transition (RC-5): given a SUCCESSFUL capture result, arm the
+/// provisional evidence guard, then check the stop flag. This exactly models
+/// the real orchestration ordering:
+///
+///   capture succeeds -> guard armed -> stop flag checked
+///   -> if stopped: bail cancels the round and the dropped guard removes the WAV
+///   -> if not stopped: Ok(guard) for the caller to commit after persistence
+///
+/// A stopped round never leaves an orphan final WAV (the guard removes it on
+/// drop), and a pre-existing committed WAV is never touched (the guard was
+/// created for a path `record_to_wav` rejected before recording — the
+/// pre-existing collision path never reaches this function).
+pub(crate) fn handoff_captured_evidence(
+    wav_path: std::path::PathBuf,
+    stop_flag: &std::sync::atomic::AtomicBool,
+) -> anyhow::Result<UnpersistedAudio> {
+    let provisional = UnpersistedAudio::new(wav_path);
+    if stop_flag.load(std::sync::atomic::Ordering::SeqCst) {
+        anyhow::bail!("Interview stopped during recording");
+    }
+    Ok(provisional)
+}
+
 /// Orchestrate a half-duplex interview round.
 /// Returns (audio_metadata, transcription_text, unpersisted_audio) on
 /// success. The `UnpersistedAudio` guard stays ARMED: the caller must commit
 /// it only after the round's DB transaction commits. Full-round timeout and
 /// grace-period enforcement live in lib.rs.
+/// `completion` is the microphone-capture lifecycle signal; `output_completion`
+/// is the PRODUCTION TTS playback lifecycle signal (RC-1) — forwarded to
+/// `PiperSupervisor::speak` so the shared audio slot stays occupied until the
+/// physical question playback has fully exited, not just until the outer
+/// worker returns.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_interview_round(
     question: &str,
@@ -110,6 +139,7 @@ pub async fn run_interview_round(
     stop_flag: Arc<AtomicBool>,
     phase_tx: Option<mpsc::Sender<InterviewPhase>>,
     completion: CaptureCompletion,
+    output_completion: CaptureCompletion,
 ) -> anyhow::Result<(AudioMetadata, String, UnpersistedAudio)> {
     let piper = PiperSupervisor::new(paths)?;
 
@@ -124,7 +154,12 @@ pub async fn run_interview_round(
     });
 
     piper
-        .speak(question, tts_event_tx.clone(), stop_flag.clone())
+        .speak(
+            question,
+            tts_event_tx.clone(),
+            stop_flag.clone(),
+            output_completion,
+        )
         .await?;
 
     if stop_flag.load(Ordering::SeqCst) {
@@ -201,23 +236,11 @@ pub async fn run_interview_round(
         }
     };
 
-    // RC-1: the outer provisional evidence guard is armed immediately after
-    // capture SUCCEEDS — BEFORE any post-capture cancellation check. When
-    // the user clicks Stop Round during recording, the capture exits
-    // normally (auto-stop observed the main stop flag) and renamed its temp
-    // to the final WAV; without the guard the round would return stopped
-    // while leaving an orphan final WAV with no DB round. The guard owns
-    // only THIS invocation's newly-created file (record_to_wav rejected any
-    // pre-existing final, so the path cannot have pre-existed), so dropping
-    // it on the stop/checksum/transcription/DB failure paths removes only
-    // this invocation's evidence. It must NOT be armed before
-    // record_to_wav() — that would let a rejected collision delete a
-    // pre-existing committed WAV on unwind.
-    let provisional = UnpersistedAudio::new(record_result.file_path.clone());
-
-    if stop_flag.load(Ordering::SeqCst) {
-        anyhow::bail!("Interview stopped during recording");
-    }
+    // RC-5: the post-capture transition is extracted as a testable seam.
+    // Must run immediately after capture SUCCEEDS and BEFORE any later work:
+    // arm the provisional guard, then check the stop flag. A stopped round
+    // drops the armed guard on bail, removing only this invocation's WAV.
+    let provisional = handoff_captured_evidence(record_result.file_path.clone(), &stop_flag)?;
 
     // Phase 4: Compute audio metadata and checksum from RecordResult
     let sha256 = sha256_file(&record_result.file_path)?;
@@ -466,6 +489,67 @@ mod tests {
         // Persistence fails -> guard dropped pre-commit -> WAV removed.
         drop(guard);
         assert!(!wav.exists(), "pre-commit failure must delete the WAV");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RC-5 stop-round orchestration regression: successful capture result →
+    /// guard creation → stop flag true → bail removes the newly-created WAV.
+    /// This exercises the exact ordering the real orchestrator uses.
+    #[test]
+    fn handoff_captured_evidence_stop_removes_wav() {
+        let dir = std::env::temp_dir().join("handoff_captured_evidence_stop_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let wav = dir.join("round.wav");
+        std::fs::write(&wav, b"captured-audio").unwrap();
+
+        let stop = std::sync::atomic::AtomicBool::new(true);
+        let result = handoff_captured_evidence(wav.clone(), &stop);
+
+        assert!(result.is_err(), "stop flag true must produce Err");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("stopped during recording"),
+            "error must describe the stop, got: {}",
+            err
+        );
+        assert!(
+            !wav.exists(),
+            "newly-created WAV must be removed by guard drop on stop"
+        );
+        assert!(
+            !wav.with_extension("wav.tmp").exists(),
+            "no stale temp may remain after a stopped round"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RC-5 positive path: stop flag false → Ok(guard) returned. The guard
+    /// is armed (no commit), so dropping it removes the WAV.
+    #[test]
+    fn handoff_captured_evidence_ok_guard_drops_wav() {
+        let dir = std::env::temp_dir().join("handoff_captured_evidence_ok_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let wav = dir.join("round.wav");
+        std::fs::write(&wav, b"captured-audio").unwrap();
+
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let result = handoff_captured_evidence(wav.clone(), &stop);
+
+        assert!(result.is_ok(), "stop flag false must produce Ok");
+        assert!(
+            wav.exists(),
+            "WAV must survive the handoff before guard drop"
+        );
+
+        // Drop the guard without commit → WAV removed (provisional still armed).
+        drop(result.unwrap());
+        assert!(!wav.exists(), "uncommitted guard drop must remove the WAV");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

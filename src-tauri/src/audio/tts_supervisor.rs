@@ -1,3 +1,4 @@
+use crate::audio::capture::{BlockingLifecycle, CaptureCompletion};
 use crate::audio::pipe::{terminate_child, StderrDrain};
 use crate::audio::playback::{
     await_playback, pcm_bytes_to_samples, PlaybackOutcome, PLAYBACK_TIMEOUT_SECS,
@@ -67,11 +68,18 @@ impl PiperSupervisor {
     /// Acquires the global TTS semaphore to ensure only one Piper runs at a time.
     /// Spawns a new Piper process per call (simple, reliable).
     /// Kills the child process immediately when stop_flag is set or timeout fires.
+    /// `output_completion` is the PRODUCTION playback lifecycle signal (RC-1):
+    /// it is marked Scheduled immediately before the physical output worker is
+    /// submitted and signalled Finished when that worker has fully exited, so
+    /// the shared audio slot stays occupied until the real Piper question
+    /// playback has physically ended — even if the owning command is dropped
+    /// or aborted while the blocking output is inside native audio calls.
     pub async fn speak(
         &self,
         text: &str,
         event_tx: mpsc::Sender<TtsEvent>,
         stop_flag: Arc<AtomicBool>,
+        output_completion: CaptureCompletion,
     ) -> anyhow::Result<()> {
         if text.trim().is_empty() {
             return Ok(());
@@ -213,14 +221,19 @@ impl PiperSupervisor {
                         // Play the collected PCM data. A playback failure must
                         // surface as an error: the candidate did not actually
                         // hear the question, so the round must not continue.
-                        let outcome = play_raw_pcm_async(&pcm_data, sample_rate, stop_flag.clone())
-                            .await
-                            .map_err(|e| {
-                                let _ = event_tx.try_send(TtsEvent::Error {
-                                    message: format!("Playback failed: {}", e),
-                                });
-                                anyhow::anyhow!("Playback failed: {}", e)
-                            })?;
+                        let outcome = play_raw_pcm_async(
+                            &pcm_data,
+                            sample_rate,
+                            stop_flag.clone(),
+                            output_completion.clone(),
+                        )
+                        .await
+                        .map_err(|e| {
+                            let _ = event_tx.try_send(TtsEvent::Error {
+                                message: format!("Playback failed: {}", e),
+                            });
+                            anyhow::anyhow!("Playback failed: {}", e)
+                        })?;
                         // P2-4: Finished is only truthful after ACTUAL playback
                         // completion. A stop during playback is Cancelled — the
                         // orchestrator observes the stop flag and aborts the
@@ -291,21 +304,42 @@ impl PiperSupervisor {
 /// report Finished after actual playback completion (P2-4).
 /// Moves the entire cpal Stream lifecycle into spawn_blocking so the
 /// !Send Stream never crosses an async await point.
+///
+/// Lifecycle ownership (RC-1): `output_completion` is the PRODUCTION
+/// playback lifecycle signal — `mark_scheduled()` runs immediately BEFORE
+/// `spawn_blocking` (no await in between) and the closure signals Finished
+/// on EVERY exit path. The shared audio slot therefore stays occupied until
+/// the physical output worker has fully terminated, even when the outer
+/// interview worker is dropped/aborted while the blocking output is inside
+/// native calls (`default_output_device()`, `build_output_stream()`,
+/// `stream.play()`) that cannot be force-cancelled.
 async fn play_raw_pcm_async(
     pcm_data: &[u8],
     sample_rate: u32,
     stop_flag: Arc<AtomicBool>,
+    output_completion: CaptureCompletion,
 ) -> anyhow::Result<PlaybackOutcome> {
     // Reject empty/malformed PCM BEFORE any device work (P1-3): Piper exiting
     // 0 with zero audio must never be reported as successfully spoken — the
     // candidate heard nothing, so the round must fail, not proceed.
     let samples = pcm_bytes_to_samples(pcm_data)?;
 
+    // RC-1: the production playback becomes `Scheduled` BEFORE spawn_blocking
+    // is submitted, with no await in between — a blocking output worker queued
+    // on a busy pool still owns the audio slot, so the slot can never be freed
+    // while a physical output might start later.
+    output_completion.mark_scheduled();
+
     // Move the entire cpal Stream lifecycle into spawn_blocking so the
     // !Send Stream never crosses an async await point.
     let stop_flag_clone = stop_flag.clone();
     tokio::task::spawn_blocking(move || -> anyhow::Result<PlaybackOutcome> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+        // RC-1: signal the physical output lifecycle on EVERY exit path
+        // (success, `?`, bail, panic) — the slot owner waits on this before
+        // releasing the shared audio slot.
+        let _lifecycle = BlockingLifecycle(output_completion.clone());
 
         let host = cpal::default_host();
         let device = host

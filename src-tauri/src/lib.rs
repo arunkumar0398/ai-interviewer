@@ -267,10 +267,15 @@ impl<T: Send + 'static> Drop for RecordingGuard<T> {
     }
 }
 
-/// Maximum duration a raw `start_recording` command may run. The UI no longer
-/// uses this command (the Home audio test is bounded + temp via
-/// `run_audio_test`), but as a public command it must still be hard-bounded:
-/// it auto-stops after this budget even if nothing ever calls stop_recording.
+/// Maximum intended recording-duration bound for `start_recording`. The stop
+/// timer sets the stop flag after this budget and then waits for the actual
+/// capture worker to exit. If a native device call itself blocks
+/// (`default_input_device()`, `build_input_stream()`, `stream.play()`), the
+/// backend retains the audio slot until the physical worker exits rather than
+/// detaching it — the slot invariant (Scheduled -> no slot reuse) is the real
+/// backstop, not the wall clock. The UI no longer uses this command (the Home
+/// audio test is bounded + temp via `run_audio_test`), but as a public command
+/// it must still self-terminate.
 const START_RECORDING_MAX_SECS: u64 = 60;
 
 #[tauri::command]
@@ -314,9 +319,10 @@ async fn start_recording(
     recording_guard.attach_worker(worker);
     drop(tx);
 
-    // Hard wall-clock bound (P1-2): auto-stop after START_RECORDING_MAX_SECS
-    // even if the UI never calls stop_recording — the command cannot run
-    // forever with a backend microphone handle open.
+    // Recording-duration bound (RC-4): auto-stop after
+    // START_RECORDING_MAX_SECS even if the UI never calls stop_recording.
+    // If a native device call blocks, the audio slot stays occupied until
+    // the physical worker exits rather than detaching it.
     let max_stop = stop_flag.clone();
     let timer = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(START_RECORDING_MAX_SECS)).await;
@@ -352,9 +358,10 @@ struct AudioTestResult {
 }
 
 /// Bounded, self-cleaning microphone test (P1-2). Records to the TEMP
-/// directory (never the persistent recordings/ tree), auto-stops after a hard
-/// 10s wall-clock bound, and DELETES the WAV before returning. The Home page
-/// Audio Test uses this instead of `start_recording`, so a test can never
+/// directory (never the persistent recordings/ tree), auto-stops after 10s
+/// (bounds normal recording duration), and DELETES the WAV before returning.
+/// The Home page Audio Test uses this instead of `start_recording`, so a test
+/// can never
 /// create orphan persistent recordings and can never leave a backend
 /// microphone operation running unbounded.
 #[tauri::command]
@@ -388,8 +395,10 @@ async fn run_audio_test(
     });
     recording_guard.attach_worker(worker);
 
-    // Hard wall-clock bound: the test auto-stops after AUDIO_TEST_MAX_SECS
-    // even if the UI never calls stop_recording.
+    // Recording-duration bound (RC-4): the test auto-stops after
+    // AUDIO_TEST_MAX_SECS even if the UI never calls stop_recording. If a
+    // native device call blocks, the audio slot stays occupied until the
+    // physical worker exits rather than detaching it.
     const AUDIO_TEST_MAX_SECS: u64 = 10;
     let max_stop = stop_flag.clone();
     let timer = tokio::spawn(async move {
@@ -431,52 +440,6 @@ async fn stop_recording(state: State<'_, Arc<RecordingState>>) -> Result<String,
         }
         None => Err("No active recording".to_string()),
     }
-}
-
-#[tauri::command]
-async fn play_round_audio(
-    session_id: uuid::Uuid,
-    round_id: uuid::Uuid,
-    paths: State<'_, PathsState>,
-) -> Result<String, String> {
-    let file_path = paths.paths.round_audio_path(session_id, round_id);
-
-    if !file_path.exists() {
-        return Err(format!(
-            "No recording found for session {} round {}",
-            session_id, round_id
-        ));
-    }
-
-    let (tx, mut rx) = mpsc::channel(32);
-    let worker_tx = tx.clone();
-    let path = file_path;
-
-    let worker =
-        tokio::spawn(async move { audio::playback::play_wav(path, worker_tx, None).await });
-    drop(tx);
-
-    let join_result = worker.await;
-    join_result
-        .map_err(|e| format!("Playback worker failed: {}", e))?
-        .map_err(|e| e.to_string())?;
-
-    while let Some(event) = rx.recv().await {
-        match event {
-            audio::playback::PlaybackEvent::Completed => {
-                return Ok("Playback completed".to_string());
-            }
-            audio::playback::PlaybackEvent::Cancelled => {
-                return Ok("Playback cancelled".to_string());
-            }
-            audio::playback::PlaybackEvent::Error { message } => {
-                return Err(message);
-            }
-            _ => continue,
-        }
-    }
-
-    Ok("Playback completed".to_string())
 }
 
 #[tauri::command]
@@ -798,9 +761,14 @@ async fn run_interview_round(
         }
     });
 
-    // Spawn worker; guaranteed cleanup on all paths
+    // Spawn worker; guaranteed cleanup on all paths. The PRODUCTION TTS
+    // playback lifecycle (RC-1) is owned by the guard's output completion:
+    // the worker forwards it through the orchestrator into the physical
+    // Piper question-playback worker, so the shared audio slot stays
+    // occupied until that worker has fully exited.
     let question_clone = question.clone();
     let completion = recording_guard.completion();
+    let output_completion = recording_guard.output_completion();
     let worker = tokio::spawn(async move {
         interview::orchestrator::run_interview_round(
             &question_clone,
@@ -812,6 +780,7 @@ async fn run_interview_round(
             stop_clone,
             Some(phase_tx),
             completion,
+            output_completion,
         )
         .await
     });
@@ -984,10 +953,21 @@ async fn run_interview_round(
         // removed: a late `.wav.tmp -> .wav` rename after this command
         // returned would resurrect an orphan final WAV with no DB round.
         let completion = recording_guard.completion();
+        // RC-1: the same holds for the PRODUCTION TTS playback worker — it
+        // runs in its own spawn_blocking inside the outer worker, so an
+        // abort of the outer task cannot kill an output closure that is
+        // inside native audio calls. If its lifecycle is still Scheduled,
+        // the shared audio slot must stay occupied until it signals
+        // Finished, regardless of whether the outer worker exited
+        // cooperatively or was force-aborted (a graceful exit awaits the
+        // closure, so Scheduled here means the closure is genuinely still
+        // alive).
+        let output_completion = recording_guard.output_completion();
         // A worker that exited cooperatively finished its capture; a capture
         // that Finished or was never Scheduled has nothing left to run. Only
         // Scheduled-but-not-Finished can still do physical work.
         let capture_pending = !graceful && completion.scheduled();
+        let output_pending = output_completion.scheduled();
 
         let defer_cleanup = if capture_pending {
             // Bounded wait for the physical capture to terminate
@@ -1034,6 +1014,22 @@ async fn run_interview_round(
                     cleanup_state,
                 )
                 .await;
+            });
+            recording_guard.disarm();
+        } else if output_pending {
+            // RC-1: the PRODUCTION question playback may still be physically
+            // alive after the outer worker was aborted — the blocking output
+            // closure is not killed by an async abort. The round never
+            // reached the capture phase (playback precedes recording), so
+            // there are no round artifacts to clean. Wait for the physical
+            // output worker to fully exit, then release the slot: the slot
+            // is never freed while production TTS playback may still be
+            // running (the invariant `Scheduled -> slot MUST stay occupied`
+            // holds across the outer-wrapper abort).
+            let output_state = state.inner().clone();
+            tokio::spawn(async move {
+                output_completion.wait().await;
+                clear_active_recording(&output_state).await;
             });
             recording_guard.disarm();
         } else {
@@ -1294,7 +1290,6 @@ pub fn run() {
             start_recording,
             stop_recording,
             run_audio_test,
-            play_round_audio,
             generate_tts,
             list_audio_devices,
             check_audio_devices,
@@ -1459,7 +1454,7 @@ mod tests {
                             std::thread::sleep(std::time::Duration::from_millis(2));
                         }
                         // Blocking worker fully terminated — signal completion,
-                        // exactly like BlockingCaptureLifecycle.
+                        // exactly like BlockingLifecycle.
                         completion.signal();
                     });
                     let _ = blocking.await;
@@ -2146,6 +2141,290 @@ mod tests {
         assert_eq!(output_completion_for_test.state(), CaptureState::Finished);
 
         // Reusable.
+        acquire_recording(&state, fake_handle()).await.unwrap();
+        assert!(state.handle.lock().await.is_some());
+    }
+
+    // ------------------------------------------------------------------
+    // RC-1: PRODUCTION interview TTS playback is owned by
+    // RecordingGuard.output_completion — the real Piper question-playback
+    // worker (play_raw_pcm_async's spawn_blocking) marks the output
+    // lifecycle Scheduled before submission and signals Finished on every
+    // exit. These tests model that worker through the guard's output
+    // completion: the shared audio slot must stay occupied while it is
+    // Scheduled, and become reusable only after Finished.
+    // ------------------------------------------------------------------
+
+    /// RC-1 Test A — production output scheduled but not started: the
+    /// interview worker has submitted the production TTS blocking output
+    /// (Scheduled) but the closure is gated before actual execution. The
+    /// owning command is then dropped. The slot must remain occupied, a
+    /// second acquire must fail, and force-aborting the outer wrapper must
+    /// NOT free the slot; only when the blocking output worker finally runs
+    /// to termination and signals Finished does the slot clear.
+    #[tokio::test]
+    async fn recording_guard_drop_waits_for_production_tts_output_scheduled_but_not_started() {
+        let state = Arc::new(RecordingState {
+            handle: Mutex::new(None),
+        });
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The production output closure cannot BEGIN executing (and therefore
+        // cannot signal Finished) until the test opens the gate.
+        let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let began = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        acquire_recording(&state, fake_handle()).await.unwrap();
+
+        let output_completion_for_test;
+        {
+            let mut guard = RecordingGuard::new(state.clone(), stop.clone());
+            guard.drop_grace = std::time::Duration::from_millis(150);
+            let output_completion = guard.output_completion();
+            output_completion_for_test = output_completion.clone();
+            let worker = {
+                let blocking_stop = stop.clone();
+                let blocking_gate = gate.clone();
+                let blocking_began = began.clone();
+                let output_completion = output_completion.clone();
+                tokio::spawn(async move {
+                    // The interview worker starts the PRODUCTION TTS playback:
+                    // play_raw_pcm_async marks Scheduled BEFORE spawn_blocking
+                    // (RC-1), with no await in between.
+                    output_completion.mark_scheduled();
+                    let playback = tokio::task::spawn_blocking(move || {
+                        // Simulate a queued output worker: it may not begin
+                        // (and cannot signal Finished) until the gate opens.
+                        while !blocking_gate.load(Ordering::SeqCst) {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        blocking_began.store(true, Ordering::SeqCst);
+                        while !blocking_stop.load(Ordering::SeqCst) {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        // Physical output worker fully exited — signal
+                        // Finished, exactly like BlockingLifecycle.
+                        output_completion.signal();
+                    });
+                    let _ = playback.await;
+                })
+            };
+            guard.attach_worker(worker);
+
+            // Wait until the production output is EXPLICITLY Scheduled
+            // (submitted but closure not started) before dropping — the
+            // state this regression targets.
+            let mut scheduled = false;
+            for _ in 0..200 {
+                if output_completion_for_test.state() == CaptureState::Scheduled {
+                    scheduled = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert!(
+                scheduled,
+                "production output must reach Scheduled before drop"
+            );
+            // Dropped while armed — the owning interview command is dropped/
+            // panics while production playback is scheduled-but-not-started.
+        }
+
+        // Grace (150ms) expired, the outer wrapper was force-aborted and
+        // awaited; the production output closure is STILL gated (never began,
+        // never signalled Finished) -> the slot must remain occupied and a
+        // second acquire must fail. The outer wrapper abort proves nothing
+        // about the physical output worker.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(
+            !began.load(Ordering::SeqCst),
+            "output closure must still be gated while the slot is held"
+        );
+        assert!(
+            state.handle.lock().await.is_some(),
+            "slot must stay occupied while production output is unresolved"
+        );
+        let second = acquire_recording(&state, fake_handle()).await;
+        assert!(
+            second.is_err() && second.unwrap_err().contains("already active"),
+            "second acquire must fail while production output is unresolved"
+        );
+
+        // Open the gate: the output worker begins, observes stop, terminates,
+        // and signals Finished. ONLY then may the slot clear.
+        gate.store(true, Ordering::SeqCst);
+        let mut cleared = false;
+        for _ in 0..300 {
+            if state.handle.lock().await.is_none() {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            cleared,
+            "slot must clear only after the production output physically ends"
+        );
+        assert_eq!(output_completion_for_test.state(), CaptureState::Finished);
+
+        // Reusable.
+        acquire_recording(&state, fake_handle()).await.unwrap();
+        assert!(state.handle.lock().await.is_some());
+    }
+
+    /// RC-1 Test B — production output running during owner cancellation:
+    /// the output worker HAS begun (stream running) when the owner is
+    /// dropped, the stop flag is set, and the physical output worker stays
+    /// alive for a controlled delay before exiting. The slot must remain
+    /// occupied until the physical output finishes, and become reusable only
+    /// after output_completion == Finished.
+    #[tokio::test]
+    async fn recording_guard_drop_holds_slot_until_production_tts_output_finishes() {
+        let state = Arc::new(RecordingState {
+            handle: Mutex::new(None),
+        });
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The output worker runs (began) but stays alive a controlled delay
+        // after observing stop before it terminates (e.g. stuck in a native
+        // device call or a slow teardown).
+        let began = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        acquire_recording(&state, fake_handle()).await.unwrap();
+
+        let output_completion_for_test;
+        {
+            let mut guard = RecordingGuard::new(state.clone(), stop.clone());
+            guard.drop_grace = std::time::Duration::from_millis(150);
+            let output_completion = guard.output_completion();
+            output_completion_for_test = output_completion.clone();
+            let worker = {
+                let blocking_stop = stop.clone();
+                let blocking_began = began.clone();
+                let blocking_release = release.clone();
+                let output_completion = output_completion.clone();
+                tokio::spawn(async move {
+                    output_completion.mark_scheduled();
+                    let playback = tokio::task::spawn_blocking(move || {
+                        // The output worker is RUNNING (stream playing).
+                        blocking_began.store(true, Ordering::SeqCst);
+                        while !blocking_stop.load(Ordering::SeqCst) {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        // Stop observed, but the physical output remains
+                        // alive for a controlled delay.
+                        while !blocking_release.load(Ordering::SeqCst) {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        output_completion.signal();
+                    });
+                    let _ = playback.await;
+                })
+            };
+            guard.attach_worker(worker);
+
+            // Wait until the output worker is actually RUNNING before the
+            // owner is dropped.
+            let mut running = false;
+            for _ in 0..200 {
+                if began.load(Ordering::SeqCst) {
+                    running = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert!(running, "production output worker must be running");
+            // Owner dropped while the output stream is running.
+        }
+
+        // Drop set stop; the running output worker observed it but is still
+        // alive (controlled delay). The grace expired, the outer wrapper was
+        // aborted/awaited — the slot must STILL be occupied and a second
+        // acquire must fail, because the physical output has not finished.
+        assert!(stop.load(Ordering::SeqCst), "drop must set the stop flag");
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(
+            state.handle.lock().await.is_some(),
+            "slot must stay occupied while production output is still running"
+        );
+        let second = acquire_recording(&state, fake_handle()).await;
+        assert!(
+            second.is_err() && second.unwrap_err().contains("already active"),
+            "second acquire must fail while production output is alive"
+        );
+
+        // Release the physical output worker -> it terminates -> signals
+        // Finished -> the slot clears ONLY then and is reusable.
+        release.store(true, Ordering::SeqCst);
+        let mut cleared = false;
+        for _ in 0..300 {
+            if state.handle.lock().await.is_none() {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            cleared,
+            "slot must clear only after output_completion == Finished"
+        );
+        assert_eq!(output_completion_for_test.state(), CaptureState::Finished);
+
+        // Reusable only now.
+        acquire_recording(&state, fake_handle()).await.unwrap();
+        assert!(state.handle.lock().await.is_some());
+    }
+
+    /// RC-1 Test C — production TTS exits normally: the output worker runs
+    /// to completion and signals Finished; the normal interview path (explicit
+    /// slot clear + guard disarm after the worker resolves) proceeds with no
+    /// slot leak — the guard's Drop safety net does not re-clear or wait on a
+    /// stale completion.
+    #[tokio::test]
+    async fn production_tts_output_completion_normal_exit_no_slot_leak() {
+        let state = Arc::new(RecordingState {
+            handle: Mutex::new(None),
+        });
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        acquire_recording(&state, fake_handle()).await.unwrap();
+
+        let output_completion_for_test;
+        {
+            let mut guard = RecordingGuard::new(state.clone(), stop.clone());
+            let output_completion = guard.output_completion();
+            output_completion_for_test = output_completion.clone();
+            let worker = {
+                let output_completion = output_completion.clone();
+                tokio::spawn(async move {
+                    // Production playback path: Scheduled before spawn_blocking
+                    // (RC-1), then the physical output runs to completion.
+                    output_completion.mark_scheduled();
+                    let playback = tokio::task::spawn_blocking(move || {
+                        // Physical playback completes normally.
+                        output_completion.signal();
+                    });
+                    let _ = playback.await;
+                })
+            };
+            guard.attach_worker(worker);
+
+            // The worker resolves; the output reached Finished. Normal
+            // completion path: take the result, clear the slot, disarm.
+            guard.wait_worker().await;
+            let _ = guard.take_result().await;
+            clear_active_recording(&state).await;
+            guard.disarm();
+            // Dropped disarmed — the safety net must not re-clear or wait.
+        }
+
+        assert_eq!(
+            output_completion_for_test.state(),
+            CaptureState::Finished,
+            "normal production TTS exit must reach Finished"
+        );
+        assert!(
+            state.handle.lock().await.is_none(),
+            "slot must be free after the normal path — no leak"
+        );
+
+        // Reusable immediately.
         acquire_recording(&state, fake_handle()).await.unwrap();
         assert!(state.handle.lock().await.is_some());
     }

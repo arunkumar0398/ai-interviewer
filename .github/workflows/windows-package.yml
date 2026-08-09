@@ -146,13 +146,16 @@ jobs:
           }
           Write-Host "Portable artifact validated"
 
-      # Model-license policy (RC-7): Policy A — the unresolved Piper voice
-      # model may be packaged into the portable ZIP and uploaded as a private
-      # GitHub Actions artifact (CI storage, retention 7 days, not publicly
-      # linkable), but the PUBLIC GitHub Release upload is gated by the
-      # RELEASE BLOCKER check in the `release` job below. If project policy
-      # changes to "no redistribution at all while unresolved" (Policy B),
-      # the license gate must run BEFORE this upload step instead.
+      # Model-license policy (Policy A): the unresolved Piper voice model may
+      # be packaged into the portable ZIP and uploaded as a GitHub Actions
+      # artifact (retention 7 days). NOTE: this repository is PUBLIC, so the
+      # artifact is downloadable by anyone who can access the repository -
+      # Actions artifacts are not a privacy boundary for a distributable
+      # build. The artifact is intentionally permitted under Policy A; the
+      # PUBLIC GitHub Release upload remains gated by the RELEASE BLOCKER
+      # check in the `release` job below. If project policy changes to "no
+      # redistribution at all while unresolved" (Policy B), the license gate
+      # must run BEFORE this upload step instead.
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -175,8 +178,10 @@ jobs:
 
       # Policy A (documented at the build job's Upload artifact step): public
       # GitHub Releases are prohibited while the model carries RELEASE
-      # BLOCKER; private Actions artifacts remain permitted. This gate must
-      # not be weakened.
+      # BLOCKER. Actions artifacts (retention 7 days) are intentionally
+      # permitted under Policy A even though this public repo's artifacts are
+      # downloadable - the artifact is a CI build, not a release distribution
+      # channel. This gate must not be weakened.
       - name: Release gate — voice-model licensing must be resolved
         shell: pwsh
         run: |

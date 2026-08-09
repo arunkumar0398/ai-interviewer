@@ -129,11 +129,14 @@ impl CaptureCompletion {
     }
 }
 
-/// Drop guard inside the blocking capture closure: signals `CaptureCompletion`
-/// on EVERY exit path (success, `?`, bail, panic).
-struct BlockingCaptureLifecycle(CaptureCompletion);
+/// Drop guard inside ANY physical blocking audio closure (input capture OR
+/// output playback/probe): signals `CaptureCompletion` on EVERY exit path
+/// (success, `?`, bail, panic). The slot owner waits on the completion before
+/// releasing the shared audio slot, so a stuck native call can never free the
+/// slot while the physical worker may still be alive (RC-1/RC-2).
+pub(crate) struct BlockingLifecycle(pub(crate) CaptureCompletion);
 
-impl Drop for BlockingCaptureLifecycle {
+impl Drop for BlockingLifecycle {
     fn drop(&mut self) {
         self.0.signal();
     }
@@ -386,7 +389,7 @@ pub async fn record_to_wav(
 
         // P1-1: the physical capture lifecycle is signalled on every exit
         // path — slot owners wait on `completion` before releasing the slot.
-        let _lifecycle = BlockingCaptureLifecycle(completion.clone());
+        let _lifecycle = BlockingLifecycle(completion.clone());
 
         // Stale partial from a previous crashed run: remove it explicitly as
         // stale so this invocation starts clean (also when a final WAV
@@ -633,7 +636,7 @@ pub async fn validate_production_playback_stream(
 
         // Signal Finished on EVERY exit path (success, ?, bail, panic) —
         // the slot owner waits on this before releasing the slot.
-        let _lifecycle = BlockingCaptureLifecycle(completion.clone());
+        let _lifecycle = BlockingLifecycle(completion.clone());
 
         let host = cpal::default_host();
         let device = host
@@ -722,10 +725,11 @@ pub async fn validate_production_playback_stream(
 
 /// Record a short audio clip for device verification (3 seconds max).
 /// Returns the path to the recorded temp file.
-/// The capture is bounded by BOTH the expected sample count AND a hard
-/// wall-clock deadline (duration + 2s): if the stream starts but delivers no
-/// frames, the check terminates with an explicit timeout error instead of
-/// looping forever.
+/// The capture polling loop enforces a deadline (duration + 2s) so the check
+/// terminates instead of looping forever if the stream delivers no frames.
+/// If a native device call itself blocks before the loop (`default_input_device()`,
+/// `build_input_stream()`, `stream.play()`), the backend retains the audio slot
+/// until the physical worker exits rather than detaching it (RC-4).
 pub async fn record_test_clip(
     sample_rate: u32,
     channels: u16,
@@ -748,7 +752,7 @@ pub async fn record_test_clip(
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
         // P1-1: signal the physical capture lifecycle on every exit path.
-        let _lifecycle = BlockingCaptureLifecycle(completion.clone());
+        let _lifecycle = BlockingLifecycle(completion.clone());
 
         let host = cpal::default_host();
         let device = host

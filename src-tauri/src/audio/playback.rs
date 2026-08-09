@@ -1,11 +1,10 @@
 use crate::audio::pipe::StderrDrain;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
-
 /// Piper outputs raw PCM at 22050 Hz mono — tied to the en_US-amy-medium model
 pub(crate) const PIPER_SAMPLE_RATE: u32 = 22050;
 
@@ -227,11 +226,11 @@ pub async fn play_wav(
 /// The child process owner enforces timeout, kill, wait/reap, and partial
 /// output cleanup directly. Any outer timeout is only defense-in-depth.
 /// Internal RAII cleanup for standalone TTS (RC-6): owns the provisional
-/// `.wav.tmp` THIS invocation writes. The temp is removed on EVERY failure
-/// path; on success it is atomically renamed to the final path and the guard
-/// is disarmed. The FINAL path is never touched by cleanup — a pre-existing
-/// WAV (rejected up front) can never be overwritten or deleted by a failed
-/// or colliding generation.
+/// unique `.<uuid>.wav.tmp` THIS invocation writes. The temp is removed on
+/// EVERY failure path; on success it is atomically claimed via
+/// `finalize_tts_output` (RC-3) and the guard is disarmed. The FINAL path is
+/// never touched by cleanup — a pre-existing WAV (rejected up front) can
+/// never be overwritten or deleted by a failed or colliding generation.
 struct TtsTempGuard {
     temp_path: PathBuf,
     armed: bool,
@@ -258,6 +257,29 @@ impl Drop for TtsTempGuard {
     }
 }
 
+/// Atomic no-overwrite finalization for standalone TTS (RC-3). Creates a
+/// hard link from the completed temp to the final path — this is atomic on
+/// all platforms (fails atomically if the final already exists). Only one
+/// concurrent same-request_id invocation can claim the final; the loser
+/// observes AlreadyExists and reports the collision. The temp is unlinked on
+/// success (the hard link carries the content) and the caller may disarm its
+/// guard. On failure, the temp is NOT removed here (the caller's guard owns
+/// it).
+pub(crate) fn finalize_tts_output(temp_path: &Path, output_path: &Path) -> anyhow::Result<()> {
+    match std::fs::hard_link(temp_path, output_path) {
+        Ok(()) => {
+            // The final path now references the same content as temp. Unlink
+            // the temp — the hard link carries the WAV content.
+            let _ = std::fs::remove_file(temp_path);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            anyhow::bail!("TTS output already exists: {}", output_path.display());
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub async fn generate_tts(
     text: &str,
     output_path: PathBuf,
@@ -265,17 +287,24 @@ pub async fn generate_tts(
     model_path: Option<&str>,
 ) -> anyhow::Result<()> {
     // RC-6: a pre-existing final WAV is evidence — never overwrite or delete
-    // it. Reject BEFORE spawning any process or writing anything.
+    // it. Reject BEFORE spawning any process or writing anything. This is the
+    // fast pre-check; the atomic hard-link claim below is the race-proof
+    // backstop.
     if output_path.exists() {
         anyhow::bail!("TTS output already exists: {}", output_path.display());
     }
-    // Stale temp policy: a leftover `.wav.tmp` from a crashed run is removed
-    // explicitly as stale (it is by definition uncommitted and cannot be
-    // evidence). Everything after this point is owned by THIS invocation.
-    let temp_path = output_path.with_extension("wav.tmp");
-    if temp_path.exists() {
-        let _ = std::fs::remove_file(&temp_path);
-    }
+    // RC-3: UNIQUE invocation-specific temp path — never a shared path that
+    // a concurrent same-ID call could target. The UUID guarantees isolation
+    // so one invocation can never delete another's active provisional file.
+    let stem = output_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("tts");
+    let invocation = uuid::Uuid::new_v4();
+    let temp_path = output_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join(format!("{}.{}.wav.tmp", stem, invocation));
     let mut temp_guard = TtsTempGuard::new(temp_path.clone());
 
     let piper = piper_binary.unwrap_or("piper");
@@ -409,7 +438,10 @@ pub async fn generate_tts(
         writer.finalize()?;
     }
 
-    std::fs::rename(&temp_path, &output_path)?;
+    // RC-3: atomic claim — hard-link succeeds only if final does not yet
+    // exist (cross-platform, no overwrite). If a concurrent same-ID call
+    // already claimed the final, this fails with AlreadyExists.
+    finalize_tts_output(&temp_path, &output_path)?;
     temp_guard.disarm();
 
     Ok(())
@@ -582,8 +614,12 @@ mod tests {
             original,
             "pre-existing TTS WAV must be byte-for-byte unchanged"
         );
+        // RC-3: no temp file of any name may remain.
+        let dir = output.parent().unwrap();
         assert!(
-            !output.with_extension("wav.tmp").exists(),
+            !std::fs::read_dir(dir).unwrap().any(|e| e
+                .as_ref()
+                .is_ok_and(|e| { e.file_name().to_string_lossy().contains(".wav.tmp") })),
             "no temp artifact may be left after collision rejection"
         );
     }
@@ -609,9 +645,96 @@ mod tests {
             !output.exists(),
             "failed generation must not leave a final WAV"
         );
+        // RC-3: no temp file of any name may remain.
+        let dir = output.parent().unwrap();
         assert!(
-            !output.with_extension("wav.tmp").exists(),
+            !std::fs::read_dir(dir).unwrap().any(|e| e
+                .as_ref()
+                .is_ok_and(|e| { e.file_name().to_string_lossy().contains(".wav.tmp") })),
             "failed generation must not leave a temp WAV"
         );
+    }
+
+    /// RC-3: two concurrent same-request_id TTS invocations must not corrupt
+    /// each other's output. This tests the atomic claim function directly: one
+    /// caller owns the final output, the other observes AlreadyExists, and no
+    /// stale temp files remain. Model/Piper process not needed.
+    #[test]
+    fn finalize_tts_output_concurrent_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("tts.wav");
+
+        // Two unique temps with distinct content, targeting the same final.
+        let temp_a = dir.path().join("tts.a.wav.tmp");
+        let temp_b = dir.path().join("tts.b.wav.tmp");
+        let content_a = b"caller-a-content";
+        let content_b = b"caller-b-content";
+        std::fs::write(&temp_a, content_a).unwrap();
+        std::fs::write(&temp_b, content_b).unwrap();
+
+        // Drive both finalizations — at most one succeeds.
+        let mut result_a = None;
+        let mut result_b = None;
+        std::thread::scope(|scope| {
+            let r_a = scope.spawn(|| finalize_tts_output(&temp_a, &final_path));
+            let r_b = scope.spawn(|| finalize_tts_output(&temp_b, &final_path));
+            result_a = Some(r_a.join().unwrap());
+            result_b = Some(r_b.join().unwrap());
+        });
+
+        let ra = result_a.unwrap();
+        let rb = result_b.unwrap();
+
+        // Exactly one succeeded.
+        let winners = [ra.is_ok(), rb.is_ok()];
+        assert_eq!(
+            winners.iter().filter(|&&w| w).count(),
+            1,
+            "exactly one invocation must claim the final output"
+        );
+
+        // The loser must report AlreadyExists.
+        let loser_err = ra.as_ref().err().or_else(|| rb.as_ref().err()).unwrap();
+        assert!(
+            loser_err.to_string().contains("already exists"),
+            "loser must report AlreadyExists, got: {}",
+            loser_err
+        );
+
+        // The final WAV has exactly one caller's complete content (winner).
+        let final_content = std::fs::read(&final_path).unwrap();
+        assert!(
+            final_content == content_a || final_content == content_b,
+            "final must contain exactly one caller's complete content, not mixed/empty"
+        );
+
+        // Clean up the loser's temp (as TtsTempGuard would).
+        for (result, temp) in [(&ra, &temp_a), (&rb, &temp_b)] {
+            if result.is_err() {
+                let _ = std::fs::remove_file(temp);
+            }
+        }
+
+        // No stale .wav.tmp files remain after finalization + guard cleanup.
+        let remaining_temps: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".wav.tmp"))
+            .collect();
+        assert!(
+            remaining_temps.is_empty(),
+            "no stale temp files may remain; found: {:?}",
+            remaining_temps
+        );
+
+        // Re-finalization on the existing final with a fresh temp fails.
+        let temp_c = dir.path().join("tts.c.wav.tmp");
+        std::fs::write(&temp_c, b"stale-content").unwrap();
+        let redo = finalize_tts_output(&temp_c, &final_path);
+        assert!(
+            redo.is_err() && redo.unwrap_err().to_string().contains("already exists"),
+            "re-finalization after a successful claim must be rejected"
+        );
+        let _ = std::fs::remove_file(&temp_c);
     }
 }
