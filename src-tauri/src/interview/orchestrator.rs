@@ -33,21 +33,30 @@ pub struct AudioMetadata {
 }
 
 /// A finalized WAV stays PROVISIONAL until the round's DB transaction
-/// commits. The guard is created before recording starts, stays armed across
-/// the worker, and is returned to the persistence-owning layer (lib.rs), which
-/// commits (disarms) it only after the DB transaction succeeds. Any pre-commit
-/// drop — stop, timeout, checksum failure, transcription failure, capture
-/// error, DB failure — deletes the WAV and its partial temp file.
-/// Once committed, the persisted evidence is never deleted automatically.
+/// commits. The guard is created ONLY AFTER capture succeeds (RC-1) — it is
+/// never armed for a path this invocation did not create — stays armed
+/// across checksum/transcription, and is returned to the persistence-owning
+/// layer (lib.rs), which commits (disarms) it only after the DB transaction
+/// succeeds. Any pre-commit drop — stop, timeout, checksum failure,
+/// transcription failure, DB failure — deletes the WAV and its partial temp
+/// file. Once committed, the persisted evidence is never deleted
+/// automatically. `owns_wav` is defense-in-depth: a guard created for a path
+/// that pre-existed (e.g. a colliding round_id that `record_to_wav`
+/// rejected) must never delete that pre-existing committed evidence.
 pub struct UnpersistedAudio {
     wav_path: std::path::PathBuf,
+    owns_wav: bool,
     committed: bool,
 }
 
 impl UnpersistedAudio {
+    /// Create the guard for a WAV THIS invocation just created. Must be
+    /// called only after a successful `record_to_wav` (RC-1): the file is
+    /// owned by this invocation and is removed if the round never commits.
     fn new(wav_path: std::path::PathBuf) -> Self {
         Self {
             wav_path,
+            owns_wav: true,
             committed: false,
         }
     }
@@ -61,7 +70,7 @@ impl UnpersistedAudio {
 
 impl Drop for UnpersistedAudio {
     fn drop(&mut self) {
-        if !self.committed {
+        if !self.committed && self.owns_wav {
             let _ = std::fs::remove_file(&self.wav_path);
             // Partial recordings land in a temp file next to the final path.
             let _ = std::fs::remove_file(self.wav_path.with_extension("wav.tmp"));
@@ -144,13 +153,6 @@ pub async fn run_interview_round(
     std::fs::create_dir_all(&session_dir)?;
     let wav_path = session_dir.join(format!("{}.wav", uuid_to_path(&round_id)));
 
-    // The WAV stays provisional until the round's DB transaction commits.
-    // Any failure after this point (stop, timeout, checksum, transcription,
-    // capture error) deletes it on drop. The guard is returned (still armed)
-    // so the persistence layer commits it only after the DB transaction
-    // succeeds — never before.
-    let provisional = UnpersistedAudio::new(wav_path.clone());
-
     let record_event_tx = event_tx.clone();
 
     // Use a separate stop flag for recording (auto-stop after 60s or silence)
@@ -202,6 +204,15 @@ pub async fn run_interview_round(
     if stop_flag.load(Ordering::SeqCst) {
         anyhow::bail!("Interview stopped during recording");
     }
+
+    // RC-1: the evidence guard is created ONLY after capture succeeded — the
+    // WAV at `wav_path` was created by THIS invocation (record_to_wav
+    // rejected any pre-existing final, and its PartialWavGuard cleaned up
+    // every failed path). Arming the guard earlier would let a rejected
+    // collision (existing committed WAV + reused round_id) delete the
+    // pre-existing evidence on unwind. From here on, any pre-commit failure
+    // (checksum, transcription, stop) deletes only THIS invocation's WAV.
+    let provisional = UnpersistedAudio::new(wav_path.clone());
 
     // Phase 4: Compute audio metadata and checksum from RecordResult
     let sha256 = sha256_file(&record_result.file_path)?;

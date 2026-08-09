@@ -326,6 +326,39 @@ impl Drop for PartialWavGuard {
     }
 }
 
+/// Internal RAII cleanup for `record_test_clip` (RC-3): the device-test WAV
+/// created by THIS invocation is removed on EVERY error path — device
+/// lookup, stream build, `stream.play()`, callback failure, wall-clock
+/// timeout, finalize — unless the clip is fully written and committed to
+/// the caller. Declared BEFORE the `WavWriter` so reverse declaration order
+/// drops the writer (releasing its Windows file handle) before removal.
+struct TestClipCleanup {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl TestClipCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            committed: false,
+        }
+    }
+
+    /// The clip was fully written; the caller owns it from here.
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for TestClipCleanup {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// Start recording from the default microphone to a WAV file using cpal (WASAPI on Windows).
 /// Writes to a temp file first, then renames on success for crash recovery.
 /// Periodically flushes the writer so partial data survives a crash.
@@ -561,77 +594,113 @@ pub fn production_stream_supported(mut ranges: impl Iterator<Item = (u16, u32, u
     })
 }
 
-/// RC-4: prove the PRODUCTION Piper playback stream can be created on the
+/// RC-4/RC-5: prove the PRODUCTION Piper playback path actually works on the
 /// default output device. Production playback (`PiperSupervisor::speak`)
-/// builds `default_output_device()` with a mono, 22050 Hz stream — Device
-/// Check must validate that exact path, not merely that SOME output device
-/// exists. Two steps:
-///   1. fast range check — the device's supported output configs must cover
-///      mono 22050 Hz;
-///   2. authoritative build — the EXACT production `StreamConfig` is built
-///      WITHOUT playing (silent) and dropped immediately, so no orphan
-///      output stream or task survives.
+/// builds `default_output_device()` with a mono, 22050 Hz stream and plays
+/// it — Device Check must validate that exact path, not merely that SOME
+/// output device exists. Three steps, all inside ONE internally-bounded
+/// blocking probe:
+///   1. fast range check — supported configs must cover mono 22050 Hz;
+///   2. build the EXACT production `StreamConfig`;
+///   3. `stream.play()` and observe real output-callback progress (a tiny
+///      silence fragment, ~100ms) — proving the device actually starts and
+///      delivers samples; a stalled device or an async output error fails
+///      readiness.
 ///
-/// Bounded: the whole check is capped by a 10s wall-clock timeout.
+/// Lifecycle ownership (RC-5): the probe is a SINGLE `spawn_blocking`
+/// closure that is internally bounded (2s progress deadline) and drops its
+/// stream on EVERY exit path, so the caller's direct await can never
+/// silently detach a still-running probe or leave an orphan output stream.
+/// The wait reuses the production `await_playback` loop (same sample-
+/// progress semantics as real question playback).
 pub async fn validate_production_playback_stream() -> anyhow::Result<String> {
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        tokio::task::spawn_blocking(|| {
-            use cpal::traits::{DeviceTrait, HostTrait};
-            let host = cpal::default_host();
-            let device = host
-                .default_output_device()
-                .ok_or_else(|| anyhow::anyhow!("No default output device found"))?;
-            let name = device
-                .name()
-                .unwrap_or_else(|_| "default output device".to_string());
+    // Directly awaited — no external timeout wrapper, so the probe is never
+    // detached while still running; the closure itself is bounded.
+    tokio::task::spawn_blocking(|| {
+        use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+        let host = cpal::default_host();
+        let device = host
+            .default_output_device()
+            .ok_or_else(|| anyhow::anyhow!("No default output device found"))?;
+        let name = device
+            .name()
+            .unwrap_or_else(|_| "default output device".to_string());
 
-            // Fast pre-check: the supported configs must cover the production
-            // stream (mono, 22050 Hz).
-            let supported = device
-                .supported_output_configs()
-                .map(|ranges| {
-                    production_stream_supported(
-                        ranges
-                            .map(|r| (r.channels(), r.min_sample_rate().0, r.max_sample_rate().0)),
-                    )
-                })
-                .map_err(|e| anyhow::anyhow!("failed to query supported output configs: {}", e))?;
-            if !supported {
-                anyhow::bail!(
-                    "default output '{}' does not support the production Piper stream (mono {} Hz)",
-                    name,
-                    crate::audio::playback::PIPER_SAMPLE_RATE
-                );
-            }
+        // Fast pre-check: the supported configs must cover the production
+        // stream (mono, 22050 Hz).
+        let supported = device
+            .supported_output_configs()
+            .map(|ranges| {
+                production_stream_supported(
+                    ranges.map(|r| (r.channels(), r.min_sample_rate().0, r.max_sample_rate().0)),
+                )
+            })
+            .map_err(|e| anyhow::anyhow!("failed to query supported output configs: {}", e))?;
+        if !supported {
+            anyhow::bail!(
+                "default output '{}' does not support the production Piper stream (mono {} Hz)",
+                name,
+                crate::audio::playback::PIPER_SAMPLE_RATE
+            );
+        }
 
-            // Authoritative: build the EXACT production stream config without
-            // playing — silent and bounded. Dropping it leaves no orphan
-            // output stream or task.
-            let config = cpal::StreamConfig {
-                channels: 1,
-                sample_rate: cpal::SampleRate(crate::audio::playback::PIPER_SAMPLE_RATE),
-                buffer_size: cpal::BufferSize::Default,
-            };
-            let stream = device.build_output_stream(
-                &config,
-                |_data: &mut [f32], _: &cpal::OutputCallbackInfo| {},
-                |err| eprintln!("Device-check output stream error: {}", err),
-                None,
-            )?;
-            drop(stream);
+        // Build the EXACT production stream config and actually PLAY it.
+        let config = cpal::StreamConfig {
+            channels: 1,
+            sample_rate: cpal::SampleRate(crate::audio::playback::PIPER_SAMPLE_RATE),
+            buffer_size: cpal::BufferSize::Default,
+        };
+        // Actual output-callback progress, shared with the bounded wait.
+        let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let progress_clone = progress.clone();
+        // Latch for asynchronous output-stream errors — a device failure
+        // after play() must fail readiness, never silently pass.
+        let playback_err: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let err_latch = playback_err.clone();
+        let stream = device.build_output_stream(
+            &config,
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                progress_clone.fetch_add(data.len(), Ordering::Relaxed);
+                for sample in data.iter_mut() {
+                    *sample = 0.0; // silence — the probe must be inaudible
+                }
+            },
+            move |err| {
+                eprintln!("Device-check output stream error: {}", err);
+                if let Ok(mut guard) = err_latch.lock() {
+                    if guard.is_none() {
+                        *guard = Some(format!("output stream error: {}", err));
+                    }
+                }
+            },
+            None,
+        )?;
+        stream.play()?;
 
-            Ok(name)
-        }),
-    )
-    .await;
+        // Bounded wait for real callback progress using the SAME
+        // sample-progress semantics as production playback: ~100ms of
+        // delivered samples (2205 at 22050 Hz). Stalled output or a latched
+        // async error fails readiness. The stream is dropped on every exit
+        // path before the closure returns, so no orphan stream survives.
+        const PROBE_TARGET_SAMPLES: usize = 2205;
+        let outcome = crate::audio::playback::await_playback(
+            &playback_err,
+            None,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+            &progress,
+            PROBE_TARGET_SAMPLES,
+        );
+        drop(stream);
+        debug_assert_eq!(
+            outcome?,
+            crate::audio::playback::PlaybackOutcome::Completed,
+            "probe has no cancellation source"
+        );
 
-    match result {
-        Ok(Ok(Ok(name))) => Ok(name),
-        Ok(Ok(Err(e))) => Err(e),
-        Ok(Err(join)) => Err(anyhow::anyhow!("device check thread failed: {}", join)),
-        Err(_) => Err(anyhow::anyhow!("device check timed out")),
-    }
+        Ok(name)
+    })
+    .await?
 }
 
 /// Record a short audio clip for device verification (3 seconds max).
@@ -682,6 +751,12 @@ pub async fn record_test_clip(
             sample_format: hound::SampleFormat::Int,
         };
 
+        // RC-3: RAII cleanup for the test clip — declared BEFORE the writer
+        // so reverse-declaration order releases the writer's file handle
+        // before the guard removes the file on EVERY failure path (device
+        // lookup, stream build, stream.play, callback failure, timeout,
+        // finalize). Committed only when the clip is fully written.
+        let mut cleanup = TestClipCleanup::new(path_clone.clone());
         let mut writer = hound::WavWriter::create(&path_clone, spec)?;
         let (sample_queue, sample_rx) = SampleQueue::new(64);
         let overflow_watch = sample_queue.overflow.clone();
@@ -741,12 +816,9 @@ pub async fn record_test_clip(
             Ok(frames) => frames,
             Err(e) => {
                 // Windows file-handle ordering (P2-2): drop the writer FIRST
-                // so its file handle is released, THEN remove the partial
-                // file. Removing a file while the writer still holds the
-                // handle commonly fails on Windows and leaves a stray
-                // device_test_*.wav behind.
+                // so its file handle is released; the RAII guard (declared
+                // before the writer) then removes the partial file on drop.
                 drop(writer);
-                let _ = std::fs::remove_file(&path_clone);
                 return Err(e);
             }
         };
@@ -760,6 +832,9 @@ pub async fn record_test_clip(
             );
         }
         writer.finalize()?;
+        // The clip is fully written — hand ownership to the caller (which
+        // validates the size and removes the file itself).
+        cleanup.commit();
 
         let duration_ms = (total_frames * 1000) / sample_rate as u64;
         let _ = event_tx.try_send(CaptureEvent::Stopped {
@@ -994,6 +1069,74 @@ mod tests {
         // Must not panic and must not error.
         let _guard = PartialWavGuard::new(temp.clone(), final_path.clone());
         drop(_guard);
+    }
+
+    /// RC-3: an armed TestClipCleanup removes the device-test WAV on drop.
+    #[test]
+    fn test_clip_cleanup_armed_removes_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device_test_abc.wav");
+        std::fs::write(&path, b"partial").unwrap();
+        {
+            let _guard = TestClipCleanup::new(path.clone());
+        }
+        assert!(
+            !path.exists(),
+            "armed guard must remove the test clip on drop"
+        );
+    }
+
+    /// RC-3: a committed TestClipCleanup preserves the written clip.
+    #[test]
+    fn test_clip_cleanup_committed_preserves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device_test_abc.wav");
+        std::fs::write(&path, b"partial").unwrap();
+        {
+            let mut guard = TestClipCleanup::new(path.clone());
+            guard.commit();
+        }
+        assert!(
+            path.exists(),
+            "committed guard must preserve the clip for the caller"
+        );
+    }
+
+    /// RC-3: on EVERY outcome (success or error — including device lookup /
+    /// stream build / play / timeout failures) the device-test call leaves no
+    /// stray `device_test_*.wav` behind: the RAII guard removes this
+    /// invocation's file on all failure paths, and the caller removes it on
+    /// success.
+    #[tokio::test]
+    async fn record_test_clip_leaves_no_stray_wav_after_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let result = record_test_clip(
+            16000,
+            1,
+            1,
+            dir.path().to_path_buf(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            CaptureCompletion::new(),
+        )
+        .await;
+
+        if let Ok(path) = result {
+            assert!(path.exists(), "successful clip must exist for the caller");
+            let _ = std::fs::remove_file(&path);
+        }
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("device_test_"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "stray device-test files left behind: {:?}",
+            leftovers
+        );
     }
 
     /// P1-2: a pre-existing final WAV is rejected BEFORE any audio device is

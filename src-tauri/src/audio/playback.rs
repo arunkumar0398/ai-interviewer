@@ -226,12 +226,58 @@ pub async fn play_wav(
 /// Generate a TTS WAV file using Piper via stdin.
 /// The child process owner enforces timeout, kill, wait/reap, and partial
 /// output cleanup directly. Any outer timeout is only defense-in-depth.
+/// Internal RAII cleanup for standalone TTS (RC-6): owns the provisional
+/// `.wav.tmp` THIS invocation writes. The temp is removed on EVERY failure
+/// path; on success it is atomically renamed to the final path and the guard
+/// is disarmed. The FINAL path is never touched by cleanup — a pre-existing
+/// WAV (rejected up front) can never be overwritten or deleted by a failed
+/// or colliding generation.
+struct TtsTempGuard {
+    temp_path: PathBuf,
+    armed: bool,
+}
+
+impl TtsTempGuard {
+    fn new(temp_path: PathBuf) -> Self {
+        Self {
+            temp_path,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TtsTempGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.temp_path);
+        }
+    }
+}
+
 pub async fn generate_tts(
     text: &str,
     output_path: PathBuf,
     piper_binary: Option<&str>,
     model_path: Option<&str>,
 ) -> anyhow::Result<()> {
+    // RC-6: a pre-existing final WAV is evidence — never overwrite or delete
+    // it. Reject BEFORE spawning any process or writing anything.
+    if output_path.exists() {
+        anyhow::bail!("TTS output already exists: {}", output_path.display());
+    }
+    // Stale temp policy: a leftover `.wav.tmp` from a crashed run is removed
+    // explicitly as stale (it is by definition uncommitted and cannot be
+    // evidence). Everything after this point is owned by THIS invocation.
+    let temp_path = output_path.with_extension("wav.tmp");
+    if temp_path.exists() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    let mut temp_guard = TtsTempGuard::new(temp_path.clone());
+
     let piper = piper_binary.unwrap_or("piper");
     let model = model_path.unwrap_or("en_US-amy-medium.onnx");
 
@@ -259,9 +305,10 @@ pub async fn generate_tts(
     if let Some(mut stdin) = child.stdin.take() {
         use tokio::io::AsyncWriteExt;
         if let Err(e) = stdin.write_all(text.as_bytes()).await {
-            // Child may still be running — kill and reap explicitly.
+            // Child may still be running — kill and reap explicitly. The
+            // temp guard removes only this invocation's artifacts; the final
+            // path is never touched (RC-6).
             crate::audio::pipe::terminate_child(&mut child).await;
-            let _ = std::fs::remove_file(&output_path);
             anyhow::bail!("Failed to write TTS text to Piper stdin: {}", e);
         }
         drop(stdin); // close stdin to signal EOF
@@ -289,8 +336,6 @@ pub async fn generate_tts(
             }
             _ = tokio::time::sleep_until(deadline) => {
                 crate::audio::pipe::terminate_child(&mut child).await;
-                // Cleanup partial output
-                let _ = std::fs::remove_file(&output_path);
                 anyhow::bail!(
                     "TTS generation timed out after {}s — process killed",
                     GENERATE_TTS_TIMEOUT_SECS
@@ -302,7 +347,6 @@ pub async fn generate_tts(
     if let Err(e) = read_result {
         // Child may still be running (stdout read error) — kill and reap.
         crate::audio::pipe::terminate_child(&mut child).await;
-        let _ = std::fs::remove_file(&output_path);
         return Err(e);
     }
 
@@ -317,7 +361,6 @@ pub async fn generate_tts(
                     Some(d) => d.text().await,
                     None => String::new(),
                 };
-                let _ = std::fs::remove_file(&output_path);
                 anyhow::bail!(
                     "Piper TTS failed (exit {}): {}",
                     status.code().unwrap_or(-1),
@@ -330,13 +373,11 @@ pub async fn generate_tts(
             // reap explicitly before propagating (P2-2); kill_on_drop stays
             // only as defense-in-depth.
             crate::audio::pipe::terminate_child(&mut child).await;
-            let _ = std::fs::remove_file(&output_path);
             anyhow::bail!("TTS process wait error: {}", e);
         }
         Err(_) => {
             // Timeout waiting for child to exit — force kill and reap.
             crate::audio::pipe::terminate_child(&mut child).await;
-            let _ = std::fs::remove_file(&output_path);
             anyhow::bail!(
                 "TTS generation timed out after {}s — process killed",
                 GENERATE_TTS_TIMEOUT_SECS
@@ -345,13 +386,14 @@ pub async fn generate_tts(
     }
 
     // Piper outputs raw PCM (16-bit signed, mono, PIPER_SAMPLE_RATE Hz).
-    // Reject empty/malformed output BEFORE creating the WAV (P1-3): a zero-
+    // Reject empty/malformed output BEFORE writing the WAV (P1-3): a zero-
     // audio "success" must never produce an empty WAV or be reported as
-    // spoken. Clean up the output path on rejection.
-    let samples = pcm_bytes_to_samples(&raw_pcm).inspect_err(|_| {
-        let _ = std::fs::remove_file(&output_path);
-    })?;
+    // spoken.
+    let samples = pcm_bytes_to_samples(&raw_pcm)?;
 
+    // Write to the PROVISIONAL temp path, then atomically rename to the
+    // final path (RC-6): a failure here removes only this invocation's temp;
+    // the final path is created atomically and never pre-existed.
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate: PIPER_SAMPLE_RATE,
@@ -359,13 +401,16 @@ pub async fn generate_tts(
         sample_format: hound::SampleFormat::Int,
     };
 
-    let mut writer = hound::WavWriter::create(&output_path, spec)?;
-
-    for sample in samples {
-        writer.write_sample(sample)?;
+    {
+        let mut writer = hound::WavWriter::create(&temp_path, spec)?;
+        for sample in samples {
+            writer.write_sample(sample)?;
+        }
+        writer.finalize()?;
     }
 
-    writer.finalize()?;
+    std::fs::rename(&temp_path, &output_path)?;
+    temp_guard.disarm();
 
     Ok(())
 }
@@ -507,5 +552,66 @@ mod tests {
     fn pcm_bytes_to_samples_parses_even_length() {
         let samples = pcm_bytes_to_samples(&[0x01, 0x00, 0xFF, 0xFF]).unwrap();
         assert_eq!(samples, vec![1i16, -1i16]);
+    }
+
+    /// RC-6: a pre-existing final WAV is rejected BEFORE any process is
+    /// spawned, and the original file stays byte-for-byte unchanged. No
+    /// temp artifact is left behind.
+    #[tokio::test]
+    async fn generate_tts_rejects_existing_final_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("tts.wav");
+        let original = b"pre-existing-tts-evidence";
+        std::fs::write(&output, original).unwrap();
+
+        let result = generate_tts(
+            "hello",
+            output.clone(),
+            Some("definitely-missing-piper-binary"),
+            Some("model.onnx"),
+        )
+        .await;
+
+        assert!(result.is_err(), "existing final must be rejected");
+        assert!(
+            result.unwrap_err().to_string().contains("already exists"),
+            "collision must be reported explicitly"
+        );
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            original,
+            "pre-existing TTS WAV must be byte-for-byte unchanged"
+        );
+        assert!(
+            !output.with_extension("wav.tmp").exists(),
+            "no temp artifact may be left after collision rejection"
+        );
+    }
+
+    /// RC-6: a failed generation (process spawn failure) leaves NO final
+    /// and NO temp artifact — only this invocation's artifacts are ever
+    /// removed or created.
+    #[tokio::test]
+    async fn generate_tts_failure_leaves_no_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("tts.wav");
+
+        let result = generate_tts(
+            "hello",
+            output.clone(),
+            Some("definitely-missing-piper-binary"),
+            Some("model.onnx"),
+        )
+        .await;
+
+        assert!(result.is_err(), "missing piper binary must fail");
+        assert!(
+            !output.exists(),
+            "failed generation must not leave a final WAV"
+        );
+        assert!(
+            !output.with_extension("wav.tmp").exists(),
+            "failed generation must not leave a temp WAV"
+        );
     }
 }

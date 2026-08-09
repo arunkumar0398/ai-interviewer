@@ -183,10 +183,16 @@ impl<T: Send + 'static> Drop for RecordingGuard<T> {
                         // closure terminates — overlapping physical capture
                         // is never allowed.
                         audio::capture::CaptureState::Scheduled => {
-                            if tokio::time::timeout(grace, completion.wait())
-                                .await
-                                .is_err()
-                            {
+                            if tokio::time::timeout(grace, completion.wait()).await.is_ok() {
+                                // Physical capture finished within the
+                                // grace. Resolve the OUTER wrapper too
+                                // (RC-7): the slot clears only after BOTH
+                                // the physical capture and the owned outer
+                                // JoinHandle are fully resolved.
+                                if let Some(h) = worker {
+                                    let _ = h.await;
+                                }
+                            } else {
                                 handle.abort();
                                 if let Some(h) = worker {
                                     let _ = h.await;
@@ -659,6 +665,13 @@ async fn run_interview_round(
         preflight_round(db, &session_id_str, round_index)?
     };
 
+    // RC-1: reject a round whose WAV already exists at the backend round
+    // boundary — BEFORE any TTS/audio work. A replayed round_id must never
+    // touch a pre-existing committed WAV. This is the FIRST line of defense;
+    // the evidence guard (created only after capture succeeds) and
+    // record_to_wav's own rejection are the others.
+    ensure_round_evidence_absent(&paths.paths, session_id, round_id, round_index)?;
+
     let (event_tx, _event_rx) = mpsc::channel(32);
     let (tts_event_tx, _tts_event_rx) = mpsc::channel(32);
     let (phase_tx, mut phase_rx) = mpsc::channel(8);
@@ -955,12 +968,12 @@ async fn run_interview_round(
 
         if defer_cleanup {
             // Pathological: physical capture still alive after the grace.
-            // This detached task owns the TAIL lifecycle (RC-3) in the
-            // required order: real capture termination -> provisional
+            // This detached task owns the TAIL lifecycle (RC-3/RC-2) in the
+            // required order: real capture termination -> OWNED provisional
             // artifact cleanup -> recording slot release. The command still
             // returns bounded; a late rename can never resurrect an orphan
-            // WAV and the slot is never freed while physical capture may
-            // still run.
+            // WAV, a pre-existing committed WAV is never touched, and the
+            // slot is never freed while physical capture may still run.
             let cleanup_paths = paths.paths.clone();
             let cleanup_state = state.inner().clone();
             tokio::spawn(async move {
@@ -977,10 +990,13 @@ async fn run_interview_round(
         } else {
             // No live physical capture (worker exited cooperatively, or the
             // capture terminated within the grace, or none was ever
-            // Scheduled): remove provisional artifacts first, then release
-            // the slot — capture terminated -> artifacts removed -> slot
-            // released (RC-3).
-            cleanup_round_artifacts(&paths.paths, session_id, round_id).await;
+            // Scheduled): the capture lifecycle is now static, so compute
+            // ownership and remove ONLY this invocation's artifacts, then
+            // release the slot — capture terminated -> owned artifacts
+            // removed -> slot released (RC-3).
+            let ownership =
+                round_artifact_ownership(&paths.paths, session_id, round_id, &completion);
+            ownership.remove_owned();
             clear_active_recording(&state).await;
             recording_guard.disarm();
         }
@@ -992,35 +1008,97 @@ async fn run_interview_round(
     }
 }
 
-/// Centralized round-artifact cleanup for a round that never committed
-/// (RC-3): removes the final WAV, the `.wav.tmp` partial, and the session
-/// temp transcript directory. MUST only be called AFTER the real physical
-/// capture for the round has terminated — a late `.wav.tmp -> .wav` rename
-/// would otherwise resurrect an orphan final WAV after the command already
-/// returned.
-async fn cleanup_round_artifacts(
+/// RC-1: a round whose WAV already exists must be rejected at the backend
+/// round boundary, before any TTS/audio work, so a replayed round_id can
+/// never touch (or appear to own) a pre-existing committed WAV.
+fn ensure_round_evidence_absent(
     paths: &crate::paths::AppPaths,
     session_id: uuid::Uuid,
     round_id: uuid::Uuid,
-) {
+    round_index: i32,
+) -> Result<(), String> {
+    let round_wav = paths.round_audio_path(session_id, round_id);
+    if round_wav.exists() {
+        return Err(format!(
+            "Round {} already has a recorded answer for this session",
+            round_index + 1
+        ));
+    }
+    Ok(())
+}
+
+/// Which provisional artifacts a timed-out round actually OWNS (RC-2).
+/// Cleanup deletes ONLY what this invocation created — deletion authority
+/// is never derived from session/round IDs alone, so a colliding
+/// pre-existing committed WAV can never be removed by a timeout.
+#[derive(Debug)]
+struct RoundArtifactOwnership {
+    wav_path: std::path::PathBuf,
+    temp_path: std::path::PathBuf,
+    transcript_path: std::path::PathBuf,
+    owns_final: bool,
+    owns_temp: bool,
+    owns_transcript: bool,
+}
+
+impl RoundArtifactOwnership {
+    fn remove_owned(&self) {
+        if self.owns_final {
+            let _ = std::fs::remove_file(&self.wav_path);
+        }
+        if self.owns_temp {
+            let _ = std::fs::remove_file(&self.temp_path);
+        }
+        if self.owns_transcript {
+            let _ = std::fs::remove_file(&self.transcript_path);
+        }
+    }
+}
+
+/// Compute artifact ownership for a timed-out round from the physical
+/// capture lifecycle (RC-2). Ownership is NEVER derived from IDs alone:
+/// - The final WAV is owned iff THIS invocation's capture FINISHED and the
+///   file exists. The round-boundary check (RC-1) rejected any pre-existing
+///   final before the worker started, so the only way the final appears is
+///   this invocation's temp->final rename; a capture that finished with an
+///   error cleaned up its own temp and created no final.
+/// - The `.wav.tmp` is owned iff a capture was Scheduled and the file
+///   exists (record_to_wav clears stale temps before writing its own).
+/// - The round transcript temp is owned iff the final WAV is owned — only a
+///   successfully recorded round can have started transcription.
+fn round_artifact_ownership(
+    paths: &crate::paths::AppPaths,
+    session_id: uuid::Uuid,
+    round_id: uuid::Uuid,
+    completion: &audio::capture::CaptureCompletion,
+) -> RoundArtifactOwnership {
     let wav_path = paths.round_audio_path(session_id, round_id);
-    let temp_dir = paths.temp_dir.join(session_id.hyphenated().to_string());
-    tokio::task::spawn_blocking(move || {
-        let _ = std::fs::remove_file(&wav_path);
-        let _ = std::fs::remove_file(wav_path.with_extension("wav.tmp"));
-        let _ = std::fs::remove_dir_all(&temp_dir);
-    })
-    .await
-    .ok();
+    let temp_path = wav_path.with_extension("wav.tmp");
+    let transcript_path = paths
+        .temp_dir
+        .join(session_id.hyphenated().to_string())
+        .join(format!("{}.txt", uuid_to_path(&round_id)));
+    let capture_attempted = completion.scheduled() || completion.finished();
+    let owns_final = completion.finished() && wav_path.exists();
+    RoundArtifactOwnership {
+        owns_final,
+        owns_temp: capture_attempted && temp_path.exists(),
+        owns_transcript: owns_final && transcript_path.exists(),
+        wav_path,
+        temp_path,
+        transcript_path,
+    }
 }
 
 /// RC-3 tail lifecycle for a timed-out round whose physical capture is
 /// STILL ALIVE after the grace period: wait for the real capture
-/// termination, THEN remove the provisional artifacts, THEN release the
-/// recording slot. Running the artifact cleanup in the same task that waits
-/// for capture completion guarantees a late `.wav.tmp -> .wav` rename can
-/// never resurrect an orphan final WAV after the command already returned,
-/// and the slot is never freed while physical capture may still run.
+/// termination, THEN recompute artifact ownership (a late temp->final
+/// rename makes the final owned by THIS invocation) and remove ONLY owned
+/// provisional artifacts (RC-2), THEN release the recording slot. Running
+/// the artifact cleanup in the same task that waits for capture completion
+/// guarantees a late `.wav.tmp -> .wav` rename can never resurrect an
+/// orphan final WAV after the command already returned, and the slot is
+/// never freed while physical capture may still run.
 async fn deferred_timeout_cleanup(
     completion: audio::capture::CaptureCompletion,
     paths: &crate::paths::AppPaths,
@@ -1029,7 +1107,8 @@ async fn deferred_timeout_cleanup(
     state: Arc<RecordingState>,
 ) {
     completion.wait().await;
-    cleanup_round_artifacts(paths, session_id, round_id).await;
+    let ownership = round_artifact_ownership(paths, session_id, round_id, &completion);
+    ownership.remove_owned();
     clear_active_recording(&state).await;
 }
 
@@ -1622,9 +1701,12 @@ mod tests {
         // A late rename would target this final path — it must never survive.
         std::fs::write(&wav_path, b"late-resurrected").unwrap();
         std::fs::write(wav_path.with_extension("wav.tmp"), b"partial").unwrap();
-        let temp_dir = paths.temp_dir.join(session_id.hyphenated().to_string());
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        std::fs::write(temp_dir.join("transcript.txt"), b"partial").unwrap();
+        let transcript_path = paths
+            .temp_dir
+            .join(session_id.hyphenated().to_string())
+            .join(format!("{}.txt", uuid_to_path(&round_id)));
+        std::fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
+        std::fs::write(&transcript_path, b"partial").unwrap();
 
         let state = Arc::new(RecordingState {
             handle: Mutex::new(None),
@@ -1652,7 +1734,7 @@ mod tests {
             "temp must survive until capture termination"
         );
         assert!(
-            temp_dir.exists(),
+            transcript_path.exists(),
             "transcript temp must survive until capture termination"
         );
         assert!(
@@ -1680,13 +1762,231 @@ mod tests {
             "temp must be removed after capture termination"
         );
         assert!(
-            !temp_dir.exists(),
+            !transcript_path.exists(),
             "transcript temp must be removed after capture termination"
         );
         assert!(
             state.handle.lock().await.is_none(),
             "slot must be released only after cleanup"
         );
+
+        // Reusable.
+        acquire_recording(&state, fake_handle()).await.unwrap();
+        assert!(state.handle.lock().await.is_some());
+    }
+
+    /// RC-2: round-artifact ownership is derived from the capture lifecycle,
+    /// NEVER from session/round IDs alone. A pre-existing committed WAV next
+    /// to a capture that never finished (e.g. TTS hang) is NOT owned and
+    /// survives cleanup; a capture that finished owns the final it created;
+    /// a scheduled-but-unfinished capture owns its temp (and its transcript
+    /// temp only when the final is owned).
+    #[test]
+    fn round_artifact_ownership_never_deletes_unowned_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::AppPaths::from_tool_dir(
+            tmp.path().join("tools"),
+            tmp.path().join("data"),
+        )
+        .unwrap();
+
+        // Case 1: capture NEVER scheduled (TTS hang) + pre-existing WAV.
+        let session = uuid::Uuid::new_v4();
+        let round = uuid::Uuid::new_v4();
+        let wav = paths.round_audio_path(session, round);
+        std::fs::create_dir_all(wav.parent().unwrap()).unwrap();
+        let original = b"pre-existing-committed-evidence";
+        std::fs::write(&wav, original).unwrap();
+
+        let completion = audio::capture::CaptureCompletion::new();
+        let ownership = round_artifact_ownership(&paths, session, round, &completion);
+        assert!(!ownership.owns_final, "unstarted capture owns no final");
+        assert!(!ownership.owns_temp, "unstarted capture owns no temp");
+        ownership.remove_owned();
+        assert_eq!(
+            std::fs::read(&wav).unwrap(),
+            original,
+            "pre-existing committed WAV must survive an unowned timeout cleanup"
+        );
+
+        // Case 2: capture FINISHED -> owns the final it created, and the
+        // round transcript temp (only because the final is owned).
+        let session2 = uuid::Uuid::new_v4();
+        let round2 = uuid::Uuid::new_v4();
+        let wav2 = paths.round_audio_path(session2, round2);
+        std::fs::create_dir_all(wav2.parent().unwrap()).unwrap();
+        std::fs::write(&wav2, b"created-by-this-invocation").unwrap();
+        let transcript2 = paths
+            .temp_dir
+            .join(session2.hyphenated().to_string())
+            .join(format!("{}.txt", uuid_to_path(&round2)));
+        std::fs::create_dir_all(transcript2.parent().unwrap()).unwrap();
+        std::fs::write(&transcript2, b"partial").unwrap();
+
+        let completion2 = audio::capture::CaptureCompletion::new();
+        completion2.mark_scheduled();
+        completion2.signal();
+        let ownership2 = round_artifact_ownership(&paths, session2, round2, &completion2);
+        assert!(ownership2.owns_final, "finished capture owns its final");
+        assert!(
+            ownership2.owns_transcript,
+            "owned final implies owned transcript"
+        );
+        ownership2.remove_owned();
+        assert!(!wav2.exists(), "owned final must be removed");
+        assert!(
+            !transcript2.exists(),
+            "owned transcript temp must be removed"
+        );
+
+        // Case 3: capture Scheduled but NOT finished -> owns its temp, never
+        // a final.
+        let session3 = uuid::Uuid::new_v4();
+        let round3 = uuid::Uuid::new_v4();
+        let wav3 = paths.round_audio_path(session3, round3);
+        std::fs::create_dir_all(wav3.parent().unwrap()).unwrap();
+        std::fs::write(wav3.with_extension("wav.tmp"), b"partial").unwrap();
+
+        let completion3 = audio::capture::CaptureCompletion::new();
+        completion3.mark_scheduled();
+        let ownership3 = round_artifact_ownership(&paths, session3, round3, &completion3);
+        assert!(!ownership3.owns_final, "unfinished capture owns no final");
+        assert!(ownership3.owns_temp, "scheduled capture owns its temp");
+        ownership3.remove_owned();
+        assert!(
+            !wav3.with_extension("wav.tmp").exists(),
+            "owned temp must be removed"
+        );
+    }
+
+    /// RC-1: a round whose WAV already exists is rejected at the backend
+    /// round boundary — a replayed round_id can never touch a pre-existing
+    /// committed WAV.
+    #[test]
+    fn ensure_round_evidence_absent_rejects_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::AppPaths::from_tool_dir(
+            tmp.path().join("tools"),
+            tmp.path().join("data"),
+        )
+        .unwrap();
+        let session_id = uuid::Uuid::new_v4();
+        let round_id = uuid::Uuid::new_v4();
+        let wav = paths.round_audio_path(session_id, round_id);
+        std::fs::create_dir_all(wav.parent().unwrap()).unwrap();
+        std::fs::write(&wav, b"committed-evidence").unwrap();
+
+        let rejected = ensure_round_evidence_absent(&paths, session_id, round_id, 2);
+        assert!(rejected.is_err(), "colliding round WAV must be rejected");
+        assert!(
+            rejected
+                .unwrap_err()
+                .contains("already has a recorded answer"),
+            "collision must be reported explicitly"
+        );
+
+        let fresh_round = uuid::Uuid::new_v4();
+        assert!(
+            ensure_round_evidence_absent(&paths, session_id, fresh_round, 2).is_ok(),
+            "a fresh round_id must pass the boundary check"
+        );
+    }
+
+    /// RC-7: when the physical capture completes WITHIN the cooperative
+    /// grace, the drop cleanup must still await the owned OUTER worker
+    /// before clearing the slot. Physical completion first, outer wrapper
+    /// deliberately delayed: the slot must not clear until the wrapper is
+    /// resolved.
+    #[tokio::test]
+    async fn recording_guard_drop_awaits_outer_worker_after_physical_completion() {
+        let state = Arc::new(RecordingState {
+            handle: Mutex::new(None),
+        });
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let physical_done = Arc::new(tokio::sync::Notify::new());
+        let outer_done = Arc::new(tokio::sync::Notify::new());
+        acquire_recording(&state, fake_handle()).await.unwrap();
+
+        let completion_for_test;
+        {
+            let mut guard = RecordingGuard::new(state.clone(), stop.clone());
+            // Generous grace: the physical capture completes within it.
+            guard.drop_grace = std::time::Duration::from_secs(5);
+            let completion = guard.completion();
+            completion_for_test = completion.clone();
+            let worker = {
+                let blocking_stop = stop.clone();
+                let blocking_release = release.clone();
+                let physical_done = physical_done.clone();
+                let outer_done = outer_done.clone();
+                let completion = completion.clone();
+                tokio::spawn(async move {
+                    completion.mark_scheduled();
+                    let blocking = tokio::task::spawn_blocking(move || {
+                        // Physical capture: observe stop quickly, signal
+                        // physical completion, then wait to be released.
+                        while !blocking_stop.load(Ordering::SeqCst) {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                        physical_done.notify_waiters();
+                        while !blocking_release.load(Ordering::SeqCst) {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                        completion.signal();
+                    });
+                    let _ = blocking.await;
+                    // The OUTER wrapper deliberately delays AFTER the
+                    // physical capture completed — the slot must not clear
+                    // until this resolves (RC-7).
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                    outer_done.notify_waiters();
+                })
+            };
+            guard.attach_worker(worker);
+            // Dropped while armed — unexpected drop/panic of the outer command.
+        }
+
+        // Physical capture completed within grace.
+        tokio::time::timeout(std::time::Duration::from_secs(5), physical_done.notified())
+            .await
+            .expect("physical capture must observe stop and complete");
+        release.store(true, Ordering::SeqCst);
+        // Wait until the physical capture signalled Finished.
+        let mut finished = false;
+        for _ in 0..200 {
+            if completion_for_test.finished() {
+                finished = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            finished,
+            "physical capture must signal Finished within grace"
+        );
+
+        // The outer wrapper is still delaying -> the slot must STILL be
+        // occupied (physical completion alone must not free it).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            state.handle.lock().await.is_some(),
+            "slot must stay occupied until the outer worker is resolved"
+        );
+
+        // Outer worker resolves -> cleanup clears the slot only then.
+        tokio::time::timeout(std::time::Duration::from_secs(5), outer_done.notified())
+            .await
+            .expect("outer worker must resolve");
+        let mut cleared = false;
+        for _ in 0..200 {
+            if state.handle.lock().await.is_none() {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(cleared, "slot must clear after the outer worker resolves");
 
         // Reusable.
         acquire_recording(&state, fake_handle()).await.unwrap();
