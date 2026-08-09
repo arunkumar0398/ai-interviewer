@@ -335,15 +335,29 @@ fn validate_readiness_partial() {
     assert!(!codes.contains(&"WHISPER_MODEL_MISSING"));
 }
 
-/// Test: readiness passes with canonical layout
+/// Test: readiness passes with canonical layout (P2-3: full Piper runtime)
 #[test]
 fn validate_readiness_canonical_all_present() {
     let tmp = tempfile::tempdir().unwrap();
     let tool = tmp.path().join("tools");
 
-    fs::create_dir_all(tool.join("piper")).unwrap();
-    fs::write(tool.join("piper").join("piper.exe"), b"").unwrap();
-    fs::write(tool.join("piper").join("model.onnx"), b"").unwrap();
+    fs::create_dir_all(tool.join("piper").join("espeak-ng-data")).unwrap();
+    for name in [
+        "piper.exe",
+        "model.onnx",
+        "model.onnx.json",
+        "espeak-ng.dll",
+        "piper_phonemize.dll",
+        "onnxruntime.dll",
+        "onnxruntime_providers_shared.dll",
+    ] {
+        fs::write(tool.join("piper").join(name), b"").unwrap();
+    }
+    fs::write(
+        tool.join("piper").join("espeak-ng-data").join("phontab"),
+        b"",
+    )
+    .unwrap();
     fs::create_dir_all(tool.join("whisper").join("Release")).unwrap();
     fs::write(tool.join("whisper").join("Release").join("main.exe"), b"").unwrap();
     fs::create_dir_all(tool.join("models")).unwrap();
@@ -355,18 +369,43 @@ fn validate_readiness_canonical_all_present() {
     assert!(readiness.issues.is_empty());
 }
 
-/// Test: readiness passes with legacy layout
+/// Test: readiness passes with legacy layout (P2-3: full legacy companions)
 #[test]
 fn validate_readiness_legacy_all_present() {
     let tmp = tempfile::tempdir().unwrap();
     let tool = tmp.path().join("tools");
 
-    // Legacy piper: piper/piper/piper.exe
-    fs::create_dir_all(tool.join("piper").join("piper")).unwrap();
-    fs::write(tool.join("piper").join("piper").join("piper.exe"), b"").unwrap();
-    // Legacy model: piper-models/en_US-amy-medium.onnx
+    // Legacy piper: piper/piper/piper.exe + companions in the same dir
+    fs::create_dir_all(tool.join("piper").join("piper").join("espeak-ng-data")).unwrap();
+    for name in [
+        "piper.exe",
+        "espeak-ng.dll",
+        "piper_phonemize.dll",
+        "onnxruntime.dll",
+        "onnxruntime_providers_shared.dll",
+    ] {
+        fs::write(tool.join("piper").join("piper").join(name), b"").unwrap();
+    }
+    fs::write(
+        tool.join("piper")
+            .join("piper")
+            .join("espeak-ng-data")
+            .join("phontab"),
+        b"",
+    )
+    .unwrap();
+    // Legacy model + config: piper-models/en_US-amy-medium.onnx(.json)
     fs::create_dir_all(tool.join("piper-models")).unwrap();
-    fs::write(tool.join("piper-models").join("en_US-amy-medium.onnx"), b"").unwrap();
+    fs::write(
+        tool.join("piper-models").join("en_US-amy-medium.onnx"),
+        b"",
+    )
+    .unwrap();
+    fs::write(
+        tool.join("piper-models").join("en_US-amy-medium.onnx.json"),
+        b"",
+    )
+    .unwrap();
     // Whisper + model
     fs::create_dir_all(tool.join("whisper").join("Release")).unwrap();
     fs::write(tool.join("whisper").join("Release").join("main.exe"), b"").unwrap();

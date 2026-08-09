@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor, act, fireEvent } from "@testing-library/react";
 import InterviewPage from "../app/interview/page";
+import { INTERVIEW_QUESTIONS } from "../lib/interview-questions";
 import { mockListenCallbacks } from "./setup";
 
 const mockInvoke = vi.fn();
@@ -105,7 +106,7 @@ describe("Interview Page", () => {
     expect(screen.getByText("Check Devices")).toBeInTheDocument();
   });
 
-  it("renders all 5 questions from QUESTIONS constant", async () => {
+  it("reads questions from the single shared INTERVIEW_QUESTIONS source (P1-2)", async () => {
     mockInvoke.mockResolvedValueOnce(mockAppConfig);
 
     await act(async () => {
@@ -116,8 +117,9 @@ describe("Interview Page", () => {
       expect(screen.getByText("Check Devices")).toBeInTheDocument();
     });
 
-    // Verify questions are accessible (they render in the QUESTIONS array)
-    // They appear when round is shown, but we can verify the component structure
+    // The page drives its rounds from the shared constant — exactly 5,
+    // matching the backend EXPECTED_ROUNDS.
+    expect(INTERVIEW_QUESTIONS.length).toBe(5);
   });
 
   it("has Retry button in error state", async () => {
@@ -437,14 +439,10 @@ describe("Interview Page", () => {
     });
   });
 
-  it("adopts the Dashboard session from the URL — no second create_session (P1-1)", async () => {
+  it("adopts the Dashboard session from the URL — no second create_session (P1-1, P2-4)", async () => {
     const handedOffSession = "11111111-2222-3333-4444-555555555555";
-    // Simulate the Dashboard's handoff link: /interview?session=<uuid>&name=Alice
-    window.history.replaceState(
-      {},
-      "",
-      `/interview?session=${handedOffSession}&name=Alice`
-    );
+    // Simulate the Dashboard's session-only handoff link: /interview?session=<uuid>
+    window.history.replaceState({}, "", `/interview?session=${handedOffSession}`);
 
     let createSessionCalls = 0;
     let roundSessionId: string | null = null;

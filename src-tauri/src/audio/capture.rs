@@ -111,12 +111,14 @@ impl CaptureErrorLatch {
 
 /// Pump chunks from `rx` into `on_chunk` until `target_frames` frames have
 /// been collected, the wall-clock `deadline` passes (explicit timeout error),
-/// a capture error is latched (explicit device error), or the channel
-/// disconnects. Pure and hardware-free, so it is unit-testable. Returns the
-/// number of frames collected.
+/// an external `stop_flag` is set (explicit cancellation), a capture error is
+/// latched (explicit device error), or the channel disconnects. Pure and
+/// hardware-free, so it is unit-testable. Returns the number of frames
+/// collected.
 fn collect_chunks_until<F>(
     rx: &std::sync::mpsc::Receiver<Vec<f32>>,
     error_latch: &CaptureErrorLatch,
+    stop_flag: Option<&AtomicBool>,
     deadline: std::time::Instant,
     target_frames: u64,
     channels: u16,
@@ -130,6 +132,13 @@ where
         // Async device failure is authoritative — fail now, never succeed.
         if let Some(msg) = error_latch.peek() {
             anyhow::bail!("{}", msg);
+        }
+        // External cancellation (P2-2): the owning command can stop the
+        // device-test capture promptly instead of waiting for the deadline.
+        if let Some(flag) = stop_flag {
+            if flag.load(Ordering::SeqCst) {
+                anyhow::bail!("Capture cancelled");
+            }
         }
         // Wall-clock bound independent of sample count: a stream that starts
         // but delivers no frames still terminates in bounded time.
@@ -328,6 +337,7 @@ pub async fn record_test_clip(
     duration_secs: u32,
     temp_dir: PathBuf,
     event_tx: mpsc::Sender<CaptureEvent>,
+    stop_flag: Arc<AtomicBool>,
 ) -> anyhow::Result<PathBuf> {
     // P2-1: UUID-based name so concurrent device checks can never target the
     // same path (a PID alone is not unique across concurrent checks).
@@ -386,6 +396,7 @@ pub async fn record_test_clip(
         let collected = collect_chunks_until(
             &sample_rx,
             &error_latch,
+            Some(&stop_flag),
             deadline,
             total_needed,
             channels,
@@ -575,7 +586,7 @@ mod tests {
         latch.set("Audio stream error: simulated device failure");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let result = collect_chunks_until(&rx, &latch, deadline, 100, 1, |_| Ok(()));
+        let result = collect_chunks_until(&rx, &latch, None, deadline, 100, 1, |_| Ok(()));
         assert!(result.is_err(), "latched error must fail the capture loop");
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -597,6 +608,7 @@ mod tests {
         let result = collect_chunks_until(
             &rx,
             &CaptureErrorLatch::default(),
+            None,
             deadline,
             16000,
             1,
@@ -632,6 +644,7 @@ mod tests {
         let frames = collect_chunks_until(
             &rx,
             &CaptureErrorLatch::default(),
+            None,
             deadline,
             320,
             1,
@@ -645,5 +658,38 @@ mod tests {
         assert_eq!(written.len(), 320);
 
         sender.join().unwrap();
+    }
+
+    /// P2-2: an outer cancellation (stop flag) terminates the capture loop
+    /// promptly with an explicit error — the device test observes the owning
+    /// command's cancellation instead of running until its deadline.
+    #[test]
+    fn collect_chunks_until_stops_on_outer_cancellation() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(4);
+        let stop = Arc::new(AtomicBool::new(false));
+        stop.store(true, Ordering::SeqCst);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let started = std::time::Instant::now();
+        let result = collect_chunks_until(
+            &rx,
+            &CaptureErrorLatch::default(),
+            Some(&stop),
+            deadline,
+            16000,
+            1,
+            |_| Ok(()),
+        );
+        assert!(result.is_err(), "outer cancellation must fail the loop");
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Capture cancelled",
+            "cancellation must be explicit"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "cancellation must be prompt, not deadline-bound"
+        );
+        drop(tx);
     }
 }

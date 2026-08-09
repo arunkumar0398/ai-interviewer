@@ -2,6 +2,8 @@ use crate::audio::capture::{
     list_input_devices, list_output_devices, record_test_clip, CaptureEvent,
 };
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Device check result
@@ -17,9 +19,13 @@ pub struct DeviceCheckResult {
 
 /// Verify microphone and speaker devices are available and functional.
 /// Records a short test clip to verify mic actually captures audio.
+/// `stop_flag` is the owning command's cancellation signal (P2-2): it is
+/// propagated into the test-clip capture loop so an outer cancellation
+/// terminates the capture promptly instead of waiting for the deadline.
 pub async fn run_device_check(
     temp_dir: PathBuf,
     event_tx: mpsc::Sender<CaptureEvent>,
+    stop_flag: Arc<AtomicBool>,
 ) -> DeviceCheckResult {
     let mut errors = Vec::new();
 
@@ -57,7 +63,7 @@ pub async fn run_device_check(
 
     // Test mic recording (2 second clip)
     let mic_test_ok = if mic_available {
-        match record_test_clip(16000, 1, 2, temp_dir, event_tx.clone()).await {
+        match record_test_clip(16000, 1, 2, temp_dir, event_tx.clone(), stop_flag).await {
             Ok(path) => {
                 // Check file has reasonable size (at least 1 second of 16kHz 16-bit mono)
                 let metadata = std::fs::metadata(&path);

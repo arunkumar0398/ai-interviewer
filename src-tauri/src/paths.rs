@@ -250,22 +250,116 @@ impl AppPaths {
         Ok(())
     }
 
-    /// Validate that critical binaries and models are present. Returns the
+    /// Validate that critical binaries, models, AND Piper's required runtime
+    /// companions are present (P2-3). Packaging requires the full Piper
+    /// runtime (espeak-ng.dll, piper_phonemize.dll, onnxruntime.dll,
+    /// onnxruntime_providers_shared.dll, espeak-ng-data/) — a damaged or
+    /// hand-supplied AI_INTERVIEWER_TOOLS directory that only has the exe
+    /// would otherwise report `ready = true` and then fail at runtime.
+    /// Supports both the canonical layout (tools/piper/*) and the legacy
+    /// layout (tools/piper/piper/* + tools/piper-models/*). Returns the
     /// aggregate readiness state — callers decide whether to surface errors
     /// or degrade gracefully.
     pub fn validate_readiness(&self) -> AppReadiness {
         let mut issues = Vec::new();
 
-        // Canonical layout: tools/piper/piper.exe  (legacy: tools/piper/piper/piper.exe)
-        let piper_canonical = self.tool_dir.join("piper").join("piper.exe");
-        let piper_legacy = self.tool_dir.join("piper").join("piper").join("piper.exe");
-        if !piper_canonical.exists() && !piper_legacy.exists() {
-            issues.push(AppConfigurationIssue {
-                code: "PIPER_BINARY_MISSING".into(),
-                message: "Piper TTS binary not found".into(),
-                expected_path: Some(piper_canonical.display().to_string()),
-            });
-        }
+        // Piper assets: canonical tools/piper/<name>, legacy tools/piper/piper/<name>
+        check_piper_asset(
+            &mut issues,
+            self.tool_dir.join("piper").join("piper.exe"),
+            Some(self.tool_dir.join("piper").join("piper").join("piper.exe")),
+            "PIPER_BINARY_MISSING",
+            "Piper TTS binary not found",
+        );
+        // Piper model: canonical tools/piper/model.onnx; legacy tools/piper-models/en_US-amy-medium.onnx
+        check_piper_asset(
+            &mut issues,
+            self.tool_dir.join("piper").join("model.onnx"),
+            Some(
+                self.tool_dir
+                    .join("piper-models")
+                    .join("en_US-amy-medium.onnx"),
+            ),
+            "PIPER_MODEL_MISSING",
+            "Piper model not found",
+        );
+        check_piper_asset(
+            &mut issues,
+            self.tool_dir.join("piper").join("model.onnx.json"),
+            Some(
+                self.tool_dir
+                    .join("piper-models")
+                    .join("en_US-amy-medium.onnx.json"),
+            ),
+            "PIPER_MODEL_CONFIG_MISSING",
+            "Piper model config not found",
+        );
+        check_piper_asset(
+            &mut issues,
+            self.tool_dir.join("piper").join("espeak-ng.dll"),
+            Some(
+                self.tool_dir
+                    .join("piper")
+                    .join("piper")
+                    .join("espeak-ng.dll"),
+            ),
+            "PIPER_ESPEAK_DLL_MISSING",
+            "Piper espeak-ng DLL not found",
+        );
+        check_piper_asset(
+            &mut issues,
+            self.tool_dir.join("piper").join("piper_phonemize.dll"),
+            Some(
+                self.tool_dir
+                    .join("piper")
+                    .join("piper")
+                    .join("piper_phonemize.dll"),
+            ),
+            "PIPER_PHONEMIZE_DLL_MISSING",
+            "Piper phonemize DLL not found",
+        );
+        check_piper_asset(
+            &mut issues,
+            self.tool_dir.join("piper").join("onnxruntime.dll"),
+            Some(
+                self.tool_dir
+                    .join("piper")
+                    .join("piper")
+                    .join("onnxruntime.dll"),
+            ),
+            "PIPER_ONNX_RUNTIME_MISSING",
+            "Piper ONNX runtime DLL not found",
+        );
+        check_piper_asset(
+            &mut issues,
+            self.tool_dir
+                .join("piper")
+                .join("onnxruntime_providers_shared.dll"),
+            Some(
+                self.tool_dir
+                    .join("piper")
+                    .join("piper")
+                    .join("onnxruntime_providers_shared.dll"),
+            ),
+            "PIPER_ONNX_PROVIDER_MISSING",
+            "Piper ONNX provider DLL not found",
+        );
+        check_piper_asset(
+            &mut issues,
+            self.tool_dir
+                .join("piper")
+                .join("espeak-ng-data")
+                .join("phontab"),
+            Some(
+                self.tool_dir
+                    .join("piper")
+                    .join("piper")
+                    .join("espeak-ng-data")
+                    .join("phontab"),
+            ),
+            "PIPER_ESPEAK_DATA_MISSING",
+            "Piper espeak-ng data not found",
+        );
 
         // Whisper binary: tools/whisper/Release/main.exe
         let whisper_path = self
@@ -278,20 +372,6 @@ impl AppPaths {
                 code: "WHISPER_BINARY_MISSING".into(),
                 message: "Whisper binary not found".into(),
                 expected_path: Some(whisper_path.display().to_string()),
-            });
-        }
-
-        // Piper model: tools/piper/model.onnx (legacy: tools/piper-models/en_US-amy-medium.onnx)
-        let model_canonical = self.tool_dir.join("piper").join("model.onnx");
-        let model_legacy = self
-            .tool_dir
-            .join("piper-models")
-            .join("en_US-amy-medium.onnx");
-        if !model_canonical.exists() && !model_legacy.exists() {
-            issues.push(AppConfigurationIssue {
-                code: "PIPER_MODEL_MISSING".into(),
-                message: "Piper model not found".into(),
-                expected_path: Some(model_canonical.display().to_string()),
             });
         }
 
@@ -309,6 +389,25 @@ impl AppPaths {
             ready: issues.is_empty(),
             issues,
         }
+    }
+}
+
+/// Push a single Piper-asset issue when neither the canonical nor the legacy
+/// path exists. `expected_path` reports the canonical location.
+fn check_piper_asset(
+    issues: &mut Vec<AppConfigurationIssue>,
+    canonical: std::path::PathBuf,
+    legacy: Option<std::path::PathBuf>,
+    code: &str,
+    message: &str,
+) {
+    let exists = canonical.exists() || legacy.map(|p| p.exists()).unwrap_or(false);
+    if !exists {
+        issues.push(AppConfigurationIssue {
+            code: code.into(),
+            message: message.into(),
+            expected_path: Some(canonical.display().to_string()),
+        });
     }
 }
 
@@ -652,12 +751,97 @@ mod tests {
         }
     }
 
+    /// Build the complete canonical runtime tree used by the readiness tests.
+    fn create_canonical_runtime(tool: &std::path::Path) {
+        fs::create_dir_all(tool.join("piper")).unwrap();
+        fs::create_dir_all(tool.join("piper").join("espeak-ng-data")).unwrap();
+        for name in [
+            "piper.exe",
+            "model.onnx",
+            "model.onnx.json",
+            "espeak-ng.dll",
+            "piper_phonemize.dll",
+            "onnxruntime.dll",
+            "onnxruntime_providers_shared.dll",
+        ] {
+            fs::write(tool.join("piper").join(name), b"").unwrap();
+        }
+        fs::write(
+            tool.join("piper").join("espeak-ng-data").join("phontab"),
+            b"",
+        )
+        .unwrap();
+        fs::create_dir_all(tool.join("whisper").join("Release")).unwrap();
+        fs::write(tool.join("whisper").join("Release").join("main.exe"), b"").unwrap();
+        fs::create_dir_all(tool.join("models")).unwrap();
+        fs::write(tool.join("models").join("ggml-tiny.en.bin"), b"").unwrap();
+    }
+
+    /// All Piper runtime companions present → ready (P2-3).
     #[test]
     fn validate_readiness_passes_when_all_present() {
         let tmp = tempfile::tempdir().unwrap();
         let tool = tmp.path().join("tools");
+        create_canonical_runtime(&tool);
 
-        // Create canonical layout
+        let paths = AppPaths::from_tool_dir(tool, tmp.path().join("data")).unwrap();
+        let readiness = paths.validate_readiness();
+        assert!(readiness.ready);
+        assert!(readiness.issues.is_empty());
+    }
+
+    /// Each mandatory Piper asset, removed individually, must flip readiness
+    /// to false with its specific issue code (P2-3).
+    #[test]
+    fn validate_readiness_fails_when_each_piper_companion_missing() {
+        for (asset, code) in [
+            ("piper.exe", "PIPER_BINARY_MISSING"),
+            ("model.onnx", "PIPER_MODEL_MISSING"),
+            ("model.onnx.json", "PIPER_MODEL_CONFIG_MISSING"),
+            ("espeak-ng.dll", "PIPER_ESPEAK_DLL_MISSING"),
+            ("piper_phonemize.dll", "PIPER_PHONEMIZE_DLL_MISSING"),
+            ("onnxruntime.dll", "PIPER_ONNX_RUNTIME_MISSING"),
+            (
+                "onnxruntime_providers_shared.dll",
+                "PIPER_ONNX_PROVIDER_MISSING",
+            ),
+            ("espeak-ng-data/phontab", "PIPER_ESPEAK_DATA_MISSING"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let tool = tmp.path().join("tools");
+            create_canonical_runtime(&tool);
+            // Remove exactly this one asset.
+            fs::remove_file(tool.join("piper").join(asset)).unwrap();
+
+            let paths = AppPaths::from_tool_dir(tool.clone(), tmp.path().join("data")).unwrap();
+            let readiness = paths.validate_readiness();
+            assert!(!readiness.ready, "removing {} must flip readiness", asset);
+            let issue = readiness
+                .issues
+                .iter()
+                .find(|i| i.code == code)
+                .unwrap_or_else(|| panic!("missing issue code {} for {}", code, asset));            // Compare the final path component (asset may contain a subdir
+            // like "espeak-ng-data/phontab", and separators differ per OS).
+            let file_name = asset.rsplit('/').next().unwrap_or(asset);
+            assert!(
+                issue
+                    .expected_path
+                    .as_deref()
+                    .unwrap_or("")
+                    .ends_with(file_name),
+                "expected_path must name the missing asset, got {:?}",
+                issue.expected_path
+            );
+        }
+    }
+
+    /// A damaged tools dir with only the exe and model (no companions) must
+    /// NOT report ready (P2-3): Piper would fail at runtime.
+    #[test]
+    fn validate_readiness_rejects_exe_only_piper_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("tools");
+
         fs::create_dir_all(tool.join("piper")).unwrap();
         fs::write(tool.join("piper").join("piper.exe"), b"").unwrap();
         fs::write(tool.join("piper").join("model.onnx"), b"").unwrap();
@@ -668,16 +852,54 @@ mod tests {
 
         let paths = AppPaths::from_tool_dir(tool, tmp.path().join("data")).unwrap();
         let readiness = paths.validate_readiness();
-        assert!(readiness.ready);
-        assert!(readiness.issues.is_empty());
+        assert!(!readiness.ready, "exe-only piper dir must not be ready");
+        for code in [
+            "PIPER_MODEL_CONFIG_MISSING",
+            "PIPER_ESPEAK_DLL_MISSING",
+            "PIPER_PHONEMIZE_DLL_MISSING",
+            "PIPER_ONNX_RUNTIME_MISSING",
+            "PIPER_ONNX_PROVIDER_MISSING",
+            "PIPER_ESPEAK_DATA_MISSING",
+        ] {
+            assert!(
+                readiness.issues.iter().any(|i| i.code == code),
+                "missing companion issue {} must be reported",
+                code
+            );
+        }
     }
 
+    /// The legacy layout, when fully populated, is still valid (P2-3).
     #[test]
-    fn validate_readiness_fails_when_piper_missing() {
+    fn validate_readiness_legacy_layout_fully_validated() {
         let tmp = tempfile::tempdir().unwrap();
         let tool = tmp.path().join("tools");
 
-        // Everything except piper
+        fs::create_dir_all(tool.join("piper").join("piper").join("espeak-ng-data")).unwrap();
+        for name in [
+            "piper.exe",
+            "espeak-ng.dll",
+            "piper_phonemize.dll",
+            "onnxruntime.dll",
+            "onnxruntime_providers_shared.dll",
+        ] {
+            fs::write(tool.join("piper").join("piper").join(name), b"").unwrap();
+        }
+        fs::write(
+            tool.join("piper")
+                .join("piper")
+                .join("espeak-ng-data")
+                .join("phontab"),
+            b"",
+        )
+        .unwrap();
+        fs::create_dir_all(tool.join("piper-models")).unwrap();
+        fs::write(tool.join("piper-models").join("en_US-amy-medium.onnx"), b"").unwrap();
+        fs::write(
+            tool.join("piper-models").join("en_US-amy-medium.onnx.json"),
+            b"",
+        )
+        .unwrap();
         fs::create_dir_all(tool.join("whisper").join("Release")).unwrap();
         fs::write(tool.join("whisper").join("Release").join("main.exe"), b"").unwrap();
         fs::create_dir_all(tool.join("models")).unwrap();
@@ -685,11 +907,7 @@ mod tests {
 
         let paths = AppPaths::from_tool_dir(tool, tmp.path().join("data")).unwrap();
         let readiness = paths.validate_readiness();
-        assert!(!readiness.ready);
-        assert!(readiness
-            .issues
-            .iter()
-            .any(|i| i.code == "PIPER_BINARY_MISSING"));
+        assert!(readiness.ready, "fully-populated legacy layout must pass");
     }
 
     #[test]

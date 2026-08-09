@@ -397,27 +397,39 @@ async fn check_audio_devices(
 ) -> Result<interview::device_check::DeviceCheckResult, String> {
     let (tx, _rx) = mpsc::channel(32);
 
-    // P2-1: route the device-test microphone capture through the SAME
-    // exclusive capture-ownership mechanism as interview recording. A device
-    // check cannot overlap an interview round (or another device check); the
-    // slot is released deterministically on success, error, and timeout.
+    // P2-2: route the device-test microphone capture through the SAME
+    // exclusive capture-ownership mechanism as interview recording, AND own
+    // the actual device-check worker with the same lifecycle guarantees: the
+    // shared stop flag is propagated into the test-clip capture loop, so on
+    // cancellation the worker terminates (cleaning its temp WAV) before the
+    // slot is released. A dropped command can never leave a detached blocking
+    // capture or free the slot while the capture is still alive.
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handle = audio::capture::RecordingHandle {
         stop: stop_flag.clone(),
     };
     acquire_recording(&state, handle).await?;
 
-    // Safety net for panic/cancellation: owns the slot lease and clears it on
-    // drop if not explicitly cleared below. No worker is attached here — the
-    // device test capture is internally bounded (wall-clock deadline).
-    let recording_guard = RecordingGuard::<()>::new(state.inner().clone(), stop_flag);
+    let mut recording_guard = RecordingGuard::new(state.inner().clone(), stop_flag.clone());
 
-    let result = interview::device_check::run_device_check(paths.paths.temp_dir.clone(), tx).await;
+    let temp_dir = paths.paths.temp_dir.clone();
+    let worker_stop = stop_flag.clone();
+    let worker = tokio::spawn(async move {
+        interview::device_check::run_device_check(temp_dir, tx, worker_stop).await
+    });
+    recording_guard.attach_worker(worker);
 
     // Release the slot on every outcome (success, error, timeout) and disarm
     // the safety net.
+    let join_result = recording_guard.take_result().await;
     clear_active_recording(&state).await;
     recording_guard.disarm();
+
+    let result = match join_result {
+        Some(Ok(result)) => result,
+        Some(Err(e)) => return Err(format!("Device check worker failed: {}", e)),
+        None => return Err("Device check worker handle lost".to_string()),
+    };
 
     Ok(result)
 }
@@ -432,6 +444,28 @@ struct InterviewRoundResult {
 /// Number of questions in the current fixed flow. Finality is derived on the
 /// backend from this constant — the frontend never supplies `is_final`.
 const EXPECTED_ROUNDS: i32 = 5;
+
+/// Maximum accepted question length at the Rust boundary.
+const MAX_QUESTION_LEN: usize = 10_000;
+
+/// Validate question text at the Rust boundary (P2-1). Runs BEFORE any DB
+/// preflight, recording-slot acquisition, or hardware work: a blank or
+/// oversized question must never reach TTS, recording, or persistence.
+/// Returns the TRIMMED text, used consistently for TTS, phase reporting,
+/// retry, and persistence.
+fn validate_question(question: &str) -> Result<String, String> {
+    let question = question.trim();
+    if question.is_empty() {
+        return Err("Question cannot be empty".to_string());
+    }
+    if question.len() > MAX_QUESTION_LEN {
+        return Err(format!(
+            "Question too long (max {} characters)",
+            MAX_QUESTION_LEN
+        ));
+    }
+    Ok(question.to_string())
+}
 
 /// Backend-authoritative preflight for a round request. Verifies — BEFORE any
 /// audio/hardware work — that the session exists and is not completed, that
@@ -515,6 +549,11 @@ async fn run_interview_round(
     db_state: State<'_, Arc<DbState>>,
     app: tauri::AppHandle,
 ) -> Result<InterviewRoundResult, String> {
+    // Backend question validation (P2-1) — the FIRST check, before any DB
+    // preflight, slot acquisition, or audio work. The trimmed text is used
+    // consistently for TTS, phase reporting, retry, and persistence.
+    let question = validate_question(&question)?;
+
     // Backend-authoritative session lifecycle and round order — ALL checks run
     // BEFORE any audio/hardware work. Finality is derived here, never trusted
     // from the client.
@@ -1331,5 +1370,52 @@ mod tests {
         // After completion, no further rounds may run.
         let err = preflight_round(&db, "s1", 5).unwrap_err();
         assert!(err.contains("already completed"));
+    }
+
+    // ------------------------------------------------------------------
+    // P2-1: backend question validation at the Rust boundary
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn validate_question_rejects_empty() {
+        let err = validate_question("").unwrap_err();
+        assert!(
+            err.contains("cannot be empty"),
+            "empty question must be rejected, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_question_rejects_whitespace_only() {
+        let err = validate_question("   \t\n ").unwrap_err();
+        assert!(
+            err.contains("cannot be empty"),
+            "whitespace-only question must be rejected, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_question_rejects_oversized() {
+        let long = "x".repeat(MAX_QUESTION_LEN + 1);
+        let err = validate_question(&long).unwrap_err();
+        assert!(
+            err.contains("too long"),
+            "oversized question must be rejected, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_question_accepts_at_limit() {
+        let at_limit = "x".repeat(MAX_QUESTION_LEN);
+        assert!(validate_question(&at_limit).is_ok());
+    }
+
+    #[test]
+    fn validate_question_accepts_and_trims() {
+        let trimmed = validate_question("  Tell me about yourself.  ").unwrap();
+        assert_eq!(trimmed, "Tell me about yourself.");
     }
 }

@@ -173,6 +173,20 @@ impl Database {
                 ALTER TABLE rounds_new RENAME TO rounds;
 
                 CREATE INDEX IF NOT EXISTS idx_rounds_session ON rounds(session_id);
+
+                -- Reconcile sessions.total_rounds with the LOGICAL round count
+                -- that remains after deduplication. v1 could store a stale
+                -- counter (e.g. 0) while rounds existed, and duplicate physical
+                -- rows collapse into fewer logical rounds — either way the
+                -- counter must match the persisted rounds so later rounds
+                -- increment from a correct base and a completed session ends
+                -- with the right total.
+                UPDATE sessions
+                SET total_rounds = (
+                    SELECT COUNT(*)
+                    FROM rounds
+                    WHERE rounds.session_id = sessions.id
+                );
                 ",
             );
             match result {

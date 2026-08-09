@@ -3,6 +3,7 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import Link from "next/link";
+import { INTERVIEW_QUESTIONS } from "../../lib/interview-questions";
 
 interface InterviewSession {
   id: string;
@@ -27,14 +28,8 @@ interface InterviewRound {
   created_at: string;
 }
 
-const QUESTIONS = [
-  "Tell me about yourself and your background.",
-  "What is your experience with Rust or systems programming?",
-  "Describe a challenging technical problem you solved recently.",
-  "How do you approach debugging complex issues?",
-  "What interests you about this role?",
-];
-
+// The question bank is the SAME fixed set /interview asks (single shared
+// source of truth, P1-2) — read-only in this version.
 export default function DashboardPage() {
   const [sessions, setSessions] = useState<InterviewSession[]>([]);
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
@@ -142,7 +137,10 @@ export default function DashboardPage() {
                     <p className="text-xs text-gray-500 mt-1">
                       Go to{" "}
                       <Link
-                        href={`/interview?session=${activeSession.id}&name=${encodeURIComponent(activeSession.name)}`}
+                        // Session-only navigation (P2-4): the candidate name
+                        // stays in the DB, never in the URL (history,
+                        // screenshots, logs, copy/paste).
+                        href={`/interview?session=${activeSession.id}`}
                         className="text-blue-600 underline"
                       >
                         /interview
@@ -163,7 +161,7 @@ export default function DashboardPage() {
               template/session-snapshot feature.
             </p>
             <ol className="space-y-2 max-h-96 overflow-y-auto list-decimal list-inside">
-              {QUESTIONS.map((q, i) => (
+              {INTERVIEW_QUESTIONS.map((q, i) => (
                 <li key={i} className="text-sm text-gray-700">
                   {q}
                 </li>

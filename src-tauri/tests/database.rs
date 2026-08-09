@@ -983,6 +983,186 @@ fn db_schema_v1_to_v2_migration_deterministic_tiebreak() {
         rounds[1].question, "Q2-new",
         "Should keep highest-id row for round_index=1"
     );
+    // Surviving physical rows are exactly the highest ids (3 and 5).
+    assert_eq!(rounds[0].id, 3, "round_index=0 keeps id=3");
+    assert_eq!(rounds[1].id, 5, "round_index=1 keeps id=5");
+    // P1-1: total_rounds is reconciled to the LOGICAL count after
+    // deduplication — 5 physical rows collapse into 2 logical rounds, so the
+    // stale stored counter (3) must become 2.
+    let sessions = db.get_sessions().unwrap();
+    assert_eq!(
+        sessions[0].total_rounds, 2,
+        "total_rounds must match logical round count"
+    );
 
     let _ = std::fs::remove_file(&db_path);
+}
+
+/// P1-1 Case A: a v1 session with a STALE total_rounds (0) and two persisted
+/// rounds migrates to total_rounds == 2 — the counter is reconciled inside the
+/// same migration transaction.
+#[test]
+fn db_schema_v1_to_v2_reconciles_stale_total_rounds() {
+    let db_path = std::env::temp_dir().join("test_migration_v1_v2_stale_count.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA user_version=1;").unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                candidate_name TEXT NOT NULL DEFAULT '',
+                started_at TEXT NOT NULL DEFAULT (datetime('now')),
+                completed_at TEXT,
+                total_rounds INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE rounds (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                round_index INTEGER NOT NULL,
+                question TEXT NOT NULL,
+                transcription TEXT NOT NULL DEFAULT '',
+                audio_path TEXT NOT NULL DEFAULT '',
+                sha256 TEXT NOT NULL DEFAULT '',
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                sample_rate INTEGER NOT NULL DEFAULT 16000,
+                channels INTEGER NOT NULL DEFAULT 1,
+                file_size_bytes INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+            ",
+        )
+        .unwrap();
+
+        // Stale counter: total_rounds = 0 while two rounds exist.
+        conn.execute(
+            "INSERT INTO sessions (id, candidate_name, total_rounds) VALUES ('s1', 'Alice', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO rounds (session_id, round_index, question, transcription) VALUES ('s1', 0, 'Q1', 'A1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO rounds (session_id, round_index, question, transcription) VALUES ('s1', 1, 'Q2', 'A2')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
+
+    let sessions = db.get_sessions().unwrap();
+    assert_eq!(sessions[0].total_rounds, 2, "stale 0 must reconcile to 2");
+    let rounds = db.get_rounds("s1").unwrap();
+    assert_eq!(rounds.len(), 2, "both rounds remain");
+
+    // Schema version must be 2 after the migration.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let version: u32 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 2, "user_version must become 2");
+
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+}
+
+/// P1-1 Case C: after migrating rounds [0, 1] (with a stale counter), the
+/// session continues through rounds 2, 3, 4 — the final session must end with
+/// total_rounds == 5 and completed_at populated.
+#[test]
+fn db_schema_v1_to_v2_reconciled_count_continues_to_completion() {
+    let db_path = std::env::temp_dir().join("test_migration_v1_v2_continue.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA user_version=1;").unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                candidate_name TEXT NOT NULL DEFAULT '',
+                started_at TEXT NOT NULL DEFAULT (datetime('now')),
+                completed_at TEXT,
+                total_rounds INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE rounds (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                round_index INTEGER NOT NULL,
+                question TEXT NOT NULL,
+                transcription TEXT NOT NULL DEFAULT '',
+                audio_path TEXT NOT NULL DEFAULT '',
+                sha256 TEXT NOT NULL DEFAULT '',
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                sample_rate INTEGER NOT NULL DEFAULT 16000,
+                channels INTEGER NOT NULL DEFAULT 1,
+                file_size_bytes INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+            ",
+        )
+        .unwrap();
+
+        // Stale counter (0) with rounds [0, 1].
+        conn.execute(
+            "INSERT INTO sessions (id, candidate_name, total_rounds) VALUES ('s1', 'Alice', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO rounds (session_id, round_index, question, transcription) VALUES ('s1', 0, 'Q1', 'A1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO rounds (session_id, round_index, question, transcription) VALUES ('s1', 1, 'Q2', 'A2')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
+
+    // Reconcile happened: counter starts at 2, not 0.
+    assert_eq!(db.get_session("s1").unwrap().unwrap().total_rounds, 2);
+
+    // Complete rounds 2, 3, 4 (final).
+    for (index, is_final) in [(2, false), (3, false), (4, true)] {
+        db.insert_round_with_session_update(
+            "s1",
+            index,
+            &format!("Q{}", index + 1),
+            &format!("A{}", index + 1),
+            "/tmp/x.wav",
+            "hash",
+            5000,
+            16000,
+            1,
+            160044,
+            is_final,
+        )
+        .unwrap();
+    }
+
+    let session = db.get_session("s1").unwrap().unwrap();
+    assert_eq!(db.get_rounds("s1").unwrap().len(), 5, "5 rounds persisted");
+    assert_eq!(session.total_rounds, 5, "total_rounds must end at 5");
+    assert!(
+        session.completed_at.is_some(),
+        "completed_at must be populated after the final round"
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
 }

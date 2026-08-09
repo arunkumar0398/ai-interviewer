@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import DashboardPage from "../app/dashboard/page";
+import { INTERVIEW_QUESTIONS } from "../lib/interview-questions";
 
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -131,14 +132,9 @@ describe("Dashboard Page", () => {
       expect(screen.getByText("Question Bank")).toBeInTheDocument();
     });
 
-    // Default questions are listed read-only.
-    for (const q of [
-      "Tell me about yourself and your background.",
-      "What is your experience with Rust or systems programming?",
-      "Describe a challenging technical problem you solved recently.",
-      "How do you approach debugging complex issues?",
-      "What interests you about this role?",
-    ]) {
+    // Default questions are listed read-only — and they are exactly the
+    // shared set the Interview page asks (P1-2).
+    for (const q of INTERVIEW_QUESTIONS) {
       expect(screen.getByText(q)).toBeInTheDocument();
     }
   });
@@ -173,19 +169,24 @@ describe("Dashboard Page", () => {
     });
     fireEvent.click(screen.getByText("Start Interview"));
 
-    // Session created, then the handoff link carries id + name.
+    // Session created; the handoff link carries ONLY the session id (P2-4 —
+    // the candidate name stays in the DB, never in the URL).
     await waitFor(() => {
       const link = screen.getByText("/interview").closest("a");
       expect(link).toHaveAttribute(
         "href",
-        expect.stringMatching(/^\/interview\?session=[0-9a-f-]+&name=Alice$/)
+        expect.stringMatching(/^\/interview\?session=[0-9a-f-]+$/)
       );
     });
+    const link = screen.getByText("/interview").closest("a");
+    const href = link!.getAttribute("href") ?? "";
+    expect(href).not.toContain("name=");
+
+    // The candidate name is still used when creating the DB session.
     const createCall = mockInvoke.mock.calls.find(([cmd]) => cmd === "create_session");
     expect(createCall).toBeDefined();
     const args = createCall![1] as { sessionId: string; candidateName: string };
     expect(args.candidateName).toBe("Alice");
-    const link = screen.getByText("/interview").closest("a");
-    expect(link!.getAttribute("href")).toContain(`session=${args.sessionId}`);
+    expect(href).toContain(`session=${args.sessionId}`);
   });
 });

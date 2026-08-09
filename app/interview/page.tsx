@@ -3,6 +3,7 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { INTERVIEW_QUESTIONS } from "../../lib/interview-questions";
 
 interface PhaseEventPayload {
   phase: string;
@@ -67,14 +68,6 @@ type RetryTarget =
   | { kind: "readiness" }
   | { kind: "session-init" };
 
-const QUESTIONS = [
-  "Tell me about yourself and your background.",
-  "What are your strengths and weaknesses?",
-  "Why are you interested in this position?",
-  "Describe a challenging project you worked on.",
-  "Where do you see yourself in five years?",
-];
-
 export default function InterviewPage() {
   const [phase, setPhase] = useState<InterviewPhase>("checking-tools");
   const [toolsStatus, setToolsStatus] = useState<ToolsStatus | null>(null);
@@ -89,22 +82,22 @@ export default function InterviewPage() {
   const [retryTarget, setRetryTarget] = useState<RetryTarget | null>(null);
 
   // When the Recruiter Dashboard created the session, it hands it off here via
-  // ?session=<uuid>&name=<name>: the interview then continues THAT session
-  // instead of creating a second, orphan one (P1-1). The handoff is read
-  // synchronously (the query string is static for the page lifetime) and
-  // nothing derived from it is rendered, so the static prerender is
-  // unaffected. No setState-in-effect is needed.
-  const handoff = (() => {
-    if (typeof window === "undefined") return { session: null, name: null };
-    const params = new URLSearchParams(window.location.search);
-    return { session: params.get("session"), name: params.get("name") };
+  // ?session=<uuid> (P2-4: session-only — the candidate name stays in the DB,
+  // never in the URL). The interview then continues THAT session instead of
+  // creating a second, orphan one (P1-1). The handoff is read synchronously
+  // (the query string is static for the page lifetime) and nothing derived
+  // from it is rendered, so the static prerender is unaffected. No
+  // setState-in-effect is needed.
+  const handedOffSession = (() => {
+    if (typeof window === "undefined") return null;
+    return new URLSearchParams(window.location.search).get("session");
   })();
 
   // Stable session ID for the entire interview flow (one session across all
   // rounds): the Dashboard's session when handed off, otherwise a fresh one.
-  const [sessionId] = useState(() => handoff.session ?? crypto.randomUUID());
+  const [sessionId] = useState(() => handedOffSession ?? crypto.randomUUID());
   const sessionIdRef = useRef(sessionId);
-  const [candidateName] = useState(handoff.name ?? "Candidate");
+  const [candidateName] = useState("Candidate");
 
   // Backend-authoritative session lifecycle: tracks whether create_session
   // has been called and whether the session is ready for round execution. A
@@ -112,7 +105,7 @@ export default function InterviewPage() {
   // ready and create_session is never called for it.
   type SessionInitState = "idle" | "creating" | "ready" | "error";
   const [sessionInitState, setSessionInitState] = useState<SessionInitState>(
-    handoff.session ? "ready" : "idle"
+    handedOffSession ? "ready" : "idle"
   );
 
   // Ref-based guard to prevent concurrent double-starts while session creation
@@ -240,7 +233,7 @@ export default function InterviewPage() {
 
   // Start interview round — let backend phase events drive the UI
   const handleStartRound = useCallback(async () => {
-    if (currentRound >= QUESTIONS.length) {
+    if (currentRound >= INTERVIEW_QUESTIONS.length) {
       // All rounds done — the backend derived finality and completed the
       // session atomically on the final round.
       setPhase("showing-result");
@@ -276,7 +269,7 @@ export default function InterviewPage() {
         }
       }
 
-      const question = QUESTIONS[currentRound];
+      const question = INTERVIEW_QUESTIONS[currentRound];
       setCurrentQuestion(question);
       setRetryTarget(null);
 
@@ -298,7 +291,7 @@ export default function InterviewPage() {
       } else {
         setPhase("error");
         setError(String(e));
-        setRetryTarget({ kind: "round", question: QUESTIONS[currentRound] });
+        setRetryTarget({ kind: "round", question: INTERVIEW_QUESTIONS[currentRound] });
       }
     } finally {
       isStartingRound.current = false;
@@ -471,7 +464,7 @@ export default function InterviewPage() {
               Interview Progress
             </h2>
             <p className="text-sm text-zinc-600 dark:text-zinc-400 mb-4">
-              Round {currentRound + 1} of {QUESTIONS.length}
+              Round {currentRound + 1} of {INTERVIEW_QUESTIONS.length}
             </p>
             <button
               onClick={handleStartRound}
@@ -567,7 +560,7 @@ export default function InterviewPage() {
                 </p>
               </div>
             </div>
-            {currentRound < QUESTIONS.length ? (
+            {currentRound < INTERVIEW_QUESTIONS.length ? (
               <button
                 onClick={handleStartRound}
                 className="w-full mt-4 px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700"
@@ -616,7 +609,7 @@ export default function InterviewPage() {
                     className="p-2 bg-zinc-50 dark:bg-zinc-900 rounded text-sm"
                   >
                     <p className="font-medium text-zinc-700 dark:text-zinc-300">
-                      Q{i + 1}: {QUESTIONS[i]}
+                      Q{i + 1}: {INTERVIEW_QUESTIONS[i]}
                     </p>
                     <p className="text-zinc-500 dark:text-zinc-400 italic mt-1">
                       A: {r.transcription || "(no speech)"}
