@@ -1,6 +1,6 @@
 use crate::audio::capture::{
-    get_default_output_device_name, list_input_devices, record_test_clip, CaptureCompletion,
-    CaptureEvent,
+    get_default_output_device_name, list_input_devices, record_test_clip,
+    validate_production_playback_stream, CaptureCompletion, CaptureEvent,
 };
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -51,7 +51,7 @@ pub async fn run_device_check(
     // round playback) selects cpal's `default_output_device()`, so enumerating
     // ANY output device is NOT sufficient: a non-default speaker alone must
     // not mark speaker readiness (P2-1).
-    let (speaker_available, speaker_name) = match get_default_output_device_name().await {
+    let (mut speaker_available, mut speaker_name) = match get_default_output_device_name().await {
         Ok(Some(name)) => (true, Some(name)),
         Ok(None) => {
             errors.push(
@@ -64,6 +64,22 @@ pub async fn run_device_check(
             (false, None)
         }
     };
+
+    // RC-4: a default output device existing is NOT enough — production Piper
+    // playback must be able to create its exact stream (mono, 22050 Hz) on it.
+    // Validate silently and bounded; if the production stream cannot be
+    // created, speaker readiness FAILS so the interview cannot start into a
+    // first question the candidate could not hear.
+    if speaker_available {
+        match validate_production_playback_stream().await {
+            Ok(_) => {}
+            Err(e) => {
+                errors.push(format!("Speaker not ready for interview playback: {}", e));
+                speaker_available = false;
+                speaker_name = None;
+            }
+        }
+    }
 
     // Test mic recording (2 second clip)
     let mic_test_ok = if mic_available {

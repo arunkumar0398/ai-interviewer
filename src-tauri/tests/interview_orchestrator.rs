@@ -84,14 +84,19 @@ fn piper_verify_all_present() {
 
     // Coherent legacy model/config pair.
     let model_path = fake_dir.join("piper-models").join("en_US-amy-medium.onnx");
-    let model_config = fake_dir.join("piper-models").join("en_US-amy-medium.onnx.json");
+    let model_config = fake_dir
+        .join("piper-models")
+        .join("en_US-amy-medium.onnx.json");
     std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
     std::fs::write(&model_path, b"fake model").unwrap();
     std::fs::write(&model_config, b"{}").unwrap();
 
     let paths = fake_app_paths(&fake_dir);
     let result = ai_interviewer_lib::audio::tts_supervisor::verify_piper_installation(&paths);
-    assert!(result.is_ok(), "Should succeed when the complete runtime exists");
+    assert!(
+        result.is_ok(),
+        "Should succeed when the complete runtime exists"
+    );
 
     let _ = std::fs::remove_dir_all(&fake_dir);
 }

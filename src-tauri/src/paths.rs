@@ -606,9 +606,15 @@ impl ResolvedTools {
 pub fn resolve_tools(tool_dir: &Path) -> ResolvedTools {
     // Piper binary AND model resolve from ONE coherent layout (P1-3): the
     // selected layout decides both — a stray canonical model next to a
-    // selected legacy runtime is never picked up.
+    // selected legacy runtime is never picked up. Each field is `Some` ONLY
+    // when that asset actually exists (RC-5): `ready()` must never report
+    // true while a critical asset (e.g. the Piper model) is missing.
     let (piper_bin, piper_model) = match resolve_piper(tool_dir) {
-        Some(piper) => (Some(piper.executable), Some(piper.model)),
+        Some(piper) => {
+            let bin = piper.executable.exists().then_some(piper.executable);
+            let model = piper.model.exists().then_some(piper.model);
+            (bin, model)
+        }
         None => (None, None),
     };
 
@@ -1435,5 +1441,89 @@ mod tests {
         assert!(tools.piper_model.is_none());
         assert!(tools.whisper_bin.is_none());
         assert!(tools.whisper_model.is_none());
+    }
+
+    /// RC-5: `ResolvedTools::ready()` must reflect actual asset EXISTENCE,
+    /// never merely the layout's expected paths. Each field is `Some` only
+    /// when the file exists; any missing critical asset flips ready() to
+    /// false. Coherent legacy layout still reports ready when complete.
+    #[test]
+    fn resolve_tools_ready_reflects_asset_existence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("tools");
+
+        // 1. Piper executable present + Piper model MISSING -> not ready.
+        fs::create_dir_all(tool.join("piper")).unwrap();
+        fs::write(tool.join("piper").join("piper.exe"), b"").unwrap();
+        fs::create_dir_all(tool.join("whisper").join("Release")).unwrap();
+        fs::write(tool.join("whisper").join("Release").join("main.exe"), b"").unwrap();
+        fs::create_dir_all(tool.join("models")).unwrap();
+        fs::write(tool.join("models").join("ggml-tiny.en.bin"), b"").unwrap();
+
+        let tools = resolve_tools(&tool);
+        assert_eq!(tools.piper_bin, Some(tool.join("piper").join("piper.exe")));
+        assert!(
+            tools.piper_model.is_none(),
+            "missing Piper model must resolve to None"
+        );
+        assert!(!tools.ready(), "piper exe without model must not be ready");
+
+        // 2. Piper model present + Piper executable MISSING -> not ready
+        // (no coherent layout is selected, so neither Piper field is set).
+        let tmp2 = tempfile::tempdir().unwrap();
+        let tool2 = tmp2.path().join("tools");
+        fs::create_dir_all(tool2.join("piper")).unwrap();
+        fs::write(tool2.join("piper").join("model.onnx"), b"").unwrap();
+        fs::create_dir_all(tool2.join("whisper").join("Release")).unwrap();
+        fs::write(tool2.join("whisper").join("Release").join("main.exe"), b"").unwrap();
+        fs::create_dir_all(tool2.join("models")).unwrap();
+        fs::write(tool2.join("models").join("ggml-tiny.en.bin"), b"").unwrap();
+
+        let tools = resolve_tools(&tool2);
+        assert!(
+            tools.piper_bin.is_none(),
+            "missing exe must resolve to None"
+        );
+        assert!(
+            tools.piper_model.is_none(),
+            "no coherent layout selected -> no model field"
+        );
+        assert!(!tools.ready(), "model without executable must not be ready");
+
+        // 3. Whisper executable MISSING -> not ready.
+        let tmp3 = tempfile::tempdir().unwrap();
+        let tool3 = tmp3.path().join("tools");
+        create_canonical_runtime(&tool3);
+        fs::remove_file(tool3.join("whisper").join("Release").join("main.exe")).unwrap();
+        let tools = resolve_tools(&tool3);
+        assert!(tools.whisper_bin.is_none());
+        assert!(!tools.ready(), "missing whisper exe must not be ready");
+
+        // 4. Whisper model MISSING -> not ready.
+        let tmp4 = tempfile::tempdir().unwrap();
+        let tool4 = tmp4.path().join("tools");
+        create_canonical_runtime(&tool4);
+        fs::remove_file(tool4.join("models").join("ggml-tiny.en.bin")).unwrap();
+        let tools = resolve_tools(&tool4);
+        assert!(tools.whisper_model.is_none());
+        assert!(!tools.ready(), "missing whisper model must not be ready");
+
+        // 5. Complete canonical tree -> ready.
+        let tmp5 = tempfile::tempdir().unwrap();
+        let tool5 = tmp5.path().join("tools");
+        create_canonical_runtime(&tool5);
+        assert!(
+            resolve_tools(&tool5).ready(),
+            "complete canonical must be ready"
+        );
+
+        // 6. Complete coherent legacy tree -> ready.
+        let tmp6 = tempfile::tempdir().unwrap();
+        let tool6 = tmp6.path().join("tools");
+        create_legacy_runtime(&tool6);
+        assert!(
+            resolve_tools(&tool6).ready(),
+            "complete legacy must be ready"
+        );
     }
 }

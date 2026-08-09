@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -32,18 +32,42 @@ impl RecordingHandle {
     }
 }
 
-/// Tracks the lifecycle of the PHYSICAL blocking capture worker so
-/// recording-slot owners can prove it has terminated before releasing the
-/// slot (P1-1). A `tokio::spawn` wrapper can be aborted without killing an
-/// already-running `spawn_blocking` CPAL closure, so slot release must wait
-/// on `wait()` rather than trusting the outer wrapper. `started`
-/// distinguishes "a capture was in flight" from "the worker died before any
-/// capture began" (e.g. aborted during TTS) — the latter must never block
-/// the slot indefinitely.
+/// Tri-state lifecycle of the PHYSICAL blocking capture worker (RC-2).
+/// `NotScheduled -> Scheduled -> Finished`:
+///
+/// - `NotScheduled`: `spawn_blocking` has not been submitted yet — the
+///   outer async wrapper is the whole lifecycle, so aborting it is safe
+///   (nothing physical can ever start).
+/// - `Scheduled`: the blocking capture HAS been submitted (marked BEFORE
+///   `spawn_blocking`, with no await in between) but the closure has not
+///   signalled `Finished`. The physical closure may begin executing at any
+///   moment — or sit queued on a busy blocking pool — so the recording slot
+///   MUST remain occupied. There is deliberately no intermediate "started"
+///   state: scheduled-but-not-yet-started is indistinguishable from running,
+///   and both own the slot.
+/// - `Finished`: the blocking closure has fully exited — safe to release
+///   the slot.
+///
+/// Recording-slot owners wait on `wait()` rather than trusting the outer
+/// `tokio::spawn` wrapper: aborting an async task cannot kill an
+/// already-submitted `spawn_blocking` CPAL closure, and a queued closure can
+/// start only after the slot would already have been released.
 #[derive(Clone, Default)]
 pub struct CaptureCompletion {
     inner: Arc<tokio::sync::Notify>,
-    started: Arc<AtomicBool>,
+    state: Arc<AtomicU8>,
+}
+
+// 0 = NotScheduled (the default), 1 = Scheduled, 2 = Finished.
+const STATE_SCHEDULED: u8 = 1;
+const STATE_FINISHED: u8 = 2;
+
+/// Observable capture lifecycle state (RC-2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CaptureState {
+    NotScheduled,
+    Scheduled,
+    Finished,
 }
 
 impl CaptureCompletion {
@@ -51,26 +75,56 @@ impl CaptureCompletion {
         Self::default()
     }
 
-    /// Called when the blocking capture closure begins executing.
-    pub fn mark_started(&self) {
-        self.started.store(true, Ordering::SeqCst);
+    /// MUST be called immediately BEFORE `tokio::task::spawn_blocking` with
+    /// no await in between (RC-2): once Scheduled, the recording slot can
+    /// never be freed until `Finished` is observed. This closes the race
+    /// where a blocking closure is queued (pool busy) but has not begun
+    /// executing when the owning command is cancelled — the slot stays
+    /// occupied and the queued capture can never start after slot release.
+    pub fn mark_scheduled(&self) {
+        self.state.store(STATE_SCHEDULED, Ordering::SeqCst);
     }
 
-    /// Whether a blocking capture was actually started.
-    pub fn started(&self) -> bool {
-        self.started.load(Ordering::SeqCst)
+    /// Current lifecycle state.
+    pub fn state(&self) -> CaptureState {
+        match self.state.load(Ordering::SeqCst) {
+            STATE_SCHEDULED => CaptureState::Scheduled,
+            STATE_FINISHED => CaptureState::Finished,
+            _ => CaptureState::NotScheduled,
+        }
+    }
+
+    /// Whether a blocking capture has been submitted and has not yet
+    /// finished — the slot must remain occupied.
+    pub fn scheduled(&self) -> bool {
+        matches!(self.state(), CaptureState::Scheduled)
+    }
+
+    /// Whether the blocking capture closure has fully exited.
+    pub fn finished(&self) -> bool {
+        self.state() == CaptureState::Finished
     }
 
     /// Wait until the blocking capture closure has exited. Signalled exactly
     /// once, on success or failure; the signal is stored if no waiter is
     /// present yet, so a late waiter still completes immediately.
     pub async fn wait(&self) {
-        self.inner.notified().await;
+        loop {
+            if self.finished() {
+                return;
+            }
+            let notified = self.inner.notified();
+            if self.finished() {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Signal that the blocking closure has exited. Must be called at most
     /// once per completion.
     pub fn signal(&self) {
+        self.state.store(STATE_FINISHED, Ordering::SeqCst);
         self.inner.notify_one();
     }
 }
@@ -288,13 +342,18 @@ pub async fn record_to_wav(
     let ch = channels;
     let temp_path = output_path.with_extension("wav.tmp");
 
+    // RC-2: the capture becomes `Scheduled` BEFORE spawn_blocking is
+    // submitted, with no await in between — a blocking closure queued on a
+    // busy pool still owns the recording slot, so the slot can never be
+    // freed while a physical capture might start later.
+    completion.mark_scheduled();
+
     tokio::task::spawn_blocking(move || -> anyhow::Result<RecordResult> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
         // P1-1: the physical capture lifecycle is signalled on every exit
         // path — slot owners wait on `completion` before releasing the slot.
         let _lifecycle = BlockingCaptureLifecycle(completion.clone());
-        completion.mark_started();
 
         // Stale partial from a previous crashed run: remove it explicitly as
         // stale so this invocation starts clean (also when a final WAV
@@ -490,6 +549,91 @@ pub async fn get_default_output_device_name() -> anyhow::Result<Option<String>> 
     .await?
 }
 
+/// Pure decision (RC-4): does ANY supported output-config range cover the
+/// production Piper playback stream — mono at PIPER_SAMPLE_RATE Hz? Each
+/// range is `(channels, min_sample_rate, max_sample_rate)`. Unit-testable
+/// without audio hardware.
+pub fn production_stream_supported(mut ranges: impl Iterator<Item = (u16, u32, u32)>) -> bool {
+    ranges.any(|(channels, min_sr, max_sr)| {
+        channels == 1
+            && min_sr <= crate::audio::playback::PIPER_SAMPLE_RATE
+            && max_sr >= crate::audio::playback::PIPER_SAMPLE_RATE
+    })
+}
+
+/// RC-4: prove the PRODUCTION Piper playback stream can be created on the
+/// default output device. Production playback (`PiperSupervisor::speak`)
+/// builds `default_output_device()` with a mono, 22050 Hz stream — Device
+/// Check must validate that exact path, not merely that SOME output device
+/// exists. Two steps:
+///   1. fast range check — the device's supported output configs must cover
+///      mono 22050 Hz;
+///   2. authoritative build — the EXACT production `StreamConfig` is built
+///      WITHOUT playing (silent) and dropped immediately, so no orphan
+///      output stream or task survives.
+///
+/// Bounded: the whole check is capped by a 10s wall-clock timeout.
+pub async fn validate_production_playback_stream() -> anyhow::Result<String> {
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::task::spawn_blocking(|| {
+            use cpal::traits::{DeviceTrait, HostTrait};
+            let host = cpal::default_host();
+            let device = host
+                .default_output_device()
+                .ok_or_else(|| anyhow::anyhow!("No default output device found"))?;
+            let name = device
+                .name()
+                .unwrap_or_else(|_| "default output device".to_string());
+
+            // Fast pre-check: the supported configs must cover the production
+            // stream (mono, 22050 Hz).
+            let supported = device
+                .supported_output_configs()
+                .map(|ranges| {
+                    production_stream_supported(
+                        ranges
+                            .map(|r| (r.channels(), r.min_sample_rate().0, r.max_sample_rate().0)),
+                    )
+                })
+                .map_err(|e| anyhow::anyhow!("failed to query supported output configs: {}", e))?;
+            if !supported {
+                anyhow::bail!(
+                    "default output '{}' does not support the production Piper stream (mono {} Hz)",
+                    name,
+                    crate::audio::playback::PIPER_SAMPLE_RATE
+                );
+            }
+
+            // Authoritative: build the EXACT production stream config without
+            // playing — silent and bounded. Dropping it leaves no orphan
+            // output stream or task.
+            let config = cpal::StreamConfig {
+                channels: 1,
+                sample_rate: cpal::SampleRate(crate::audio::playback::PIPER_SAMPLE_RATE),
+                buffer_size: cpal::BufferSize::Default,
+            };
+            let stream = device.build_output_stream(
+                &config,
+                |_data: &mut [f32], _: &cpal::OutputCallbackInfo| {},
+                |err| eprintln!("Device-check output stream error: {}", err),
+                None,
+            )?;
+            drop(stream);
+
+            Ok(name)
+        }),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(Ok(name))) => Ok(name),
+        Ok(Ok(Err(e))) => Err(e),
+        Ok(Err(join)) => Err(anyhow::anyhow!("device check thread failed: {}", join)),
+        Err(_) => Err(anyhow::anyhow!("device check timed out")),
+    }
+}
+
 /// Record a short audio clip for device verification (3 seconds max).
 /// Returns the path to the recorded temp file.
 /// The capture is bounded by BOTH the expected sample count AND a hard
@@ -510,12 +654,15 @@ pub async fn record_test_clip(
     let tmp_path = temp_dir.join(format!("device_test_{}.wav", uuid::Uuid::new_v4()));
     let path_clone = tmp_path.clone();
 
+    // RC-2: mark Scheduled BEFORE spawn_blocking (no await between) so a
+    // queued-but-not-started closure still owns the recording slot.
+    completion.mark_scheduled();
+
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
         // P1-1: signal the physical capture lifecycle on every exit path.
         let _lifecycle = BlockingCaptureLifecycle(completion.clone());
-        completion.mark_started();
 
         let host = cpal::default_host();
         let device = host
@@ -638,6 +785,58 @@ pub async fn record_test_clip(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RC-2: the capture lifecycle is explicitly tri-state — NotScheduled ->
+    /// Scheduled -> Finished — and mark_scheduled is the transition that
+    /// reserves the slot BEFORE spawn_blocking is submitted.
+    #[test]
+    fn capture_completion_tri_state_lifecycle() {
+        let completion = CaptureCompletion::new();
+        assert_eq!(completion.state(), CaptureState::NotScheduled);
+        assert!(!completion.scheduled());
+        assert!(!completion.finished());
+
+        completion.mark_scheduled();
+        assert_eq!(completion.state(), CaptureState::Scheduled);
+        assert!(completion.scheduled());
+        assert!(!completion.finished());
+
+        completion.signal();
+        assert_eq!(completion.state(), CaptureState::Finished);
+        assert!(!completion.scheduled());
+        assert!(completion.finished());
+    }
+
+    /// RC-4: production_stream_supported decides whether the supported output
+    /// configs cover the production mono 22050 Hz stream — the pure,
+    /// hardware-free core of speaker readiness.
+    #[test]
+    fn production_stream_supported_decisions() {
+        use crate::audio::playback::PIPER_SAMPLE_RATE;
+
+        // No ranges -> unsupported.
+        assert!(!production_stream_supported(std::iter::empty()));
+        // Stereo-only device -> unsupported.
+        assert!(!production_stream_supported(
+            vec![(2, 44100, 48000)].into_iter()
+        ));
+        // Mono but wrong rates -> unsupported.
+        assert!(!production_stream_supported(
+            vec![(1, 44100, 48000)].into_iter()
+        ));
+        // Mono range covering 22050 -> supported.
+        assert!(production_stream_supported(
+            vec![(1, 8000, 24000)].into_iter()
+        ));
+        // Exact production rate -> supported.
+        assert!(production_stream_supported(
+            vec![(1, PIPER_SAMPLE_RATE, PIPER_SAMPLE_RATE)].into_iter()
+        ));
+        // Range that barely misses the rate -> unsupported.
+        assert!(!production_stream_supported(
+            vec![(1, 24000, 48000)].into_iter()
+        ));
+    }
 
     #[test]
     fn recording_handle_stop_sets_flag() {

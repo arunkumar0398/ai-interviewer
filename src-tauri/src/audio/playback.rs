@@ -7,7 +7,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 /// Piper outputs raw PCM at 22050 Hz mono — tied to the en_US-amy-medium model
-const PIPER_SAMPLE_RATE: u32 = 22050;
+pub(crate) const PIPER_SAMPLE_RATE: u32 = 22050;
 
 /// Maximum time allowed for a single playback operation before it is cancelled.
 /// Shared with the Piper supervisor's raw-PCM playback, which uses the same

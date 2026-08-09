@@ -170,39 +170,47 @@ impl<T: Send + 'static> Drop for RecordingGuard<T> {
             // TTS) has nothing to wait for and is simply aborted/awaited.
             tokio::runtime::Handle::current().spawn(async move {
                 if let Some(handle) = worker.as_ref() {
-                    // A capture's first blocking-closure statement is
-                    // mark_started; give it a tiny window to appear so a
-                    // freshly spawned capture is never mistaken for "no
-                    // capture started".
-                    if !completion.started() {
-                        let start_deadline =
-                            tokio::time::Instant::now() + std::time::Duration::from_millis(50);
-                        while !completion.started() && tokio::time::Instant::now() < start_deadline
-                        {
-                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    match completion.state() {
+                        // The blocking closure has fully exited — nothing
+                        // physical can still run.
+                        audio::capture::CaptureState::Finished => {}
+                        // A capture is Scheduled (submitted) but not
+                        // Finished: the closure may be running OR still
+                        // queued on a busy blocking pool. Either way the
+                        // slot stays occupied. Cooperative grace first; only
+                        // if it expires is the outer wrapper aborted, and
+                        // even then the slot is held until the REAL blocking
+                        // closure terminates — overlapping physical capture
+                        // is never allowed.
+                        audio::capture::CaptureState::Scheduled => {
+                            if tokio::time::timeout(grace, completion.wait())
+                                .await
+                                .is_err()
+                            {
+                                handle.abort();
+                                if let Some(h) = worker {
+                                    let _ = h.await;
+                                }
+                                completion.wait().await;
+                            }
                         }
-                    }
-                    if completion.started() {
-                        // Real physical capture in flight.
-                        if tokio::time::timeout(grace, completion.wait())
-                            .await
-                            .is_err()
-                        {
+                        // No capture scheduled yet. The outer wrapper is the
+                        // whole lifecycle so far: abort and await it. But the
+                        // worker may have raced to submit spawn_blocking
+                        // between our state read and the abort landing — the
+                        // submission is synchronous, so an abort cannot stop
+                        // it. Re-check AFTER the outer worker is confirmed
+                        // dead (its JoinHandle resolved): a capture that
+                        // became Scheduled in the meantime must be waited
+                        // out before the slot is freed.
+                        audio::capture::CaptureState::NotScheduled => {
                             handle.abort();
                             if let Some(h) = worker {
                                 let _ = h.await;
                             }
-                            // Keep the slot occupied until the real blocking
-                            // worker has terminated — overlapping physical
-                            // capture is never allowed.
-                            completion.wait().await;
-                        }
-                    } else {
-                        // No capture ever started — the outer wrapper is the
-                        // whole lifecycle: abort and await it.
-                        handle.abort();
-                        if let Some(h) = worker {
-                            let _ = h.await;
+                            if completion.scheduled() {
+                                completion.wait().await;
+                            }
                         }
                     }
                 }
@@ -905,42 +913,33 @@ async fn run_interview_round(
             recording_guard.await_worker().await;
         }
 
-        // P1-1: the outer worker is resolved, but an already-running nested
-        // spawn_blocking capture may still be finishing — aborting the outer
-        // async task does NOT prove the physical capture has stopped. The
-        // recording slot stays occupied until the real blocking capture
-        // signals termination (it observes the stop flag within ~100ms). If
-        // the capture is pathologically stuck, keep the slot reserved: a
-        // detached task releases it only once the capture truly terminates,
-        // so overlapping physical capture is never allowed, while this
-        // command still returns (bounded).
+        // RC-2/RC-3: the outer worker is resolved, but a capture that was
+        // Scheduled (submitted to the blocking pool) but not Finished may
+        // still be running — or may not even have STARTED yet (queued on a
+        // busy blocking pool). Aborting the outer async task proves nothing
+        // about the physical closure. Until it terminates, the recording
+        // slot stays occupied AND the provisional artifacts must NOT be
+        // removed: a late `.wav.tmp -> .wav` rename after this command
+        // returned would resurrect an orphan final WAV with no DB round.
         let completion = recording_guard.completion();
-        let mut blocking_terminated = true;
-        if !graceful && completion.started() {
-            blocking_terminated = tokio::time::timeout(
+        // A worker that exited cooperatively finished its capture; a capture
+        // that Finished or was never Scheduled has nothing left to run. Only
+        // Scheduled-but-not-Finished can still do physical work.
+        let capture_pending = !graceful && completion.scheduled();
+
+        let defer_cleanup = if capture_pending {
+            // Bounded wait for the physical capture to terminate
+            // cooperatively (it observes the stop flag within ~100ms).
+            let terminated = tokio::time::timeout(
                 std::time::Duration::from_secs(GRACE_SECS),
                 completion.wait(),
             )
             .await
             .is_ok();
-        }
-
-        if blocking_terminated {
-            // Worker has fully terminated (cooperatively or aborted) AND any
-            // in-flight physical capture is done — release the recording
-            // slot deterministically and disarm the safety net.
-            clear_active_recording(&state).await;
-            recording_guard.disarm();
+            !terminated
         } else {
-            // Pathological: physical capture still alive after the grace.
-            // Hold the slot; a detached task releases it after termination.
-            let cleanup_state = state.inner().clone();
-            tokio::spawn(async move {
-                completion.wait().await;
-                clear_active_recording(&cleanup_state).await;
-            });
-            recording_guard.disarm();
-        }
+            false
+        };
 
         // Drain the relay so queued phase events flush BEFORE the final
         // error event below — the timeout error must be the last word.
@@ -954,23 +953,84 @@ async fn run_interview_round(
             },
         );
 
-        // The round never committed — remove provisional artifacts: the
-        // WAV for this round_id, its partial temp file, and the session
-        // temp transcript directory.
-        let wav_path = paths.paths.round_audio_path(session_id, round_id);
-        let _ = std::fs::remove_file(&wav_path);
-        let _ = std::fs::remove_file(wav_path.with_extension("wav.tmp"));
-        let temp_dir = paths
-            .paths
-            .temp_dir
-            .join(session_id.hyphenated().to_string());
-        let _ = std::fs::remove_dir_all(temp_dir);
+        if defer_cleanup {
+            // Pathological: physical capture still alive after the grace.
+            // This detached task owns the TAIL lifecycle (RC-3) in the
+            // required order: real capture termination -> provisional
+            // artifact cleanup -> recording slot release. The command still
+            // returns bounded; a late rename can never resurrect an orphan
+            // WAV and the slot is never freed while physical capture may
+            // still run.
+            let cleanup_paths = paths.paths.clone();
+            let cleanup_state = state.inner().clone();
+            tokio::spawn(async move {
+                deferred_timeout_cleanup(
+                    completion,
+                    &cleanup_paths,
+                    session_id,
+                    round_id,
+                    cleanup_state,
+                )
+                .await;
+            });
+            recording_guard.disarm();
+        } else {
+            // No live physical capture (worker exited cooperatively, or the
+            // capture terminated within the grace, or none was ever
+            // Scheduled): remove provisional artifacts first, then release
+            // the slot — capture terminated -> artifacts removed -> slot
+            // released (RC-3).
+            cleanup_round_artifacts(&paths.paths, session_id, round_id).await;
+            clear_active_recording(&state).await;
+            recording_guard.disarm();
+        }
 
         Err(format!(
             "Round timed out after {}s — processes terminated, partial artifacts cleaned up",
             ROUND_TIMEOUT_SECS
         ))
     }
+}
+
+/// Centralized round-artifact cleanup for a round that never committed
+/// (RC-3): removes the final WAV, the `.wav.tmp` partial, and the session
+/// temp transcript directory. MUST only be called AFTER the real physical
+/// capture for the round has terminated — a late `.wav.tmp -> .wav` rename
+/// would otherwise resurrect an orphan final WAV after the command already
+/// returned.
+async fn cleanup_round_artifacts(
+    paths: &crate::paths::AppPaths,
+    session_id: uuid::Uuid,
+    round_id: uuid::Uuid,
+) {
+    let wav_path = paths.round_audio_path(session_id, round_id);
+    let temp_dir = paths.temp_dir.join(session_id.hyphenated().to_string());
+    tokio::task::spawn_blocking(move || {
+        let _ = std::fs::remove_file(&wav_path);
+        let _ = std::fs::remove_file(wav_path.with_extension("wav.tmp"));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    })
+    .await
+    .ok();
+}
+
+/// RC-3 tail lifecycle for a timed-out round whose physical capture is
+/// STILL ALIVE after the grace period: wait for the real capture
+/// termination, THEN remove the provisional artifacts, THEN release the
+/// recording slot. Running the artifact cleanup in the same task that waits
+/// for capture completion guarantees a late `.wav.tmp -> .wav` rename can
+/// never resurrect an orphan final WAV after the command already returned,
+/// and the slot is never freed while physical capture may still run.
+async fn deferred_timeout_cleanup(
+    completion: audio::capture::CaptureCompletion,
+    paths: &crate::paths::AppPaths,
+    session_id: uuid::Uuid,
+    round_id: uuid::Uuid,
+    state: Arc<RecordingState>,
+) {
+    completion.wait().await;
+    cleanup_round_artifacts(paths, session_id, round_id).await;
+    clear_active_recording(&state).await;
 }
 
 /// Retry a failed interview round with a fresh round_id. Only a round that
@@ -1126,6 +1186,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use audio::capture::CaptureState;
 
     fn fake_handle() -> audio::capture::RecordingHandle {
         audio::capture::RecordingHandle {
@@ -1212,7 +1273,8 @@ mod tests {
         }
 
         // Give the drop-spawned cleanup task time to run (no-capture worker:
-        // the cleanup waits up to 50ms for a capture start, then aborts).
+        // the capture stays NotScheduled, so the cleanup aborts the outer
+        // wrapper and clears the slot).
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         assert!(
@@ -1253,11 +1315,13 @@ mod tests {
                 let completion = completion.clone();
                 tokio::spawn(async move {
                     // Outer async worker awaiting the nested blocking capture.
+                    // RC-2: mark Scheduled BEFORE spawn_blocking — no await
+                    // between, exactly like record_to_wav.
+                    completion.mark_scheduled();
                     let blocking = tokio::task::spawn_blocking(move || {
-                        // Mimic record_to_wav's physical capture: mark started
-                        // first, loop until stop observed, then stay "still
-                        // finishing" until released.
-                        completion.mark_started();
+                        // Mimic record_to_wav's physical capture: loop until
+                        // stop observed, then stay "still finishing" until
+                        // released.
                         while !blocking_stop.load(Ordering::SeqCst) {
                             std::thread::sleep(std::time::Duration::from_millis(2));
                         }
@@ -1347,8 +1411,9 @@ mod tests {
                 let completion = completion.clone();
                 tokio::spawn(async move {
                     // Real nested topology: outer tokio::spawn -> spawn_blocking.
+                    // RC-2: mark Scheduled BEFORE spawn_blocking.
+                    completion.mark_scheduled();
                     let blocking = tokio::task::spawn_blocking(move || {
-                        completion.mark_started();
                         // 1. Observe stop.
                         while !blocking_stop.load(Ordering::SeqCst) {
                             std::thread::sleep(std::time::Duration::from_millis(2));
@@ -1406,6 +1471,224 @@ mod tests {
         );
 
         // Slot is reusable.
+        acquire_recording(&state, fake_handle()).await.unwrap();
+        assert!(state.handle.lock().await.is_some());
+    }
+
+    /// RC-2 regression: the capture lifecycle is explicitly tri-state
+    /// (NotScheduled -> Scheduled -> Finished) and `mark_scheduled()` runs
+    /// BEFORE `spawn_blocking` with no await in between. A capture that is
+    /// Scheduled but whose blocking closure has NOT begun executing (queued
+    /// on a busy blocking pool, modelled here by a gate) must keep the slot
+    /// occupied through grace expiry AND force-abort of the outer wrapper;
+    /// the slot frees only after the real closure runs to termination and
+    /// signals Finished. There is no timing assumption about when the
+    /// closure "should" have started — the gate proves it never began.
+    #[tokio::test]
+    async fn recording_guard_drop_scheduled_but_not_started_holds_slot() {
+        let state = Arc::new(RecordingState {
+            handle: Mutex::new(None),
+        });
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The blocking closure cannot BEGIN executing (and therefore cannot
+        // signal Finished) until the test opens the gate.
+        let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let began = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        acquire_recording(&state, fake_handle()).await.unwrap();
+
+        let completion_for_test;
+        {
+            let mut guard = RecordingGuard::new(state.clone(), stop.clone());
+            guard.drop_grace = std::time::Duration::from_millis(150);
+            let completion = guard.completion();
+            completion_for_test = completion.clone();
+            let worker = {
+                let blocking_stop = stop.clone();
+                let blocking_gate = gate.clone();
+                let blocking_began = began.clone();
+                let completion = completion.clone();
+                tokio::spawn(async move {
+                    // RC-2: Scheduled BEFORE spawn_blocking — no await between.
+                    completion.mark_scheduled();
+                    let blocking = tokio::task::spawn_blocking(move || {
+                        // Simulate a queued closure: it may not begin
+                        // executing until the gate opens.
+                        while !blocking_gate.load(Ordering::SeqCst) {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        blocking_began.store(true, Ordering::SeqCst);
+                        while !blocking_stop.load(Ordering::SeqCst) {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        // Fully terminated — signal completion.
+                        completion.signal();
+                    });
+                    let _ = blocking.await;
+                })
+            };
+            guard.attach_worker(worker);
+
+            // Wait until the capture is EXPLICITLY Scheduled (submitted but
+            // closure not started) before dropping — the state this
+            // regression targets. The gate guarantees the closure never
+            // began during this window.
+            let mut scheduled = false;
+            for _ in 0..200 {
+                if completion_for_test.state() == CaptureState::Scheduled {
+                    scheduled = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert!(scheduled, "capture must reach the explicit Scheduled state");
+            assert_eq!(completion_for_test.state(), CaptureState::Scheduled);
+            assert!(
+                !began.load(Ordering::SeqCst),
+                "blocking closure must not have begun while gated"
+            );
+
+            // Dropped while armed — unexpected drop/panic of the outer
+            // command while the capture is scheduled-but-not-started.
+        }
+
+        // The drop safety net set stop, ran the shrunk grace (150ms), and
+        // force-aborted the outer wrapper; it is now waiting out the real
+        // blocking closure, which is STILL gated (never began, never
+        // signalled Finished). The slot must remain occupied and a second
+        // acquire must fail.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert_eq!(
+            completion_for_test.state(),
+            CaptureState::Scheduled,
+            "scheduled-but-not-finished capture must remain Scheduled after outer abort"
+        );
+        assert!(
+            !began.load(Ordering::SeqCst),
+            "closure must still be gated (never started) while the slot is held"
+        );
+        assert!(
+            state.handle.lock().await.is_some(),
+            "slot must stay occupied while a scheduled capture has not terminated"
+        );
+        let second = acquire_recording(&state, fake_handle()).await;
+        assert!(
+            second.is_err() && second.unwrap_err().contains("already active"),
+            "second acquire must fail while the scheduled capture is unresolved"
+        );
+
+        // Open the gate: the closure begins, observes stop, terminates, and
+        // signals Finished. ONLY then may the slot clear.
+        gate.store(true, Ordering::SeqCst);
+        let mut cleared = false;
+        for _ in 0..300 {
+            if state.handle.lock().await.is_none() {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            cleared,
+            "slot must clear only after real blocking-closure termination"
+        );
+        assert_eq!(completion_for_test.state(), CaptureState::Finished);
+
+        // Reusable.
+        acquire_recording(&state, fake_handle()).await.unwrap();
+        assert!(state.handle.lock().await.is_some());
+    }
+
+    /// RC-3 regression: a timed-out round whose physical capture is still
+    /// alive must finish in the order real capture termination -> provisional
+    /// artifact cleanup -> recording slot release. While the capture has not
+    /// signalled completion, the final WAV, `.wav.tmp` and transcript temp
+    /// all survive AND the slot stays occupied; only after real termination
+    /// are the artifacts removed and the slot released — a late
+    /// `.wav.tmp -> .wav` rename can never resurrect an orphan final WAV
+    /// after the command already returned.
+    #[tokio::test]
+    async fn deferred_timeout_cleanup_orders_capture_artifacts_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::AppPaths::from_tool_dir(
+            tmp.path().join("tools"),
+            tmp.path().join("data"),
+        )
+        .unwrap();
+
+        let session_id = uuid::Uuid::new_v4();
+        let round_id = uuid::Uuid::new_v4();
+        let wav_path = paths.round_audio_path(session_id, round_id);
+        std::fs::create_dir_all(wav_path.parent().unwrap()).unwrap();
+        // A late rename would target this final path — it must never survive.
+        std::fs::write(&wav_path, b"late-resurrected").unwrap();
+        std::fs::write(wav_path.with_extension("wav.tmp"), b"partial").unwrap();
+        let temp_dir = paths.temp_dir.join(session_id.hyphenated().to_string());
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(temp_dir.join("transcript.txt"), b"partial").unwrap();
+
+        let state = Arc::new(RecordingState {
+            handle: Mutex::new(None),
+        });
+        acquire_recording(&state, fake_handle()).await.unwrap();
+
+        let completion = audio::capture::CaptureCompletion::new();
+        let signal = completion.clone();
+        let paths_clone = paths.clone();
+        let state_clone = state.clone();
+        let cleanup = tokio::spawn(async move {
+            deferred_timeout_cleanup(completion, &paths_clone, session_id, round_id, state_clone)
+                .await;
+        });
+
+        // While the physical capture is still alive (no completion signal):
+        // artifacts survive and the slot stays occupied.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            wav_path.exists(),
+            "final WAV must survive until capture termination"
+        );
+        assert!(
+            wav_path.with_extension("wav.tmp").exists(),
+            "temp must survive until capture termination"
+        );
+        assert!(
+            temp_dir.exists(),
+            "transcript temp must survive until capture termination"
+        );
+        assert!(
+            state.handle.lock().await.is_some(),
+            "slot must stay occupied until capture termination"
+        );
+        let second = acquire_recording(&state, fake_handle()).await;
+        assert!(
+            second.is_err(),
+            "second acquire must fail while the capture is unresolved"
+        );
+
+        // Real capture terminates -> artifacts removed -> slot released.
+        signal.signal();
+        tokio::time::timeout(std::time::Duration::from_secs(5), cleanup)
+            .await
+            .expect("deferred cleanup must finish")
+            .expect("cleanup task must not panic");
+        assert!(
+            !wav_path.exists(),
+            "final WAV must be removed after capture termination"
+        );
+        assert!(
+            !wav_path.with_extension("wav.tmp").exists(),
+            "temp must be removed after capture termination"
+        );
+        assert!(
+            !temp_dir.exists(),
+            "transcript temp must be removed after capture termination"
+        );
+        assert!(
+            state.handle.lock().await.is_none(),
+            "slot must be released only after cleanup"
+        );
+
+        // Reusable.
         acquire_recording(&state, fake_handle()).await.unwrap();
         assert!(state.handle.lock().await.is_some());
     }
