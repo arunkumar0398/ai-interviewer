@@ -172,18 +172,16 @@ pub fn resolve_piper_layout(tool_dir: &Path) -> Option<PiperLayout> {
 }
 
 /// (relative asset path, issue code, message) triples for the canonical
-/// layout `tools/piper/<name>`.
-const CANONICAL_PIPER_ASSETS: &[(&str, &str, &str)] = &[
+/// (relative asset path, issue code, message) triples for the Piper runtime
+/// companions that must live in the SELECTED layout's runtime directory
+/// (canonical `tools/piper/`, legacy `tools/piper/piper/`). The model/config
+/// pair is validated separately via `ResolvedPiper` so executable and model
+/// always resolve from the SAME coherent layout (P1-3).
+const PIPER_RUNTIME_ASSETS: &[(&str, &str, &str)] = &[
     (
         "piper.exe",
         "PIPER_BINARY_MISSING",
         "Piper TTS binary not found",
-    ),
-    ("model.onnx", "PIPER_MODEL_MISSING", "Piper model not found"),
-    (
-        "model.onnx.json",
-        "PIPER_MODEL_CONFIG_MISSING",
-        "Piper model config not found",
     ),
     (
         "espeak-ng.dll",
@@ -211,6 +209,49 @@ const CANONICAL_PIPER_ASSETS: &[(&str, &str, &str)] = &[
         "Piper espeak-ng data not found",
     ),
 ];
+
+/// One coherent, fully-resolved Piper runtime (P1-3). Executable, model, and
+/// model config ALWAYS come from the same layout — there is no independent
+/// canonical-first model fallback after the layout is selected. Readiness and
+/// runtime execution both derive from this resolver, so they always agree.
+#[derive(Debug, Clone)]
+pub struct ResolvedPiper {
+    pub layout: PiperLayout,
+    pub executable: PathBuf,
+    pub model: PathBuf,
+    pub model_config: PathBuf,
+    pub runtime_dir: PathBuf,
+}
+
+/// Resolve the coherent Piper runtime (executable + model + config + runtime
+/// directory) for the selected layout. Returns `None` when no Piper executable
+/// exists in either layout. The returned paths are the layout's canonical
+/// expectations — callers check `.exists()` as needed.
+pub fn resolve_piper(tool_dir: &Path) -> Option<ResolvedPiper> {
+    match resolve_piper_layout(tool_dir)? {
+        PiperLayout::Canonical => {
+            let dir = tool_dir.join("piper");
+            Some(ResolvedPiper {
+                layout: PiperLayout::Canonical,
+                executable: dir.join("piper.exe"),
+                model: dir.join("model.onnx"),
+                model_config: dir.join("model.onnx.json"),
+                runtime_dir: dir,
+            })
+        }
+        PiperLayout::Legacy => {
+            let runtime_dir = tool_dir.join("piper").join("piper");
+            let models_dir = tool_dir.join("piper-models");
+            Some(ResolvedPiper {
+                layout: PiperLayout::Legacy,
+                executable: runtime_dir.join("piper.exe"),
+                model: models_dir.join("en_US-amy-medium.onnx"),
+                model_config: models_dir.join("en_US-amy-medium.onnx.json"),
+                runtime_dir,
+            })
+        }
+    }
+}
 
 impl AppPaths {
     /// Return the recordings directory for a specific session.
@@ -322,20 +363,27 @@ impl AppPaths {
     /// would otherwise report `ready = true` and then fail at runtime.
     ///
     /// Readiness resolves ONE coherent Piper layout first (canonical
-    /// preferred, matching the runtime resolver) and validates every required
-    /// asset against that selected layout only. A mixed tree — canonical
-    /// executable with only legacy DLLs, or a canonical model paired with a
-    /// legacy config — must NOT report ready. Returns the aggregate readiness
-    /// state — callers decide whether to surface errors or degrade gracefully.
+    /// preferred, matching the runtime resolver) via `resolve_piper` and
+    /// validates every required asset against that selected layout only — the
+    /// SAME resolver the runtime uses to pick the executable and model. A
+    /// mixed tree — canonical executable with only legacy DLLs, a canonical
+    /// model paired with a legacy config, or a stray canonical model next to
+    /// a selected legacy runtime — must NOT report ready. Returns the
+    /// aggregate readiness state — callers decide whether to surface errors
+    /// or degrade gracefully.
     pub fn validate_readiness(&self) -> AppReadiness {
         let mut issues = Vec::new();
 
-        // Resolve the selected Piper layout, then validate against it.
-        match resolve_piper_layout(&self.tool_dir) {
-            Some(PiperLayout::Canonical) => {
-                let piper_dir = self.tool_dir.join("piper");
-                for (asset, code, message) in CANONICAL_PIPER_ASSETS {
-                    let path = piper_dir.join(asset);
+        // ONE coherent resolver for runtime AND readiness (P1-3): the
+        // selected layout determines the executable, the model/config pair,
+        // and the runtime directory. No independent canonical-first model
+        // fallback after layout selection.
+        match resolve_piper(&self.tool_dir) {
+            Some(piper) => {
+                // All runtime companions come from the selected layout's
+                // runtime directory.
+                for (asset, code, message) in PIPER_RUNTIME_ASSETS {
+                    let path = piper.runtime_dir.join(asset);
                     if !path.exists() {
                         issues.push(AppConfigurationIssue {
                             code: (*code).into(),
@@ -344,40 +392,19 @@ impl AppPaths {
                         });
                     }
                 }
-            }
-            Some(PiperLayout::Legacy) => {
-                // All runtime companions come from the same legacy runtime
-                // directory (the model/config pair lives in piper-models/).
-                let legacy_piper_dir = self.tool_dir.join("piper").join("piper");
-                for (asset, code, message) in CANONICAL_PIPER_ASSETS {
-                    if *asset == "model.onnx" || *asset == "model.onnx.json" {
-                        continue;
-                    }
-                    let path = legacy_piper_dir.join(asset);
-                    if !path.exists() {
-                        issues.push(AppConfigurationIssue {
-                            code: (*code).into(),
-                            message: (*message).into(),
-                            expected_path: Some(path.display().to_string()),
-                        });
-                    }
-                }
-                // Supported legacy model/config pair lives in piper-models/.
-                let models_dir = self.tool_dir.join("piper-models");
-                let model = models_dir.join("en_US-amy-medium.onnx");
-                let config = models_dir.join("en_US-amy-medium.onnx.json");
-                if !model.exists() {
+                // The selected layout's model/config pair.
+                if !piper.model.exists() {
                     issues.push(AppConfigurationIssue {
                         code: "PIPER_MODEL_MISSING".into(),
                         message: "Piper model not found".into(),
-                        expected_path: Some(model.display().to_string()),
+                        expected_path: Some(piper.model.display().to_string()),
                     });
                 }
-                if !config.exists() {
+                if !piper.model_config.exists() {
                     issues.push(AppConfigurationIssue {
                         code: "PIPER_MODEL_CONFIG_MISSING".into(),
                         message: "Piper model config not found".into(),
-                        expected_path: Some(config.display().to_string()),
+                        expected_path: Some(piper.model_config.display().to_string()),
                     });
                 }
             }
@@ -577,30 +604,12 @@ impl ResolvedTools {
 /// legacy layouts.  Returns a `ResolvedTools` where each field is `None`
 /// if that component was not found.
 pub fn resolve_tools(tool_dir: &Path) -> ResolvedTools {
-    // Piper binary — canonical then legacy
-    let piper_bin = {
-        let canonical = tool_dir.join("piper").join("piper.exe");
-        let legacy = tool_dir.join("piper").join("piper").join("piper.exe");
-        if canonical.exists() {
-            Some(canonical)
-        } else if legacy.exists() {
-            Some(legacy)
-        } else {
-            None
-        }
-    };
-
-    // Piper model — canonical then legacy
-    let piper_model = {
-        let canonical = tool_dir.join("piper").join("model.onnx");
-        let legacy = tool_dir.join("piper-models").join("en_US-amy-medium.onnx");
-        if canonical.exists() {
-            Some(canonical)
-        } else if legacy.exists() {
-            Some(legacy)
-        } else {
-            None
-        }
+    // Piper binary AND model resolve from ONE coherent layout (P1-3): the
+    // selected layout decides both — a stray canonical model next to a
+    // selected legacy runtime is never picked up.
+    let (piper_bin, piper_model) = match resolve_piper(tool_dir) {
+        Some(piper) => (Some(piper.executable), Some(piper.model)),
+        None => (None, None),
     };
 
     // Whisper binary
@@ -1039,8 +1048,9 @@ mod tests {
         );
     }
 
-    /// P1-2: when both layouts are valid, canonical remains selected, and the
-    /// layout resolver agrees with the runtime resolver.
+    /// P1-2/P1-3: when both layouts are valid, canonical remains selected, and
+    /// the layout resolver agrees with the coherent runtime resolver
+    /// (executable + model + config all from the same layout).
     #[test]
     fn resolve_piper_layout_agrees_with_runtime_resolver() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1049,11 +1059,17 @@ mod tests {
         // Canonical only.
         create_canonical_runtime(&tool);
         assert_eq!(resolve_piper_layout(&tool), Some(PiperLayout::Canonical));
-        let resolved = resolve_tools(&tool);
+        let piper = resolve_piper(&tool).unwrap();
+        assert_eq!(piper.layout, PiperLayout::Canonical);
+        assert_eq!(piper.executable, tool.join("piper").join("piper.exe"));
+        assert_eq!(piper.model, tool.join("piper").join("model.onnx"));
         assert_eq!(
-            resolved.piper_bin,
-            Some(tool.join("piper").join("piper.exe"))
+            piper.model_config,
+            tool.join("piper").join("model.onnx.json")
         );
+        let resolved = resolve_tools(&tool);
+        assert_eq!(resolved.piper_bin, Some(piper.executable));
+        assert_eq!(resolved.piper_model, Some(piper.model));
 
         // Both layouts valid -> canonical still selected.
         create_legacy_runtime(&tool);
@@ -1062,6 +1078,8 @@ mod tests {
             Some(PiperLayout::Canonical),
             "canonical must remain selected when both layouts are valid"
         );
+        let piper = resolve_piper(&tool).unwrap();
+        assert_eq!(piper.layout, PiperLayout::Canonical);
         let resolved = resolve_tools(&tool);
         assert_eq!(
             resolved.piper_bin,
@@ -1078,21 +1096,64 @@ mod tests {
         let tool2 = tmp2.path().join("tools");
         create_legacy_runtime(&tool2);
         assert_eq!(resolve_piper_layout(&tool2), Some(PiperLayout::Legacy));
+        let piper = resolve_piper(&tool2).unwrap();
+        assert_eq!(piper.layout, PiperLayout::Legacy);
+        assert_eq!(
+            piper.executable,
+            tool2.join("piper").join("piper").join("piper.exe")
+        );
+        assert_eq!(
+            piper.model,
+            tool2.join("piper-models").join("en_US-amy-medium.onnx")
+        );
+        assert_eq!(
+            piper.model_config,
+            tool2
+                .join("piper-models")
+                .join("en_US-amy-medium.onnx.json")
+        );
         let resolved = resolve_tools(&tool2);
-        assert_eq!(
-            resolved.piper_bin,
-            Some(tool2.join("piper").join("piper").join("piper.exe"))
-        );
-        assert_eq!(
-            resolved.piper_model,
-            Some(tool2.join("piper-models").join("en_US-amy-medium.onnx"))
-        );
+        assert_eq!(resolved.piper_bin, Some(piper.executable));
+        assert_eq!(resolved.piper_model, Some(piper.model));
 
         // No exe anywhere -> no layout.
         let tmp3 = tempfile::tempdir().unwrap();
         let tool3 = tmp3.path().join("tools");
         fs::create_dir_all(&tool3).unwrap();
         assert_eq!(resolve_piper_layout(&tool3), None);
+        assert!(resolve_piper(&tool3).is_none());
+    }
+
+    /// P1-3: a stray canonical model next to a selected legacy runtime must
+    /// NOT be picked up — the runtime keeps using the legacy model/config pair
+    /// and readiness validates that same pair.
+    #[test]
+    fn resolve_piper_ignores_stray_canonical_model_for_legacy_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("tools");
+
+        // Complete legacy runtime/model/config.
+        create_legacy_runtime(&tool);
+        // Stray canonical model (no canonical executable, no canonical
+        // config) — must be ignored.
+        fs::create_dir_all(tool.join("piper")).unwrap();
+        fs::write(tool.join("piper").join("model.onnx"), b"stray").unwrap();
+
+        assert_eq!(resolve_piper_layout(&tool), Some(PiperLayout::Legacy));
+        let piper = resolve_piper(&tool).unwrap();
+        assert_eq!(piper.layout, PiperLayout::Legacy);
+        assert_eq!(
+            piper.model,
+            tool.join("piper-models").join("en_US-amy-medium.onnx"),
+            "runtime must select the legacy model, not the stray canonical one"
+        );
+        let resolved = resolve_tools(&tool);
+        assert_eq!(resolved.piper_model, Some(piper.model));
+
+        // Readiness validates the SAME legacy pair and passes.
+        let paths = AppPaths::from_tool_dir(tool, tmp.path().join("data")).unwrap();
+        let readiness = paths.validate_readiness();
+        assert!(readiness.ready, "coherent legacy runtime must be ready");
     }
 
     /// The legacy layout, when fully populated, is still valid (P2-3).

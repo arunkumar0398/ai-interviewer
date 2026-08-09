@@ -46,19 +46,28 @@ async fn clear_active_recording(state: &RecordingState) {
     *guard = None;
 }
 
-/// Owner of the recording-slot lease, the worker's stop flag, AND the worker's
-/// JoinHandle (P2-1). Every controlled path clears RecordingState explicitly
-/// (after the worker has fully terminated) and disarms the guard, so the slot
-/// is freed deterministically. If the guard is dropped while still armed — an
+/// Owner of the recording-slot lease, the worker's stop flag, the worker's
+/// JoinHandle (P2-1), AND the physical capture lifecycle signal (P1-1). Every
+/// controlled path clears RecordingState explicitly (after the worker has
+/// fully terminated) and disarms the guard, so the slot is freed
+/// deterministically. If the guard is dropped while still armed — an
 /// unexpected drop or panic of the outer command — Drop sets the stop flag,
-/// aborts and awaits the worker, and ONLY THEN clears the slot. A bare
-/// JoinHandle drop would detach the task and let the slot be cleared while
-/// the worker is still alive; this guard closes that lifecycle gap.
+/// waits for the REAL blocking capture to terminate (bounded cooperative
+/// grace, then force-abort of the outer wrapper, then waiting out the
+/// blocking worker), and ONLY THEN clears the slot. A bare JoinHandle drop
+/// would detach the task and let the slot be cleared while the worker is
+/// still alive; aborting the outer wrapper alone does not prove the nested
+/// `spawn_blocking` capture has stopped — the slot is never freed while the
+/// physical capture may still be alive.
 struct RecordingGuard<T: Send + 'static> {
     state: Arc<RecordingState>,
     stop: Arc<std::sync::atomic::AtomicBool>,
+    completion: audio::capture::CaptureCompletion,
     worker: Option<tokio::task::JoinHandle<T>>,
     armed: std::sync::atomic::AtomicBool,
+    /// Drop-safety-net cooperative grace. Tests shrink this to exercise the
+    /// force-abort path quickly.
+    drop_grace: std::time::Duration,
 }
 
 impl<T: Send + 'static> RecordingGuard<T> {
@@ -66,9 +75,17 @@ impl<T: Send + 'static> RecordingGuard<T> {
         Self {
             state,
             stop,
+            completion: audio::capture::CaptureCompletion::new(),
             worker: None,
             armed: std::sync::atomic::AtomicBool::new(true),
+            drop_grace: std::time::Duration::from_secs(RECORDING_DROP_GRACE_SECS),
         }
+    }
+
+    /// Clone of the physical-capture lifecycle signal, handed to the worker
+    /// so `record_to_wav` / `record_test_clip` can report termination.
+    fn completion(&self) -> audio::capture::CaptureCompletion {
+        self.completion.clone()
     }
 
     /// Give the guard ownership of the spawned worker so a dropped command
@@ -135,29 +152,58 @@ impl<T: Send + 'static> Drop for RecordingGuard<T> {
             self.stop.store(true, Ordering::SeqCst);
             let worker = self.worker.take();
             let state = self.state.clone();
+            let completion = self.completion.clone();
+            let grace = self.drop_grace;
             // Spawn on the runtime; this runs even on panic. The slot is
-            // cleared ONLY after the worker's lifecycle is resolved. The real
-            // microphone work runs in a NESTED spawn_blocking task, so the
-            // worker is first given a bounded cooperative grace period to
-            // observe the stop flag and terminate normally — aborting the
-            // outer async task alone would NOT prove the blocking capture has
-            // stopped (the outer task can resolve while the blocking closure
-            // is still finishing). Only if the grace expires is the worker
-            // force-aborted (and awaited) before the slot is released.
+            // cleared ONLY after the worker's lifecycle is resolved AND the
+            // real physical capture (if one was in flight) has terminated:
+            //  1. stop flag set;
+            //  2. bounded cooperative grace for the blocking capture to
+            //     observe stop and exit normally (signalling `completion`);
+            //  3. if the grace expires, force-abort the outer wrapper
+            //     (best effort — aborting an async task cannot kill an
+            //     already-running spawn_blocking closure) and await it;
+            //  4. the slot STAYS occupied until the blocking capture signals
+            //     termination — overlapping physical capture is never
+            //     allowed, so a stuck capture keeps the slot reserved.
+            // A worker that never started a capture (e.g. aborted during
+            // TTS) has nothing to wait for and is simply aborted/awaited.
             tokio::runtime::Handle::current().spawn(async move {
-                if let Some(handle) = worker {
-                    let deadline = tokio::time::Instant::now()
-                        + std::time::Duration::from_secs(RECORDING_DROP_GRACE_SECS);
-                    loop {
-                        if handle.is_finished() {
-                            break;
+                if let Some(handle) = worker.as_ref() {
+                    // A capture's first blocking-closure statement is
+                    // mark_started; give it a tiny window to appear so a
+                    // freshly spawned capture is never mistaken for "no
+                    // capture started".
+                    if !completion.started() {
+                        let start_deadline =
+                            tokio::time::Instant::now() + std::time::Duration::from_millis(50);
+                        while !completion.started() && tokio::time::Instant::now() < start_deadline
+                        {
+                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                         }
-                        if tokio::time::Instant::now() >= deadline {
+                    }
+                    if completion.started() {
+                        // Real physical capture in flight.
+                        if tokio::time::timeout(grace, completion.wait())
+                            .await
+                            .is_err()
+                        {
                             handle.abort();
-                            let _ = handle.await;
-                            break;
+                            if let Some(h) = worker {
+                                let _ = h.await;
+                            }
+                            // Keep the slot occupied until the real blocking
+                            // worker has terminated — overlapping physical
+                            // capture is never allowed.
+                            completion.wait().await;
                         }
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    } else {
+                        // No capture ever started — the outer wrapper is the
+                        // whole lifecycle: abort and await it.
+                        handle.abort();
+                        if let Some(h) = worker {
+                            let _ = h.await;
+                        }
                     }
                 }
                 clear_active_recording(&state).await;
@@ -204,10 +250,11 @@ async fn start_recording(
     let path_clone = path.clone();
     let event_tx = tx.clone();
     let stop_clone = stop_flag.clone();
+    let completion = recording_guard.completion();
 
     // Spawn worker; drop original tx so channel closes when worker finishes
     let worker = tokio::spawn(async move {
-        audio::capture::record_to_wav(path_clone, sr, 1, event_tx, stop_clone).await
+        audio::capture::record_to_wav(path_clone, sr, 1, event_tx, stop_clone, completion).await
     });
     recording_guard.attach_worker(worker);
     drop(tx);
@@ -280,8 +327,9 @@ async fn run_audio_test(
     let path_clone = tmp_path.clone();
     let event_tx = tx.clone();
     let stop_clone = stop_flag.clone();
+    let completion = recording_guard.completion();
     let worker = tokio::spawn(async move {
-        audio::capture::record_to_wav(path_clone, 16000, 1, event_tx, stop_clone).await
+        audio::capture::record_to_wav(path_clone, 16000, 1, event_tx, stop_clone, completion).await
     });
     recording_guard.attach_worker(worker);
 
@@ -382,12 +430,7 @@ async fn generate_tts(
     request_id: uuid::Uuid,
     paths: State<'_, PathsState>,
 ) -> Result<String, String> {
-    if text.trim().is_empty() {
-        return Err("Text cannot be empty".to_string());
-    }
-    if text.len() > 10_000 {
-        return Err("Text too long (max 10,000 characters)".to_string());
-    }
+    validate_tts_text(&text)?;
 
     let output_path = paths.paths.tts_output_path(request_id);
     if let Some(parent) = output_path.parent() {
@@ -439,8 +482,9 @@ async fn check_audio_devices(
 
     let temp_dir = paths.paths.temp_dir.clone();
     let worker_stop = stop_flag.clone();
+    let completion = recording_guard.completion();
     let worker = tokio::spawn(async move {
-        interview::device_check::run_device_check(temp_dir, tx, worker_stop).await
+        interview::device_check::run_device_check(temp_dir, tx, worker_stop, completion).await
     });
     recording_guard.attach_worker(worker);
 
@@ -472,6 +516,22 @@ const EXPECTED_ROUNDS: i32 = 5;
 
 /// Maximum accepted question length at the Rust boundary.
 const MAX_QUESTION_LEN: usize = 10_000;
+
+/// Maximum accepted standalone-TTS text length at the Rust boundary.
+const MAX_TTS_LEN: usize = 10_000;
+
+/// Validate standalone TTS text at the command boundary (P3). The limit is
+/// CHARACTERS, matching the error message — `chars().count()` keeps the
+/// contract truthful for multibyte text.
+fn validate_tts_text(text: &str) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Err("Text cannot be empty".to_string());
+    }
+    if text.chars().count() > MAX_TTS_LEN {
+        return Err(format!("Text too long (max {} characters)", MAX_TTS_LEN));
+    }
+    Ok(())
+}
 
 /// Validate question text at the Rust boundary (P2-1). Runs BEFORE any DB
 /// preflight, recording-slot acquisition, or hardware work: a blank or
@@ -670,6 +730,7 @@ async fn run_interview_round(
 
     // Spawn worker; guaranteed cleanup on all paths
     let question_clone = question.clone();
+    let completion = recording_guard.completion();
     let worker = tokio::spawn(async move {
         interview::orchestrator::run_interview_round(
             &question_clone,
@@ -680,6 +741,7 @@ async fn run_interview_round(
             tts_event_tx_clone,
             stop_clone,
             Some(phase_tx),
+            completion,
         )
         .await
     });
@@ -843,10 +905,42 @@ async fn run_interview_round(
             recording_guard.await_worker().await;
         }
 
-        // Worker has fully terminated (cooperatively or aborted) — release
-        // the recording slot deterministically and disarm the safety net.
-        clear_active_recording(&state).await;
-        recording_guard.disarm();
+        // P1-1: the outer worker is resolved, but an already-running nested
+        // spawn_blocking capture may still be finishing — aborting the outer
+        // async task does NOT prove the physical capture has stopped. The
+        // recording slot stays occupied until the real blocking capture
+        // signals termination (it observes the stop flag within ~100ms). If
+        // the capture is pathologically stuck, keep the slot reserved: a
+        // detached task releases it only once the capture truly terminates,
+        // so overlapping physical capture is never allowed, while this
+        // command still returns (bounded).
+        let completion = recording_guard.completion();
+        let mut blocking_terminated = true;
+        if !graceful && completion.started() {
+            blocking_terminated = tokio::time::timeout(
+                std::time::Duration::from_secs(GRACE_SECS),
+                completion.wait(),
+            )
+            .await
+            .is_ok();
+        }
+
+        if blocking_terminated {
+            // Worker has fully terminated (cooperatively or aborted) AND any
+            // in-flight physical capture is done — release the recording
+            // slot deterministically and disarm the safety net.
+            clear_active_recording(&state).await;
+            recording_guard.disarm();
+        } else {
+            // Pathological: physical capture still alive after the grace.
+            // Hold the slot; a detached task releases it after termination.
+            let cleanup_state = state.inner().clone();
+            tokio::spawn(async move {
+                completion.wait().await;
+                clear_active_recording(&cleanup_state).await;
+            });
+            recording_guard.disarm();
+        }
 
         // Drain the relay so queued phase events flush BEFORE the final
         // error event below — the timeout error must be the last word.
@@ -1117,8 +1211,9 @@ mod tests {
             // command before the worker completed.
         }
 
-        // Give the drop-spawned cleanup task time to run.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Give the drop-spawned cleanup task time to run (no-capture worker:
+        // the cleanup waits up to 50ms for a capture start, then aborts).
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         assert!(
             stop.load(Ordering::SeqCst),
@@ -1130,13 +1225,13 @@ mod tests {
         );
     }
 
-    /// P1-1: the drop safety net uses the REAL nested topology (outer
-    /// tokio::spawn -> spawn_blocking -> loops until stop observed). Dropping
-    /// an armed guard sets the stop flag and gives the nested blocking
-    /// capture a bounded cooperative grace period; the slot stays occupied
-    /// until the blocking worker has actually terminated, so a second acquire
-    /// cannot succeed early, and only after termination is the slot cleared
-    /// and reusable.
+    /// P1-1 cooperative case: the drop safety net uses the REAL nested
+    /// topology (outer tokio::spawn -> spawn_blocking -> loops until stop
+    /// observed). Dropping an armed guard sets the stop flag; the nested
+    /// blocking worker exits within the cooperative grace and signals
+    /// completion (exactly like record_to_wav's lifecycle guard), and only
+    /// then is the slot cleared and reusable. A second acquire fails while
+    /// the blocking worker is still alive.
     #[tokio::test]
     async fn recording_guard_drop_waits_for_nested_blocking_worker() {
         let state = Arc::new(RecordingState {
@@ -1147,36 +1242,35 @@ mod tests {
         acquire_recording(&state, fake_handle()).await.unwrap();
 
         let stop_seen = Arc::new(tokio::sync::Notify::new());
-        let (terminated_tx, terminated_rx) = tokio::sync::oneshot::channel::<()>();
 
         {
             let mut guard = RecordingGuard::new(state.clone(), stop.clone());
+            let completion = guard.completion();
             let worker = {
                 let blocking_stop = stop.clone();
                 let blocking_release = release.clone();
                 let stop_seen = stop_seen.clone();
-                let terminated_tx = terminated_tx;
+                let completion = completion.clone();
                 tokio::spawn(async move {
                     // Outer async worker awaiting the nested blocking capture.
-                    let blocking_stop = blocking_stop.clone();
-                    let blocking_release = blocking_release.clone();
-                    let stop_seen = stop_seen.clone();
-                    let terminated_tx = terminated_tx;
                     let blocking = tokio::task::spawn_blocking(move || {
-                        // Nested physical capture: loop until stop observed.
+                        // Mimic record_to_wav's physical capture: mark started
+                        // first, loop until stop observed, then stay "still
+                        // finishing" until released.
+                        completion.mark_started();
                         while !blocking_stop.load(Ordering::SeqCst) {
                             std::thread::sleep(std::time::Duration::from_millis(2));
                         }
-                        // Stop observed — signal, then "still finishing"
-                        // (unwinding the capture) until released.
+                        // Stop observed — signal it.
                         stop_seen.notify_waiters();
                         while !blocking_release.load(Ordering::SeqCst) {
                             std::thread::sleep(std::time::Duration::from_millis(2));
                         }
+                        // Blocking worker fully terminated — signal completion,
+                        // exactly like BlockingCaptureLifecycle.
+                        completion.signal();
                     });
                     let _ = blocking.await;
-                    // Blocking worker fully terminated.
-                    let _ = terminated_tx.send(());
                 })
             };
             guard.attach_worker(worker);
@@ -1202,14 +1296,9 @@ mod tests {
             "second acquire must not succeed while the cancelled worker is alive"
         );
 
-        // 4. Release the blocking worker -> it terminates -> outer worker
-        // finishes -> cleanup clears the slot.
+        // 4. Release the blocking worker -> it terminates -> signals
+        // completion -> cleanup clears the slot.
         release.store(true, Ordering::SeqCst);
-        match tokio::time::timeout(std::time::Duration::from_secs(5), terminated_rx).await {
-            Ok(Ok(())) => {}
-            _ => panic!("blocking worker must terminate after release"),
-        }
-        // Wait for the cleanup task to clear the slot after termination.
         let mut cleared = false;
         for _ in 0..200 {
             if state.handle.lock().await.is_none() {
@@ -1224,6 +1313,99 @@ mod tests {
         );
 
         // 5. Slot is reusable.
+        acquire_recording(&state, fake_handle()).await.unwrap();
+        assert!(state.handle.lock().await.is_some());
+    }
+
+    /// P1-1 force-abort regression: a nested blocking capture that survives
+    /// BEYOND the cooperative grace does NOT free the slot early. The outer
+    /// wrapper is force-aborted (which cannot kill the spawn_blocking
+    /// closure), but the slot stays occupied until the REAL blocking worker
+    /// terminates and signals completion; only then is it cleared and
+    /// reusable. The drop_grace is shrunk so the test is fast.
+    #[tokio::test]
+    async fn recording_guard_drop_force_abort_does_not_free_slot_early() {
+        let state = Arc::new(RecordingState {
+            handle: Mutex::new(None),
+        });
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        acquire_recording(&state, fake_handle()).await.unwrap();
+
+        let stop_seen = Arc::new(tokio::sync::Notify::new());
+
+        {
+            let mut guard = RecordingGuard::new(state.clone(), stop.clone());
+            // Shrink the drop-safety-net grace so the force-abort path is
+            // exercised quickly (production default is 5s).
+            guard.drop_grace = std::time::Duration::from_millis(150);
+            let completion = guard.completion();
+            let worker = {
+                let blocking_stop = stop.clone();
+                let blocking_release = release.clone();
+                let stop_seen = stop_seen.clone();
+                let completion = completion.clone();
+                tokio::spawn(async move {
+                    // Real nested topology: outer tokio::spawn -> spawn_blocking.
+                    let blocking = tokio::task::spawn_blocking(move || {
+                        completion.mark_started();
+                        // 1. Observe stop.
+                        while !blocking_stop.load(Ordering::SeqCst) {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                        // 2. Signal stop was observed.
+                        stop_seen.notify_waiters();
+                        // 3. Remain alive beyond the cooperative grace.
+                        while !blocking_release.load(Ordering::SeqCst) {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                        // 4. Terminate only after the test releases it.
+                        completion.signal();
+                    });
+                    let _ = blocking.await;
+                })
+            };
+            guard.attach_worker(worker);
+            // Dropped while armed — unexpected drop/panic of the outer command.
+        }
+
+        // The blocking worker observed stop.
+        tokio::time::timeout(std::time::Duration::from_secs(5), stop_seen.notified())
+            .await
+            .expect("blocking worker must observe the drop-set stop flag");
+        assert!(stop.load(Ordering::SeqCst), "drop must set the stop flag");
+
+        // Wait PAST the shrunk grace AND the outer abort: the real blocking
+        // worker is still alive, so the slot must still be occupied and a
+        // second acquire must fail.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            state.handle.lock().await.is_some(),
+            "slot must stay occupied past the grace/abort while the blocking worker is alive"
+        );
+        let second = acquire_recording(&state, fake_handle()).await;
+        assert!(
+            second.is_err() && second.unwrap_err().contains("already active"),
+            "force-aborting the outer wrapper must not free the slot early"
+        );
+
+        // Release the blocking worker -> it signals completion -> the cleanup
+        // clears the slot ONLY then.
+        release.store(true, Ordering::SeqCst);
+        let mut cleared = false;
+        for _ in 0..200 {
+            if state.handle.lock().await.is_none() {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            cleared,
+            "slot must clear only after real blocking-worker termination"
+        );
+
+        // Slot is reusable.
         acquire_recording(&state, fake_handle()).await.unwrap();
         assert!(state.handle.lock().await.is_some());
     }
@@ -1589,5 +1771,38 @@ mod tests {
     fn validate_question_ascii_boundary() {
         assert!(validate_question(&"x".repeat(MAX_QUESTION_LEN)).is_ok());
         assert!(validate_question(&"x".repeat(MAX_QUESTION_LEN + 1)).is_err());
+    }
+
+    // --- Standalone TTS text validation (P3) ---
+
+    #[test]
+    fn validate_tts_text_rejects_empty() {
+        assert!(validate_tts_text("").is_err());
+        assert!(validate_tts_text("   \t\n ").is_err());
+    }
+
+    #[test]
+    fn validate_tts_text_rejects_oversized() {
+        let err = validate_tts_text(&"x".repeat(MAX_TTS_LEN + 1)).unwrap_err();
+        assert!(err.contains("too long"), "got: {}", err);
+    }
+
+    #[test]
+    fn validate_tts_text_accepts_at_limit() {
+        assert!(validate_tts_text(&"x".repeat(MAX_TTS_LEN)).is_ok());
+    }
+
+    #[test]
+    fn validate_tts_text_limits_characters_not_bytes() {
+        // Each character is 4 UTF-8 bytes: 4000 chars = 16000 bytes but only
+        // 4000 characters — accepted (byte-length checks would reject it).
+        let multibyte = "\u{1F600}".repeat(4_000);
+        assert!(multibyte.len() > MAX_TTS_LEN, "sanity: bytes exceed limit");
+        assert!(validate_tts_text(&multibyte).is_ok());
+
+        // Past the CHARACTER limit it is rejected regardless of byte width.
+        let too_many = "\u{1F600}".repeat(MAX_TTS_LEN + 1);
+        let err = validate_tts_text(&too_many).unwrap_err();
+        assert!(err.contains("too long"), "got: {}", err);
     }
 }

@@ -32,6 +32,59 @@ impl RecordingHandle {
     }
 }
 
+/// Tracks the lifecycle of the PHYSICAL blocking capture worker so
+/// recording-slot owners can prove it has terminated before releasing the
+/// slot (P1-1). A `tokio::spawn` wrapper can be aborted without killing an
+/// already-running `spawn_blocking` CPAL closure, so slot release must wait
+/// on `wait()` rather than trusting the outer wrapper. `started`
+/// distinguishes "a capture was in flight" from "the worker died before any
+/// capture began" (e.g. aborted during TTS) — the latter must never block
+/// the slot indefinitely.
+#[derive(Clone, Default)]
+pub struct CaptureCompletion {
+    inner: Arc<tokio::sync::Notify>,
+    started: Arc<AtomicBool>,
+}
+
+impl CaptureCompletion {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Called when the blocking capture closure begins executing.
+    pub fn mark_started(&self) {
+        self.started.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether a blocking capture was actually started.
+    pub fn started(&self) -> bool {
+        self.started.load(Ordering::SeqCst)
+    }
+
+    /// Wait until the blocking capture closure has exited. Signalled exactly
+    /// once, on success or failure; the signal is stored if no waiter is
+    /// present yet, so a late waiter still completes immediately.
+    pub async fn wait(&self) {
+        self.inner.notified().await;
+    }
+
+    /// Signal that the blocking closure has exited. Must be called at most
+    /// once per completion.
+    pub fn signal(&self) {
+        self.inner.notify_one();
+    }
+}
+
+/// Drop guard inside the blocking capture closure: signals `CaptureCompletion`
+/// on EVERY exit path (success, `?`, bail, panic).
+struct BlockingCaptureLifecycle(CaptureCompletion);
+
+impl Drop for BlockingCaptureLifecycle {
+    fn drop(&mut self) {
+        self.0.signal();
+    }
+}
+
 /// Bounded sample queue with a non-blocking producer for the real-time CPAL
 /// callback. Overflow policy is explicit: queue available -> enqueue; queue
 /// full -> drop the current chunk and count the overflow. The callback can
@@ -159,15 +212,20 @@ where
     Ok(total_frames)
 }
 
-/// Internal RAII cleanup for `record_to_wav` failure paths (P2-2). Removes the
-/// partial `.wav.tmp` — and any uncommitted provisional final WAV — when
-/// dropped without being committed. Missing files are ignored and cleanup
-/// never panics. Declared BEFORE the `WavWriter` so reverse declaration
-/// order drops the writer (releasing its Windows file handle) before the
-/// guard removes files.
+/// Internal RAII cleanup for `record_to_wav` failure paths (P2-2). Removes
+/// ONLY files this invocation created: the partial `.wav.tmp` (once the
+/// writer has created it) and any provisional final WAV (once the temp has
+/// been renamed to it) — when dropped without being committed. A pre-existing
+/// final WAV is rejected before recording begins, so cleanup can never delete
+/// evidence it did not create. Missing files are ignored and cleanup never
+/// panics. Declared BEFORE the `WavWriter` so reverse declaration order
+/// drops the writer (releasing its Windows file handle) before the guard
+/// removes files.
 struct PartialWavGuard {
     temp_path: PathBuf,
     final_path: PathBuf,
+    owns_temp: bool,
+    owns_final: bool,
     committed: bool,
 }
 
@@ -176,8 +234,22 @@ impl PartialWavGuard {
         Self {
             temp_path,
             final_path,
+            owns_temp: false,
+            owns_final: false,
             committed: false,
         }
+    }
+
+    /// This invocation created the temp file — cleanup owns it.
+    fn mark_temp_owned(&mut self) {
+        self.owns_temp = true;
+    }
+
+    /// The temp was renamed to the final path — this invocation now owns the
+    /// final (provisional until `commit`).
+    fn mark_final_owned(&mut self) {
+        self.owns_temp = false;
+        self.owns_final = true;
     }
 
     /// Mark the recording fully committed — the final WAV must be preserved.
@@ -191,8 +263,12 @@ impl Drop for PartialWavGuard {
         if self.committed {
             return;
         }
-        let _ = std::fs::remove_file(&self.temp_path);
-        let _ = std::fs::remove_file(&self.final_path);
+        if self.owns_temp {
+            let _ = std::fs::remove_file(&self.temp_path);
+        }
+        if self.owns_final {
+            let _ = std::fs::remove_file(&self.final_path);
+        }
     }
 }
 
@@ -206,6 +282,7 @@ pub async fn record_to_wav(
     channels: u16,
     event_tx: mpsc::Sender<CaptureEvent>,
     stop_flag: Arc<AtomicBool>,
+    completion: CaptureCompletion,
 ) -> anyhow::Result<RecordResult> {
     let sr = sample_rate;
     let ch = channels;
@@ -214,9 +291,30 @@ pub async fn record_to_wav(
     tokio::task::spawn_blocking(move || -> anyhow::Result<RecordResult> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
+        // P1-1: the physical capture lifecycle is signalled on every exit
+        // path — slot owners wait on `completion` before releasing the slot.
+        let _lifecycle = BlockingCaptureLifecycle(completion.clone());
+        completion.mark_started();
+
+        // Stale partial from a previous crashed run: remove it explicitly as
+        // stale so this invocation starts clean (also when a final WAV
+        // collision below is rejected). It is by definition uncommitted and
+        // cannot be evidence.
+        if temp_path.exists() {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+
+        // P1-2: a pre-existing final WAV is evidence — never overwrite or
+        // delete it. Reject BEFORE any destructive cleanup ownership begins
+        // (and before any audio device is touched).
+        if output_path.exists() {
+            anyhow::bail!("Recording output already exists: {}", output_path.display());
+        }
+
         // Own partial-file cleanup for EVERY failure path: any `?`/bail below
         // unwinds with the guard armed, and because the guard is declared
         // before the writer, the writer (holding the file handle) drops first.
+        // The guard only ever removes files THIS invocation created.
         let mut cleanup = PartialWavGuard::new(temp_path.clone(), output_path.clone());
 
         let host = cpal::default_host();
@@ -238,6 +336,8 @@ pub async fn record_to_wav(
         };
 
         let mut writer = hound::WavWriter::create(&temp_path, spec)?;
+        // The temp file now exists because of THIS invocation.
+        cleanup.mark_temp_owned();
 
         let (sample_queue, sample_rx) = SampleQueue::new(64);
         let overflow_watch = sample_queue.overflow.clone();
@@ -320,8 +420,11 @@ pub async fn record_to_wav(
         }
         writer.finalize()?;
 
-        // Atomic rename: temp -> final (crash-safe)
+        // Atomic rename: temp -> final (crash-safe). From here the invocation
+        // owns the final path; a post-rename failure removes only this
+        // provisional final.
         std::fs::rename(&temp_path, &output_path)?;
+        cleanup.mark_final_owned();
 
         let duration_ms = (total_frames * 1000) / sr as u64;
         let file_size_bytes = std::fs::metadata(&output_path)?.len();
@@ -369,6 +472,24 @@ pub async fn list_output_devices() -> anyhow::Result<Vec<String>> {
     .await?
 }
 
+/// Name of the DEFAULT output device — the one production playback actually
+/// uses (Piper TTS and round playback both select cpal's
+/// `default_output_device()`). Returns `Ok(None)` when the host has no
+/// default output; this is deliberately distinct from listing all output
+/// devices, because a non-default speaker alone must not mark TTS
+/// readiness (P2-1).
+pub async fn get_default_output_device_name() -> anyhow::Result<Option<String>> {
+    tokio::task::spawn_blocking(|| {
+        use cpal::traits::{DeviceTrait, HostTrait};
+        let host = cpal::default_host();
+        Ok(host
+            .default_output_device()
+            .and_then(|d| d.name().ok())
+            .map(|n| n.to_string()))
+    })
+    .await?
+}
+
 /// Record a short audio clip for device verification (3 seconds max).
 /// Returns the path to the recorded temp file.
 /// The capture is bounded by BOTH the expected sample count AND a hard
@@ -382,6 +503,7 @@ pub async fn record_test_clip(
     temp_dir: PathBuf,
     event_tx: mpsc::Sender<CaptureEvent>,
     stop_flag: Arc<AtomicBool>,
+    completion: CaptureCompletion,
 ) -> anyhow::Result<PathBuf> {
     // P2-1: UUID-based name so concurrent device checks can never target the
     // same path (a PID alone is not unique across concurrent checks).
@@ -390,6 +512,10 @@ pub async fn record_test_clip(
 
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+        // P1-1: signal the physical capture lifecycle on every exit path.
+        let _lifecycle = BlockingCaptureLifecycle(completion.clone());
+        completion.mark_started();
 
         let host = cpal::default_host();
         let device = host
@@ -580,7 +706,7 @@ mod tests {
         );
     }
 
-    /// P2-2: an armed cleanup guard removes the partial temp file.
+    /// P2-2: an armed cleanup guard removes the partial temp file it created.
     #[test]
     fn partial_wav_guard_armed_removes_temp() {
         let dir = tempfile::tempdir().unwrap();
@@ -589,28 +715,57 @@ mod tests {
         std::fs::write(&temp, b"partial").unwrap();
 
         {
-            let _guard = PartialWavGuard::new(temp.clone(), final_path.clone());
+            let mut guard = PartialWavGuard::new(temp.clone(), final_path.clone());
+            guard.mark_temp_owned();
         }
         assert!(!temp.exists(), "armed guard must remove the temp file");
     }
 
-    /// P2-2: an uncommitted provisional final WAV is also removed (the final
-    /// is provisional until the caller commits it — e.g. after DB commit).
+    /// P2-2: an uncommitted provisional final WAV owned by this invocation is
+    /// also removed (the final is provisional until the caller commits it —
+    /// e.g. after DB commit). After the rename the temp no longer exists, so
+    /// only the provisional final is owned.
     #[test]
     fn partial_wav_guard_armed_removes_uncommitted_final() {
         let dir = tempfile::tempdir().unwrap();
         let temp = dir.path().join("round.wav.tmp");
         let final_path = dir.path().join("round.wav");
-        std::fs::write(&temp, b"partial").unwrap();
         std::fs::write(&final_path, b"provisional").unwrap();
 
         {
-            let _guard = PartialWavGuard::new(temp.clone(), final_path.clone());
+            let mut guard = PartialWavGuard::new(temp.clone(), final_path.clone());
+            guard.mark_temp_owned();
+            guard.mark_final_owned();
         }
-        assert!(!temp.exists());
+        assert!(!temp.exists(), "temp is gone after the rename lifecycle");
         assert!(
             !final_path.exists(),
             "uncommitted provisional final must be removed"
+        );
+    }
+
+    /// P1-2 core invariant: a final WAV this invocation did NOT create is
+    /// never removed — the guard only owns what it marked.
+    #[test]
+    fn partial_wav_guard_never_removes_unowned_final() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("round.wav.tmp");
+        let final_path = dir.path().join("round.wav");
+        let original = b"pre-existing-evidence";
+        std::fs::write(&temp, b"partial").unwrap();
+        std::fs::write(&final_path, original).unwrap();
+
+        {
+            let mut guard = PartialWavGuard::new(temp.clone(), final_path.clone());
+            // Only the temp was created by this invocation.
+            guard.mark_temp_owned();
+        }
+        assert!(!temp.exists(), "owned temp removed");
+        assert!(final_path.exists(), "unowned final must survive");
+        assert_eq!(
+            std::fs::read(&final_path).unwrap(),
+            original,
+            "unowned final must be byte-for-byte unchanged"
         );
     }
 
@@ -640,6 +795,43 @@ mod tests {
         // Must not panic and must not error.
         let _guard = PartialWavGuard::new(temp.clone(), final_path.clone());
         drop(_guard);
+    }
+
+    /// P1-2: a pre-existing final WAV is rejected BEFORE any audio device is
+    /// touched, the original file stays byte-for-byte unchanged, and a stale
+    /// temp from a previous run is removed by policy.
+    #[tokio::test]
+    async fn record_to_wav_rejects_existing_final_before_audio() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("round.wav");
+        let original = b"pre-existing-evidence";
+        std::fs::write(&final_path, original).unwrap();
+        let temp_path = final_path.with_extension("wav.tmp");
+        std::fs::write(&temp_path, b"stale").unwrap();
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let result = record_to_wav(
+            final_path.clone(),
+            16000,
+            1,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            CaptureCompletion::new(),
+        )
+        .await;
+
+        assert!(result.is_err(), "existing final must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("already exists"), "unexpected error: {}", msg);
+        assert_eq!(
+            std::fs::read(&final_path).unwrap(),
+            original,
+            "original WAV must be byte-for-byte unchanged"
+        );
+        assert!(
+            !temp_path.exists(),
+            "stale temp must be removed by the stale-temp policy"
+        );
     }
 
     /// A full sample queue never blocks the producer: the chunk is dropped and

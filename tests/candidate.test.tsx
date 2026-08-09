@@ -14,41 +14,24 @@ describe("Candidate Page", () => {
 
   it("renders the heading", () => {
     render(<CandidatePage />);
-    expect(screen.getByText("Interview Session")).toBeInTheDocument();
+    expect(screen.getByText("Candidate View")).toBeInTheDocument();
   });
 
-  it("shows waiting state by default", () => {
+  it("honestly labels the window as not available yet (P2-2)", () => {
     render(<CandidatePage />);
-    expect(screen.getByText("Waiting for the interviewer to begin...")).toBeInTheDocument();
+    expect(
+      screen.getByText(/This window is not available yet/)
+    ).toBeInTheDocument();
+    expect(screen.getByText(/planned for a later release/)).toBeInTheDocument();
   });
 
-  it("shows round number starting at 1", () => {
+  it("does not fake functional interview states", () => {
     render(<CandidatePage />);
-    expect(screen.getByText("Round 1")).toBeInTheDocument();
-  });
-
-  it("does not show recording indicator in waiting state", () => {
-    render(<CandidatePage />);
+    expect(screen.queryByText("Waiting for the interviewer to begin...")).not.toBeInTheDocument();
     expect(screen.queryByText("Recording your answer...")).not.toBeInTheDocument();
-  });
-
-  it("does not show listening indicator in waiting state", () => {
-    render(<CandidatePage />);
     expect(screen.queryByText("Listening to question...")).not.toBeInTheDocument();
-  });
-
-  it("does not show done state initially", () => {
-    render(<CandidatePage />);
-    expect(screen.queryByText("Answer recorded")).not.toBeInTheDocument();
-  });
-
-  it("does not show error initially", () => {
-    render(<CandidatePage />);
-    expect(screen.queryByText(/Error/)).not.toBeInTheDocument();
-  });
-
-  it("does not show Ready button in waiting state", () => {
-    render(<CandidatePage />);
-    expect(screen.queryByText("Ready for next question")).not.toBeInTheDocument();
+    expect(screen.queryByText("Round 1")).not.toBeInTheDocument();
+    // No Tauri invoke calls either — the placeholder is purely static.
+    expect(mockInvoke).not.toHaveBeenCalled();
   });
 });

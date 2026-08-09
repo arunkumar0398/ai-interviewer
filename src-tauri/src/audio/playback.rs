@@ -376,13 +376,13 @@ pub async fn generate_tts_with_paths(
     output_path: PathBuf,
     paths: &crate::paths::AppPaths,
 ) -> anyhow::Result<()> {
-    let tools = crate::paths::resolve_tools(&paths.tool_dir);
-    let piper_bin = tools
-        .piper_bin
-        .ok_or_else(|| anyhow::anyhow!("Piper binary not found"))?;
-    let piper_model = tools
-        .piper_model
-        .ok_or_else(|| anyhow::anyhow!("Piper model not found"))?;
+    // Executable and model resolve from ONE coherent layout (P1-3) — the
+    // same resolver readiness uses, so execution always matches the
+    // validated runtime pair.
+    let piper = crate::paths::resolve_piper(&paths.tool_dir)
+        .ok_or_else(|| anyhow::anyhow!("Piper runtime not found"))?;
+    let piper_bin = piper.executable;
+    let piper_model = piper.model;
 
     // Validate paths exist before spawning process
     if !piper_bin.exists() {

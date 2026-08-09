@@ -1,5 +1,6 @@
 use crate::audio::capture::{
-    list_input_devices, list_output_devices, record_test_clip, CaptureEvent,
+    get_default_output_device_name, list_input_devices, record_test_clip, CaptureCompletion,
+    CaptureEvent,
 };
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -26,6 +27,7 @@ pub async fn run_device_check(
     temp_dir: PathBuf,
     event_tx: mpsc::Sender<CaptureEvent>,
     stop_flag: Arc<AtomicBool>,
+    completion: CaptureCompletion,
 ) -> DeviceCheckResult {
     let mut errors = Vec::new();
 
@@ -45,25 +47,37 @@ pub async fn run_device_check(
         errors.push("No microphone detected".to_string());
     }
 
-    // Check output devices
-    let output_devices = match list_output_devices().await {
-        Ok(devices) => devices,
+    // Check the DEFAULT output device. Production playback (Piper TTS and
+    // round playback) selects cpal's `default_output_device()`, so enumerating
+    // ANY output device is NOT sufficient: a non-default speaker alone must
+    // not mark speaker readiness (P2-1).
+    let (speaker_available, speaker_name) = match get_default_output_device_name().await {
+        Ok(Some(name)) => (true, Some(name)),
+        Ok(None) => {
+            errors.push(
+                "No default output device detected — TTS playback has no speaker".to_string(),
+            );
+            (false, None)
+        }
         Err(e) => {
-            errors.push(format!("Failed to list output devices: {}", e));
-            Vec::new()
+            errors.push(format!("Failed to query default output device: {}", e));
+            (false, None)
         }
     };
 
-    let speaker_available = !output_devices.is_empty();
-    let speaker_name = output_devices.first().cloned();
-
-    if !speaker_available {
-        errors.push("No speaker/headphone detected".to_string());
-    }
-
     // Test mic recording (2 second clip)
     let mic_test_ok = if mic_available {
-        match record_test_clip(16000, 1, 2, temp_dir, event_tx.clone(), stop_flag).await {
+        match record_test_clip(
+            16000,
+            1,
+            2,
+            temp_dir,
+            event_tx.clone(),
+            stop_flag,
+            completion,
+        )
+        .await
+        {
             Ok(path) => {
                 // Check file has reasonable size (at least 1 second of 16kHz 16-bit mono)
                 let metadata = std::fs::metadata(&path);

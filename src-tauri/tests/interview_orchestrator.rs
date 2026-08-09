@@ -58,22 +58,40 @@ fn piper_verify_missing_model() {
     let _ = std::fs::remove_dir_all(&fake_dir);
 }
 
-/// Test: Piper installation check passes when both present
+/// Test: Piper installation check passes when the complete coherent runtime
+/// is present (legacy layout: executable + runtime companions + model/config).
 #[test]
 fn piper_verify_all_present() {
     let fake_dir = std::env::temp_dir().join("fake_piper_ok_dir");
     let _ = std::fs::remove_dir_all(&fake_dir);
 
-    let piper_bin = fake_dir.join("piper").join("piper").join("piper.exe");
+    // Complete legacy runtime: binary + required companion DLLs + espeak data.
+    let runtime_dir = fake_dir.join("piper").join("piper");
+    for asset in [
+        "piper.exe",
+        "espeak-ng.dll",
+        "piper_phonemize.dll",
+        "onnxruntime.dll",
+        "onnxruntime_providers_shared.dll",
+    ] {
+        let p = runtime_dir.join(asset);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"fake runtime file").unwrap();
+    }
+    let phontab = runtime_dir.join("espeak-ng-data").join("phontab");
+    std::fs::create_dir_all(phontab.parent().unwrap()).unwrap();
+    std::fs::write(&phontab, b"fake phontab").unwrap();
+
+    // Coherent legacy model/config pair.
     let model_path = fake_dir.join("piper-models").join("en_US-amy-medium.onnx");
-    std::fs::create_dir_all(piper_bin.parent().unwrap()).unwrap();
+    let model_config = fake_dir.join("piper-models").join("en_US-amy-medium.onnx.json");
     std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
-    std::fs::write(&piper_bin, b"fake binary").unwrap();
     std::fs::write(&model_path, b"fake model").unwrap();
+    std::fs::write(&model_config, b"{}").unwrap();
 
     let paths = fake_app_paths(&fake_dir);
     let result = ai_interviewer_lib::audio::tts_supervisor::verify_piper_installation(&paths);
-    assert!(result.is_ok(), "Should succeed when both files exist");
+    assert!(result.is_ok(), "Should succeed when the complete runtime exists");
 
     let _ = std::fs::remove_dir_all(&fake_dir);
 }
@@ -85,9 +103,13 @@ async fn device_check_handles_no_devices() {
     let temp_dir = std::env::temp_dir().join("ai_interviewer_test_device_check");
     let _ = std::fs::create_dir_all(&temp_dir);
     let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let result =
-        ai_interviewer_lib::interview::device_check::run_device_check(temp_dir, tx, stop_flag)
-            .await;
+    let result = ai_interviewer_lib::interview::device_check::run_device_check(
+        temp_dir,
+        tx,
+        stop_flag,
+        ai_interviewer_lib::audio::capture::CaptureCompletion::new(),
+    )
+    .await;
 
     // Should return a result, even if devices aren't found
     // On CI/headless, both will be false

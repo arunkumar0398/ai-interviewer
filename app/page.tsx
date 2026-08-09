@@ -43,8 +43,10 @@ export default function Home() {
           Automated interview platform with local audio capture, TTS, and whisper transcription.
         </p>
 
-        {/* Navigation Cards */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 w-full max-w-2xl">
+        {/* Navigation Cards — the Candidate View is intentionally not
+            advertised here (P2-2): it is a static placeholder until real
+            candidate-window synchronization lands in later work. */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 w-full max-w-2xl">
           <a
             href="/interview"
             className="block p-6 border rounded-lg dark:border-zinc-800 hover:border-indigo-500 dark:hover:border-indigo-400 transition-colors"
@@ -54,18 +56,6 @@ export default function Home() {
             </h2>
             <p className="text-sm text-zinc-500 dark:text-zinc-400">
               Device check, TTS playback, recording, and transcription.
-            </p>
-          </a>
-
-          <a
-            href="/candidate"
-            className="block p-6 border rounded-lg dark:border-zinc-800 hover:border-indigo-500 dark:hover:border-indigo-400 transition-colors"
-          >
-            <h2 className="text-lg font-medium dark:text-zinc-200 mb-2">
-              Candidate View
-            </h2>
-            <p className="text-sm text-zinc-500 dark:text-zinc-400">
-              Restricted window for the interviewee.
             </p>
           </a>
 

@@ -1,4 +1,4 @@
-use crate::audio::capture::{self, CaptureEvent};
+use crate::audio::capture::{self, CaptureCompletion, CaptureEvent};
 use crate::audio::pipe::{terminate_child, StderrDrain};
 use crate::audio::tts_supervisor::{PiperSupervisor, TtsEvent};
 use crate::paths::uuid_to_path;
@@ -100,6 +100,7 @@ pub async fn run_interview_round(
     tts_event_tx: mpsc::Sender<TtsEvent>,
     stop_flag: Arc<AtomicBool>,
     phase_tx: Option<mpsc::Sender<InterviewPhase>>,
+    completion: CaptureCompletion,
 ) -> anyhow::Result<(AudioMetadata, String, UnpersistedAudio)> {
     let piper = PiperSupervisor::new(paths)?;
 
@@ -181,6 +182,7 @@ pub async fn run_interview_round(
         1,     // mono
         record_event_tx.clone(),
         record_auto_stop,
+        completion,
     )
     .await;
 

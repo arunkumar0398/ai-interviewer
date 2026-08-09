@@ -38,22 +38,26 @@ pub struct PiperSupervisor {
 
 impl PiperSupervisor {
     pub fn new(paths: &crate::paths::AppPaths) -> anyhow::Result<Self> {
-        let tools = crate::paths::resolve_tools(&paths.tool_dir);
-        let piper_bin = tools
-            .piper_bin
-            .ok_or_else(|| anyhow::anyhow!("Piper binary not found"))?;
-        let model_path = tools
-            .piper_model
-            .ok_or_else(|| anyhow::anyhow!("Piper model not found"))?;
-        if !piper_bin.exists() {
-            anyhow::bail!("Piper binary not found at {}", piper_bin.display());
+        // Executable, model, AND model config resolve from ONE coherent
+        // layout (P1-3): the same resolver readiness uses, so the runtime can
+        // never execute a model different from the pair that was validated.
+        let piper = crate::paths::resolve_piper(&paths.tool_dir)
+            .ok_or_else(|| anyhow::anyhow!("Piper runtime not found"))?;
+        if !piper.executable.exists() {
+            anyhow::bail!("Piper binary not found at {}", piper.executable.display());
         }
-        if !model_path.exists() {
-            anyhow::bail!("Piper model not found at {}", model_path.display());
+        if !piper.model.exists() {
+            anyhow::bail!("Piper model not found at {}", piper.model.display());
+        }
+        if !piper.model_config.exists() {
+            anyhow::bail!(
+                "Piper model config not found at {}",
+                piper.model_config.display()
+            );
         }
         Ok(Self {
-            piper_bin,
-            model_path,
+            piper_bin: piper.executable,
+            model_path: piper.model,
             sample_rate: 22050,
             max_restarts: 3,
         })
@@ -380,20 +384,21 @@ async fn play_raw_pcm_async(
     .await?
 }
 
-/// Verify that Piper binary exists and model file is present
+/// Verify that the coherent Piper runtime (binary, model, config) is present
 pub fn verify_piper_installation(paths: &crate::paths::AppPaths) -> anyhow::Result<()> {
-    let tools = crate::paths::resolve_tools(&paths.tool_dir);
-    let piper_bin = tools
-        .piper_bin
-        .ok_or_else(|| anyhow::anyhow!("Piper binary not found"))?;
-    let piper_model = tools
-        .piper_model
-        .ok_or_else(|| anyhow::anyhow!("Piper model not found"))?;
-    if !piper_bin.exists() {
-        anyhow::bail!("Piper binary not found at {}", piper_bin.display());
+    let piper = crate::paths::resolve_piper(&paths.tool_dir)
+        .ok_or_else(|| anyhow::anyhow!("Piper runtime not found"))?;
+    if !piper.executable.exists() {
+        anyhow::bail!("Piper binary not found at {}", piper.executable.display());
     }
-    if !piper_model.exists() {
-        anyhow::bail!("Piper model not found at {}", piper_model.display());
+    if !piper.model.exists() {
+        anyhow::bail!("Piper model not found at {}", piper.model.display());
+    }
+    if !piper.model_config.exists() {
+        anyhow::bail!(
+            "Piper model config not found at {}",
+            piper.model_config.display()
+        );
     }
     Ok(())
 }

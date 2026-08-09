@@ -34,23 +34,20 @@ describe("Home Page", () => {
     ).toBeInTheDocument();
   });
 
-  it("renders three navigation cards", () => {
+  it("renders the navigation cards (Candidate View is not advertised)", () => {
     render(<Home />);
     expect(screen.getByText("Start Interview")).toBeInTheDocument();
-    expect(screen.getByText("Candidate View")).toBeInTheDocument();
     expect(screen.getByText("Dashboard")).toBeInTheDocument();
+    // P2-2: the Candidate View is a static placeholder without backend
+    // synchronization — it must NOT be advertised as a functional window.
+    expect(screen.queryByText("Candidate View")).not.toBeInTheDocument();
+    expect(screen.queryByText("Restricted window for the interviewee")).not.toBeInTheDocument();
   });
 
   it("links to /interview", () => {
     render(<Home />);
     const link = screen.getByText("Start Interview").closest("a");
     expect(link).toHaveAttribute("href", "/interview");
-  });
-
-  it("links to /candidate", () => {
-    render(<Home />);
-    const link = screen.getByText("Candidate View").closest("a");
-    expect(link).toHaveAttribute("href", "/candidate");
   });
 
   it("links to /dashboard", () => {
