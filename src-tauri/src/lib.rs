@@ -10,7 +10,9 @@ use tokio::sync::{mpsc, Mutex};
 
 use paths::{get_app_config, resolve_app_paths, uuid_to_path, PathsState};
 
-/// Holds the current recording handle so stop_recording can cancel it
+/// Holds the current recording handle — the shared EXCLUSIVE audio-slot
+/// lease. Every raw microphone/audio command acquires it before touching a
+/// device and clears it only after the physical worker has fully terminated.
 struct RecordingState {
     handle: Mutex<Option<audio::capture::RecordingHandle>>,
 }
@@ -18,13 +20,6 @@ struct RecordingState {
 /// Holds the database connection
 struct DbState {
     db: Mutex<Option<db::Database>>,
-}
-
-/// Structured return type for recording results
-#[derive(serde::Serialize)]
-struct RecordingResult {
-    path: String,
-    duration_ms: u64,
 }
 
 /// Atomically acquire the recording slot. Returns Err if already active.
@@ -282,89 +277,6 @@ impl<T: Send + 'static> Drop for RecordingGuard<T> {
     }
 }
 
-/// Maximum intended recording-duration bound for `start_recording`. The stop
-/// timer sets the stop flag after this budget and then waits for the actual
-/// capture worker to exit. If a native device call itself blocks
-/// (`default_input_device()`, `build_input_stream()`, `stream.play()`), the
-/// backend retains the audio slot until the physical worker exits rather than
-/// detaching it — the slot invariant (Scheduled -> no slot reuse) is the real
-/// backstop, not the wall clock. The UI no longer uses this command (the Home
-/// audio test is bounded + temp via `run_audio_test`), but as a public command
-/// it must still self-terminate.
-const START_RECORDING_MAX_SECS: u64 = 60;
-
-#[tauri::command]
-async fn start_recording(
-    session_id: uuid::Uuid,
-    round_id: uuid::Uuid,
-    sample_rate: Option<u32>,
-    state: State<'_, Arc<RecordingState>>,
-    paths: State<'_, PathsState>,
-) -> Result<RecordingResult, String> {
-    let (tx, _rx) = mpsc::channel(32);
-    let sr = sample_rate.unwrap_or(16000);
-
-    // Backend generates path: recordings/<session_id>/<round_id>.wav
-    let session_dir = paths.paths.session_recordings_dir(session_id);
-    std::fs::create_dir_all(&session_dir).map_err(|e| e.to_string())?;
-    let path = session_dir.join(format!("{}.wav", uuid_to_path(&round_id)));
-
-    let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let handle = audio::capture::RecordingHandle {
-        stop: stop_flag.clone(),
-    };
-
-    // Atomic acquire — single lock, check-and-set
-    acquire_recording(&state, handle).await?;
-
-    // P2-1: the guard owns the slot lease, stop flag, and worker JoinHandle.
-    // If this command is dropped mid-flight, the worker is stopped/aborted
-    // and awaited BEFORE the slot is released — never detached and leaked.
-    let mut recording_guard = RecordingGuard::new(state.inner().clone(), stop_flag.clone());
-
-    let path_clone = path.clone();
-    let event_tx = tx.clone();
-    let stop_clone = stop_flag.clone();
-    let completion = recording_guard.completion();
-
-    // Spawn worker; drop original tx so channel closes when worker finishes
-    let worker = tokio::spawn(async move {
-        audio::capture::record_to_wav(path_clone, sr, 1, event_tx, stop_clone, completion).await
-    });
-    recording_guard.attach_worker(worker);
-    drop(tx);
-
-    // Recording-duration bound (RC-4): auto-stop after
-    // START_RECORDING_MAX_SECS even if the UI never calls stop_recording.
-    // If a native device call blocks, the audio slot stays occupied until
-    // the physical worker exits rather than detaching it.
-    let max_stop = stop_flag.clone();
-    let timer = tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(START_RECORDING_MAX_SECS)).await;
-        max_stop.store(true, Ordering::SeqCst);
-    });
-
-    let join_result = recording_guard.take_result().await;
-    timer.abort();
-
-    // Release the slot and disarm the guard on EVERY outcome before
-    // propagating any error.
-    clear_active_recording(&state).await;
-    recording_guard.disarm();
-
-    // Check for join failure (panic/cancellation)
-    let record_result = match join_result {
-        Some(Ok(result)) => result.map_err(|e| e.to_string()),
-        Some(Err(e)) => Err(format!("Recording worker failed: {}", e)),
-        None => Err("Recording worker handle lost".to_string()),
-    }?;
-
-    Ok(RecordingResult {
-        path: record_result.file_path.to_string_lossy().to_string(),
-        duration_ms: record_result.duration_ms,
-    })
-}
-
 /// Result of a bounded microphone test
 #[derive(serde::Serialize)]
 struct AudioTestResult {
@@ -372,12 +284,11 @@ struct AudioTestResult {
     file_size_bytes: u64,
 }
 
-/// Bounded, self-cleaning microphone test (P1-2). Records to the TEMP
-/// directory (never the persistent recordings/ tree), auto-stops after 10s
-/// (bounds normal recording duration), and DELETES the WAV before returning.
-/// The Home page Audio Test uses this instead of `start_recording`, so a test
-/// can never
-/// create orphan persistent recordings and can never leave a backend
+/// Bounded, self-cleaning microphone test (P1-2) — the ONLY raw microphone
+/// test path in the app (RC-5). Records to the TEMP directory (never the
+/// persistent recordings/ tree), auto-stops after 10s (bounds normal
+/// recording duration), and DELETES the WAV before returning, so a test can
+/// never create orphan persistent recordings and can never leave a backend
 /// microphone operation running unbounded.
 #[tauri::command]
 async fn run_audio_test(
@@ -405,28 +316,26 @@ async fn run_audio_test(
     let event_tx = tx.clone();
     let stop_clone = stop_flag.clone();
     let completion = recording_guard.completion();
+    // RC-1: the outer wrapper does NOT own cleanup — the PHYSICAL capture
+    // closure does (retain_output = false). A command-level timeout aborts
+    // this outer async task, but aborting an async task cannot kill an
+    // already-submitted spawn_blocking capture. The only cleanup that
+    // survives such an abort is the one running INSIDE the physical closure
+    // (delete final WAV, then signal Finished), so a late capture
+    // finalization can never leave an orphan audio_test_*.wav.
     let worker = tokio::spawn(async move {
-        let result = audio::capture::record_to_wav(
-            path_clone.clone(),
-            16000,
-            1,
-            event_tx,
-            stop_clone,
-            completion,
+        audio::capture::record_to_wav(
+            path_clone, 16000, 1, event_tx, stop_clone, completion,
+            false, // RC-1: the physical worker removes the test WAV on success
         )
-        .await;
-        // The worker owns cleanup so a command-level timeout cannot return
-        // before the native capture and then miss a late-created WAV.
-        let _ = std::fs::remove_file(&path_clone);
-        let _ = std::fs::remove_file(path_clone.with_extension("wav.tmp"));
-        result
+        .await
     });
     recording_guard.attach_worker(worker);
 
     // Recording-duration bound (RC-4): the test auto-stops after
-    // AUDIO_TEST_MAX_SECS even if the UI never calls stop_recording. If a
-    // native device call blocks, the audio slot stays occupied until the
-    // physical worker exits rather than detaching it.
+    // AUDIO_TEST_MAX_SECS. If a native device call blocks, the audio slot
+    // stays occupied until the physical worker exits rather than detaching
+    // it.
     const AUDIO_TEST_MAX_SECS: u64 = 10;
     const AUDIO_TEST_COMMAND_DEADLINE_SECS: u64 = 15;
     let max_stop = stop_flag.clone();
@@ -457,18 +366,6 @@ async fn run_audio_test(
         duration_ms: record_result.duration_ms,
         file_size_bytes: record_result.file_size_bytes,
     })
-}
-
-#[tauri::command]
-async fn stop_recording(state: State<'_, Arc<RecordingState>>) -> Result<String, String> {
-    let guard = state.handle.lock().await;
-    match &*guard {
-        Some(handle) => {
-            handle.stop();
-            Ok("Stop signal sent".to_string())
-        }
-        None => Err("No active recording".to_string()),
-    }
 }
 
 #[tauri::command]
@@ -954,15 +851,12 @@ async fn run_interview_round(
         round_result
     } else {
         // Deadline hit — signal cooperative cancellation via stop_flag.
+        // RC-7: NO terminal event is emitted here. The single terminal
+        // timeout error is emitted exactly once below, after the worker
+        // lifecycle is resolved and the phase relay is drained, so the
+        // backend's one-terminal-event-per-round contract holds (a timeout
+        // produces exactly one error event).
         stop_flag.store(true, Ordering::SeqCst);
-        let _ = app.emit(
-            "interview-phase",
-            PhaseEventPayload {
-                phase: "error".to_string(),
-                question: Some(format!("Round timed out after {}s", ROUND_TIMEOUT_SECS)),
-                duration_ms: None,
-            },
-        );
 
         // Await the SAME worker up to the 5s grace period — allows
         // cooperative exit.
@@ -1019,13 +913,19 @@ async fn run_interview_round(
         };
 
         // Drain the relay so queued phase events flush BEFORE the final
-        // error event below — the timeout error must be the last word.
+        // error event below — the timeout error must be the last word
+        // (RC-7: exactly one terminal event per timed-out round).
         let _ = phase_relay.await;
+
+        // RC-7: truthful messaging — cleanup completion is reported only when
+        // it actually happened (see `round_timeout_message`).
+        let timeout_message =
+            round_timeout_message(defer_cleanup, output_pending, ROUND_TIMEOUT_SECS);
         let _ = app.emit(
             "interview-phase",
             PhaseEventPayload {
                 phase: "error".to_string(),
-                question: Some(format!("Round timed out after {}s", ROUND_TIMEOUT_SECS)),
+                question: Some(timeout_message.clone()),
                 duration_ms: None,
             },
         );
@@ -1081,10 +981,32 @@ async fn run_interview_round(
             recording_guard.disarm();
         }
 
-        Err(format!(
+        Err(timeout_message)
+    }
+}
+
+/// RC-7: truthful terminal timeout message, chosen from the ACTUAL cleanup
+/// state. Cleanup completion is claimed only when it truly happened: a
+/// deferred cleanup (physical worker still alive after the grace) explicitly
+/// says the artifacts will be removed after the worker exits, and a pending
+/// output worker reports that playback is still shutting down — neither ever
+/// claims cleanup already finished.
+fn round_timeout_message(defer_cleanup: bool, output_pending: bool, timeout_secs: u64) -> String {
+    if defer_cleanup {
+        format!(
+            "Round timed out after {}s. Cancellation was requested; temporary artifacts will be removed after the audio worker exits.",
+            timeout_secs
+        )
+    } else if output_pending {
+        format!(
+            "Round timed out after {}s. Cancellation was requested; audio playback is still shutting down.",
+            timeout_secs
+        )
+    } else {
+        format!(
             "Round timed out after {}s — processes terminated, partial artifacts cleaned up",
-            ROUND_TIMEOUT_SECS
-        ))
+            timeout_secs
+        )
     }
 }
 
@@ -1322,8 +1244,6 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_app_config,
-            start_recording,
-            stop_recording,
             run_audio_test,
             generate_tts,
             list_audio_devices,
@@ -1425,6 +1345,135 @@ mod tests {
         })
         .await
         .expect("slot must clear after physical worker termination");
+    }
+
+    /// RC-1 (Audio Test): the test-WAV cleanup lives INSIDE the physical
+    /// capture closure (`record_to_wav` with retain_output=false), so
+    /// aborting the outer async wrapper on a command timeout can never
+    /// destroy a pending cleanup. Models the exact failure topology from the
+    /// review: outer worker aborted -> physical capture still alive -> capture
+    /// later finalizes the WAV -> the physical closure removes final + tmp
+    /// BEFORE signalling Finished -> the slot clears only after termination
+    /// AND cleanup, and a retry can start cleanly.
+    #[tokio::test]
+    async fn audio_test_cleanup_survives_outer_worker_abort() {
+        let dir = std::env::temp_dir().join("audio_test_cleanup_abort_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let final_path = dir.join("audio_test_test.wav");
+        let tmp_path = final_path.with_extension("wav.tmp");
+
+        let state = Arc::new(RecordingState {
+            handle: Mutex::new(None),
+        });
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        acquire_recording(&state, fake_handle()).await.unwrap();
+
+        let mut guard = RecordingGuard::new(state.clone(), stop.clone());
+        guard.drop_grace = std::time::Duration::from_millis(50);
+        let completion = guard.completion();
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let completion_for_test = completion.clone();
+        let completion_for_cleanup = completion.clone();
+        let blocking_release = release.clone();
+        let closure_final = final_path.clone();
+        let closure_tmp = tmp_path.clone();
+        let worker = tokio::spawn(async move {
+            // RC-2: mark Scheduled BEFORE spawn_blocking, exactly like
+            // record_to_wav.
+            completion_for_test.mark_scheduled();
+            let closure = tokio::task::spawn_blocking(move || {
+                // Physical capture in flight: partial temp exists.
+                std::fs::write(&closure_tmp, b"partial").unwrap();
+                // The capture ignores the stop flag (hung native call) and
+                // continues until the test releases it.
+                while !blocking_release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                // Physical capture finalizes: temp -> final rename.
+                std::fs::rename(&closure_tmp, &closure_final).unwrap();
+                // RC-1: cleanup runs INSIDE the physical closure
+                // (retain_output=false) BEFORE Finished is signalled.
+                let _ = std::fs::remove_file(&closure_final);
+                completion_for_cleanup.signal();
+            });
+            let _ = closure.await;
+        });
+        guard.attach_worker(worker);
+
+        // Command deadline fires (take_recording_result_before_deadline
+        // returns Err) -> the command returns with the guard still armed ->
+        // the drop safety net runs: stop set, grace (50ms) expires, the outer
+        // wrapper is force-aborted, and the physical closure is waited out.
+        drop(guard);
+
+        // While the physical capture is still alive, the slot must stay
+        // occupied — a retry cannot start.
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_millis(80) {
+            assert!(
+                state.handle.lock().await.is_some(),
+                "slot must stay occupied while the physical capture is alive"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // Physical capture finishes: finalizes the WAV, removes it inside the
+        // closure, then signals Finished — only then does the slot clear.
+        release.store(true, Ordering::SeqCst);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if state.handle.lock().await.is_none() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("slot must clear after physical termination + cleanup");
+
+        assert!(
+            !final_path.exists(),
+            "final Audio Test WAV must be removed by the physical closure"
+        );
+        assert!(
+            !tmp_path.exists(),
+            "no .wav.tmp may survive a timed-out audio test"
+        );
+
+        // Retry can start cleanly.
+        acquire_recording(&state, fake_handle()).await.unwrap();
+        assert!(state.handle.lock().await.is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RC-7: the terminal timeout message is truthful about the cleanup
+    /// state — a deferred cleanup or pending output never claims artifacts
+    /// were already cleaned up; an actually-completed cleanup reports it.
+    #[test]
+    fn round_timeout_message_is_truthful() {
+        let deferred = round_timeout_message(true, false, 300);
+        assert!(deferred.contains("Cancellation was requested"));
+        assert!(deferred.contains("will be removed after the audio worker exits"));
+        assert!(
+            !deferred.contains("cleaned up"),
+            "deferred cleanup must not claim completion: {}",
+            deferred
+        );
+
+        let output_shutdown = round_timeout_message(false, true, 300);
+        assert!(output_shutdown.contains("audio playback is still shutting down"));
+        assert!(
+            !output_shutdown.contains("cleaned up"),
+            "pending output must not claim cleanup: {}",
+            output_shutdown
+        );
+
+        let done = round_timeout_message(false, false, 300);
+        assert!(done.contains("processes terminated, partial artifacts cleaned up"));
+        assert!(done.contains("300s"));
     }
 
     /// Controlled path: after the worker terminates, the command explicitly

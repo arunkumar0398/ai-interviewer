@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor, act, fireEvent } from "@testing-library/react";
+import { renderToString } from "react-dom/server";
+import { hydrateRoot } from "react-dom/client";
 import InterviewPage from "../app/interview/page";
 import { INTERVIEW_QUESTIONS } from "../lib/interview-questions";
 import { mockListenCallbacks } from "./setup";
@@ -948,5 +950,94 @@ describe("Interview Page", () => {
       expect(screen.getByText("Start Interview")).toBeInTheDocument();
     });
     expect(screen.queryByText("Error")).not.toBeInTheDocument();
+  });
+
+  // RC-4: hydration safety — the query string is NEVER read during render, so
+  // the server/static-rendered tree equals the first client-rendered tree for
+  // both /interview?session=<uuid> and /interview. Hydration must produce NO
+  // warning, and the handoff still resolves into the verifying state via the
+  // mount effect (never by reading window during render).
+  it.each([
+    ["/interview?session=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "session"],
+    ["/interview", "direct"],
+  ])("hydrates cleanly for %s (RC-4)", async (url) => {
+    const handedOffSession = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    window.history.replaceState({}, "", url);
+
+    let resolveSession!: (value: unknown) => void;
+    const sessionPromise = new Promise((res) => {
+      resolveSession = res;
+    });
+    let getSessionCalls = 0;
+    mockInvoke.mockImplementation((cmd: string) => {
+      switch (cmd) {
+        case "get_app_config":
+          return Promise.resolve(mockAppConfig);
+        case "get_session":
+          getSessionCalls += 1;
+          return sessionPromise;
+        case "get_rounds":
+          return Promise.resolve([]);
+        default:
+          return Promise.resolve();
+      }
+    });
+
+    // Server/static render: effects never run, window is not consulted — the
+    // tree is the hydration-identical initial state.
+    const serverHtml = renderToString(<InterviewPage />);
+    expect(serverHtml).not.toContain("Verifying session");
+
+    const container = document.createElement("div");
+    container.innerHTML = serverHtml;
+    document.body.appendChild(container);
+
+    const errors: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => {
+      errors.push(args.map(String).join(" "));
+    };
+
+    let hydrationErrors: string[] = [];
+    try {
+      await act(async () => {
+        hydrateRoot(container, <InterviewPage />);
+      });
+
+      // The mount effect resolves the query param after hydration: a handoff
+      // enters verifying (held open by the deferred get_session), a direct
+      // /interview goes straight to the device-check flow.
+      if (url.includes("session=")) {
+        await waitFor(() => {
+          expect(
+            screen.getByText("Verifying session...")
+          ).toBeInTheDocument();
+        });
+        expect(getSessionCalls).toBe(1);
+        resolveSession({
+          id: handedOffSession,
+          candidate_name: "Alice",
+          started_at: "2026-01-01T00:00:00Z",
+          completed_at: null,
+          total_rounds: 0,
+        });
+        await waitFor(() => {
+          expect(screen.getByText("Check Devices")).toBeInTheDocument();
+        });
+      } else {
+        await waitFor(() => {
+          expect(screen.getByText("Check Devices")).toBeInTheDocument();
+        });
+        expect(getSessionCalls).toBe(0);
+      }
+
+      hydrationErrors = errors.filter((e) => /hydrat/i.test(e));
+    } finally {
+      console.error = originalError;
+      document.body.removeChild(container);
+      window.history.replaceState({}, "", "/");
+    }
+
+    expect(hydrationErrors).toHaveLength(0);
   });
 });

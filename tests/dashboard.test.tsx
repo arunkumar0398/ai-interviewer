@@ -189,4 +189,50 @@ describe("Dashboard Page", () => {
     expect(args.candidateName).toBe("Alice");
     expect(href).toContain(`session=${args.sessionId}`);
   });
+
+  it("shows Resume Interview for an incomplete session (RC-6)", async () => {
+    mockInvoke.mockResolvedValue([
+      {
+        id: "session-in-progress",
+        candidate_name: "Bob",
+        started_at: "2026-01-01T10:00:00",
+        completed_at: null,
+        total_rounds: 2,
+      },
+    ]);
+
+    render(<DashboardPage />);
+
+    await waitFor(() => {
+      expect(screen.getByText("In Progress")).toBeInTheDocument();
+    });
+    const resume = screen.getByText(/Resume Interview/);
+    expect(resume.closest("a")).toHaveAttribute(
+      "href",
+      "/interview?session=session-in-progress"
+    );
+    // Session-only URL (P2-4): the candidate name never appears in it.
+    expect(resume.closest("a")!.getAttribute("href")).not.toContain("name=");
+  });
+
+  it("does not show Resume Interview for a completed session (RC-6)", async () => {
+    mockInvoke.mockResolvedValue([
+      {
+        id: "session-done",
+        candidate_name: "Alice",
+        started_at: "2026-01-01T10:00:00",
+        completed_at: "2026-01-01T10:30:00",
+        total_rounds: 5,
+      },
+    ]);
+
+    render(<DashboardPage />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Completed")).toBeInTheDocument();
+    });
+    expect(
+      screen.queryByText(/Resume Interview/)
+    ).not.toBeInTheDocument();
+  });
 });

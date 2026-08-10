@@ -129,28 +129,27 @@ export default function InterviewPage() {
   // When the Recruiter Dashboard created the session, it hands it off here via
   // ?session=<uuid> (P2-4: session-only — the candidate name stays in the DB,
   // never in the URL). The interview then continues THAT session instead of
-  // creating a second, orphan one (P1-1). The handoff is read synchronously
-  // (the query string is static for the page lifetime) and nothing derived
-  // from it is rendered, so the static prerender is unaffected. No
-  // setState-in-effect is needed.
-  const handedOffSession = (() => {
-    if (typeof window === "undefined") return null;
-    return new URLSearchParams(window.location.search).get("session");
-  })();
-
-  // Stable session ID for the entire interview flow (one session across all
-  // rounds): the Dashboard's session when handed off, otherwise a fresh one.
-  const [sessionId] = useState(() => handedOffSession ?? crypto.randomUUID());
-  const sessionIdRef = useRef(sessionId);
+  // creating a second, orphan one (P1-1).
+  //
+  // RC-4 (hydration safety): the query string is NOT read during render. The
+  // initial state is identical for the server/static render and the first
+  // client render (sessionId = null, sessionInitState = "idle"); a mount
+  // effect resolves the query param afterwards and transitions to "verifying"
+  // (handoff) or assigns a fresh UUID (direct /interview). The server-rendered
+  // tree therefore always equals the first client-rendered tree for both
+  // /interview and /interview?session=<uuid>. Nothing derived from the session
+  // is rendered, so the one-tick null window is invisible.
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const sessionIdRef = useRef<string | null>(null);
   const [candidateName] = useState("Candidate");
 
   // Backend-authoritative session lifecycle: tracks whether create_session
   // has been called and whether the session is ready for round execution. A
-  // handed-off session was already created by the Dashboard, so it starts
-  // VERIFYING (P2-1): the backend is asked whether the session exists and is
-  // incomplete BEFORE any round flow. create_session is never called for a
-  // handed-off session; invalid/missing/completed handoffs never reach the
-  // round invoke.
+  // handed-off session was already created by the Dashboard, so it enters
+  // VERIFYING (P2-1) once the query param is resolved: the backend is asked
+  // whether the session exists and is incomplete BEFORE any round flow.
+  // create_session is never called for a handed-off session;
+  // invalid/missing/completed handoffs never reach the round invoke.
   type SessionInitState =
     | "idle"
     | "creating"
@@ -158,9 +157,27 @@ export default function InterviewPage() {
     | "ready"
     | "error"
     | "completed";
-  const [sessionInitState, setSessionInitState] = useState<SessionInitState>(
-    handedOffSession ? "verifying" : "idle"
-  );
+  const [sessionInitState, setSessionInitState] =
+    useState<SessionInitState>("idle");
+
+  // RC-4: resolve the handoff query parameter exactly once, after hydration.
+  // Runs only on the client after mount, so the first client render stays
+  // identical to the server/static render. The update is deferred out of the
+  // synchronous effect body (react-hooks/set-state-in-effect): the query
+  // string is static for the page lifetime, so a single deferred flush is
+  // enough.
+  useEffect(() => {
+    const param = new URLSearchParams(window.location.search).get("session");
+    const timer = window.setTimeout(() => {
+      if (param) {
+        setSessionId(param);
+        setSessionInitState("verifying");
+      } else {
+        setSessionId(crypto.randomUUID());
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, []);
   // Synchronous marker set by the handoff-verification effect BEFORE the
   // tools-check effect's async continuation can run, so a rejected handoff is
   // never overwritten by the independent tools/device-check phase flow.
@@ -258,8 +275,8 @@ export default function InterviewPage() {
   // completed state; valid + incomplete -> ready. An invalid handoff is never
   // turned into a round retry (no RetryTarget is set).
   useEffect(() => {
-    const sessionParam = handedOffSession;
-    if (!sessionParam) return;
+    const sessionParam = sessionId;
+    if (!sessionParam || sessionInitState !== "verifying") return;
     let cancelled = false;
 
     async function verifyHandoff(sessionId: string) {
@@ -324,7 +341,7 @@ export default function InterviewPage() {
 
     verifyHandoff(sessionParam);
     return () => { cancelled = true; };
-  }, [handedOffSession]);
+  }, [sessionId, sessionInitState]);
 
   // P2-1: in-flight guard — a rapid double-click must not start a second
   // device check. The backend also rejects overlap via the shared recording

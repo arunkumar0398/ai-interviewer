@@ -366,6 +366,16 @@ impl Drop for TestClipCleanup {
 /// Writes to a temp file first, then renames on success for crash recovery.
 /// Periodically flushes the writer so partial data survives a crash.
 /// Returns `RecordResult` with file path, duration, and size on success.
+///
+/// RC-1 (Audio Test lifecycle): `retain_output` decides who owns the final
+/// WAV after a SUCCESSFUL capture. `true` (interview rounds) keeps it as
+/// provisional evidence for the persistence layer. `false` (audio test)
+/// deletes it INSIDE this physical blocking closure — BEFORE the closure
+/// returns and signals Finished — so cleanup is owned by the physical worker
+/// itself. Aborting the outer async wrapper (command timeout) can never kill
+/// an already-submitted `spawn_blocking` closure, so the deletion still runs
+/// after a late temp->final rename; a timed-out audio test can never orphan
+/// a final WAV.
 pub async fn record_to_wav(
     output_path: PathBuf,
     sample_rate: u32,
@@ -373,6 +383,7 @@ pub async fn record_to_wav(
     event_tx: mpsc::Sender<CaptureEvent>,
     stop_flag: Arc<AtomicBool>,
     completion: CaptureCompletion,
+    retain_output: bool,
 ) -> anyhow::Result<RecordResult> {
     let sr = sample_rate;
     let ch = channels;
@@ -525,6 +536,19 @@ pub async fn record_to_wav(
         let file_size_bytes = std::fs::metadata(&output_path)?.len();
         // Fully committed — the final WAV must be preserved.
         cleanup.commit();
+
+        // RC-1: when the caller does not retain the output (audio test), the
+        // final WAV is removed HERE, inside the physical capture closure,
+        // before it signals Finished. The size was already captured above, so
+        // the returned RecordResult stays accurate. This is the ONLY cleanup
+        // that survives an abort of the outer async wrapper: the blocking
+        // closure always runs to completion, and Finished is signalled only
+        // after the artifact is gone — the slot owner never sees Finished
+        // while a test WAV could still exist.
+        if !retain_output {
+            let _ = std::fs::remove_file(&output_path);
+        }
+
         let _ = event_tx.try_send(CaptureEvent::Stopped {
             file_path: output_path.to_string_lossy().to_string(),
             duration_ms,
@@ -738,17 +762,21 @@ pub async fn record_test_clip(
     event_tx: mpsc::Sender<CaptureEvent>,
     stop_flag: Arc<AtomicBool>,
     completion: CaptureCompletion,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<(PathBuf, String)> {
     // P2-1: UUID-based name so concurrent device checks can never target the
     // same path (a PID alone is not unique across concurrent checks).
     let tmp_path = temp_dir.join(format!("device_test_{}.wav", uuid::Uuid::new_v4()));
     let path_clone = tmp_path.clone();
 
     // RC-2: mark Scheduled BEFORE spawn_blocking (no await between) so a
-    // queued-but-not-started closure still owns the recording slot.
+    // queued-but-not-started closure still owns the recording slot. The
+    // closure also performs the DEFAULT-input lookup and returns the tested
+    // device name — the enumeration is lifecycle-owned by the SAME completion
+    // as the mic test, so Device Check has no separate untracked native
+    // enumeration worker.
     completion.mark_scheduled();
 
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+    let device_name = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
         // P1-1: signal the physical capture lifecycle on every exit path.
@@ -758,6 +786,9 @@ pub async fn record_test_clip(
         let device = host
             .default_input_device()
             .ok_or_else(|| anyhow::anyhow!("No input device found"))?;
+        let device_name = device
+            .name()
+            .unwrap_or_else(|_| "default input device".to_string());
 
         let config = cpal::StreamConfig {
             channels,
@@ -863,7 +894,7 @@ pub async fn record_test_clip(
             duration_ms,
         });
 
-        Ok(())
+        Ok(device_name)
     })
     .await??;
 
@@ -875,7 +906,7 @@ pub async fn record_test_clip(
         anyhow::bail!("Test clip too short ({} bytes)", metadata.len());
     }
 
-    Ok(tmp_path)
+    Ok((tmp_path, device_name))
 }
 
 #[cfg(test)]
@@ -1143,7 +1174,7 @@ mod tests {
         )
         .await;
 
-        if let Ok(path) = result {
+        if let Ok((path, _name)) = result {
             assert!(path.exists(), "successful clip must exist for the caller");
             let _ = std::fs::remove_file(&path);
         }
@@ -1180,6 +1211,7 @@ mod tests {
             tx,
             Arc::new(AtomicBool::new(false)),
             CaptureCompletion::new(),
+            true,
         )
         .await;
 

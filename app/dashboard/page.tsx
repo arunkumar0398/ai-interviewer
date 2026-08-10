@@ -177,31 +177,46 @@ export default function DashboardPage() {
             ) : (
               <div className="space-y-2 max-h-96 overflow-y-auto">
                 {sessions.map((s) => (
-                  <button
+                  <div
                     key={s.id}
-                    onClick={() => loadRounds(s.id)}
-                    className={`w-full text-left border rounded-lg p-3 text-sm transition ${
+                    className={`border rounded-lg p-3 text-sm transition ${
                       selectedSession === s.id
                         ? "border-blue-500 bg-blue-50"
                         : "border-gray-200 hover:border-gray-300"
                     }`}
                   >
-                    <div className="flex justify-between">
-                      <span className="font-medium">{s.candidate_name}</span>
-                      <span
-                        className={`text-xs px-2 py-0.5 rounded ${
-                          s.completed_at
-                            ? "bg-green-100 text-green-700"
-                            : "bg-yellow-100 text-yellow-700"
-                        }`}
+                    <button
+                      onClick={() => loadRounds(s.id)}
+                      className="w-full text-left"
+                    >
+                      <div className="flex justify-between">
+                        <span className="font-medium">{s.candidate_name}</span>
+                        <span
+                          className={`text-xs px-2 py-0.5 rounded ${
+                            s.completed_at
+                              ? "bg-green-100 text-green-700"
+                              : "bg-yellow-100 text-yellow-700"
+                          }`}
+                        >
+                          {s.completed_at ? "Completed" : "In Progress"}
+                        </span>
+                      </div>
+                      <div className="text-xs text-gray-500 mt-1">
+                        {s.total_rounds} rounds &middot; {s.started_at}
+                      </div>
+                    </button>
+                    {!s.completed_at && (
+                      <Link
+                        // RC-6: incomplete persisted sessions expose a normal
+                        // Resume action. Session-only URL (P2-4): the
+                        // candidate name stays in the DB, never in the URL.
+                        href={`/interview?session=${s.id}`}
+                        className="mt-2 inline-block text-xs font-medium text-blue-600 hover:text-blue-800"
                       >
-                        {s.completed_at ? "Completed" : "In Progress"}
-                      </span>
-                    </div>
-                    <div className="text-xs text-gray-500 mt-1">
-                      {s.total_rounds} rounds &middot; {s.started_at}
-                    </div>
-                  </button>
+                        Resume Interview &rarr;
+                      </Link>
+                    )}
+                  </div>
                 ))}
               </div>
             )}

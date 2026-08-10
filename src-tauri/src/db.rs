@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, Result as SqlResult};
+use rusqlite::{params, Connection, Result as SqlResult, TransactionBehavior};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -84,14 +84,17 @@ impl Database {
     /// Each migration step runs in an explicit transaction so a failure
     /// cannot leave half-migrated tables.
     fn initialize(&self) -> SqlResult<()> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
 
         let current_version: u32 =
             conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
 
         if current_version == 0 {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-            let result = conn.execute_batch(
+            // RC-3: RAII transaction — a failed COMMIT triggers a best-effort
+            // ROLLBACK in Drop, so the connection is never returned with an
+            // unresolved transaction and the original error is surfaced.
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS sessions (
                     id TEXT PRIMARY KEY,
@@ -119,16 +122,8 @@ impl Database {
 
                 CREATE INDEX IF NOT EXISTS idx_rounds_session ON rounds(session_id);
                 ",
-            );
-            match result {
-                Ok(_) => {
-                    conn.execute_batch("COMMIT")?;
-                }
-                Err(e) => {
-                    conn.execute_batch("ROLLBACK")?;
-                    return Err(e);
-                }
-            }
+            )?;
+            tx.commit()?;
         }
 
         if current_version < 2 {
@@ -137,8 +132,10 @@ impl Database {
             // Deterministic tie-breaker: retain the row with the highest primary-key id.
             // Wrapped in an explicit transaction so a failure cannot leave
             // half-migrated tables.
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-            let result = conn.execute_batch(
+            // RC-3: RAII transaction — a COMMIT failure rolls back in Drop,
+            // leaving the connection usable and surfacing the commit error.
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS rounds_new (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -188,16 +185,8 @@ impl Database {
                     WHERE rounds.session_id = sessions.id
                 );
                 ",
-            );
-            match result {
-                Ok(_) => {
-                    conn.execute_batch("COMMIT")?;
-                }
-                Err(e) => {
-                    conn.execute_batch("ROLLBACK")?;
-                    return Err(e);
-                }
-            }
+            )?;
+            tx.commit()?;
         }
 
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -206,19 +195,25 @@ impl Database {
     }
 
     /// Execute a closure within a transaction. Rolls back on error.
+    ///
+    /// RC-3: uses rusqlite's RAII `Transaction`, so EVERY exit path resolves
+    /// the transaction: `f` returning Err rolls back explicitly (the original
+    /// error stays primary); `f` returning Ok commits, and if COMMIT itself
+    /// fails the transaction is rolled back best-effort in Drop — the
+    /// connection is never returned with an unresolved transaction.
     pub fn in_transaction<F, R>(&self, f: F) -> SqlResult<R>
     where
         F: FnOnce(&Connection) -> SqlResult<R>,
     {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute_batch("BEGIN IMMEDIATE")?;
-        match f(&conn) {
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        match f(&tx) {
             Ok(result) => {
-                conn.execute_batch("COMMIT")?;
+                tx.commit()?;
                 Ok(result)
             }
             Err(e) => {
-                conn.execute_batch("ROLLBACK")?;
+                let _ = tx.rollback();
                 Err(e)
             }
         }
@@ -319,50 +314,45 @@ impl Database {
         file_size_bytes: u64,
         is_final: bool,
     ) -> SqlResult<i64> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| {
-            conn.execute(
-                "INSERT INTO rounds (session_id, round_index, question, transcription, audio_path, sha256, duration_ms, sample_rate, channels, file_size_bytes)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    session_id,
-                    round_index,
-                    question,
-                    transcription,
-                    audio_path,
-                    sha256,
-                    duration_ms,
-                    sample_rate,
-                    channels,
-                    file_size_bytes,
-                ],
-            )?;
-            // Session must exist — verify exactly one row is updated. The
-            // completed_at timestamp is set in the same statement when this is
-            // the final round, so commit is all-or-nothing.
-            let affected = conn.execute(
-                "UPDATE sessions
-                    SET total_rounds = total_rounds + 1,
-                        completed_at = CASE WHEN ?2 = 1 THEN datetime('now') ELSE completed_at END
-                  WHERE id = ?1",
-                params![session_id, if is_final { 1 } else { 0 }],
-            )?;
-            if affected != 1 {
-                return Err(rusqlite::Error::QueryReturnedNoRows);
-            }
-            Ok::<_, rusqlite::Error>(conn.last_insert_rowid())
-        })();
-        match result {
-            Ok(id) => {
-                conn.execute_batch("COMMIT")?;
-                Ok(id)
-            }
-            Err(e) => {
-                conn.execute_batch("ROLLBACK")?;
-                Err(e)
-            }
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        // RC-3: RAII transaction — COMMIT failure triggers a best-effort
+        // ROLLBACK in Drop (the connection stays usable and the original
+        // commit error is surfaced), and any statement error drops the
+        // transaction (rolling it back) before the error propagates. A failed
+        // persistence is never partially visible.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO rounds (session_id, round_index, question, transcription, audio_path, sha256, duration_ms, sample_rate, channels, file_size_bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                session_id,
+                round_index,
+                question,
+                transcription,
+                audio_path,
+                sha256,
+                duration_ms,
+                sample_rate,
+                channels,
+                file_size_bytes,
+            ],
+        )?;
+        // Session must exist — verify exactly one row is updated. The
+        // completed_at timestamp is set in the same statement when this is
+        // the final round, so commit is all-or-nothing.
+        let affected = tx.execute(
+            "UPDATE sessions
+                SET total_rounds = total_rounds + 1,
+                    completed_at = CASE WHEN ?2 = 1 THEN datetime('now') ELSE completed_at END
+              WHERE id = ?1",
+            params![session_id, if is_final { 1 } else { 0 }],
+        )?;
+        if affected != 1 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
         }
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(id)
     }
 
     /// Get all rounds for a session
@@ -438,5 +428,185 @@ impl Database {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RC-3: a COMMIT that fails (deferred foreign-key violation surfaces at
+    /// commit time) must roll the transaction back, leave NO visible row, and
+    /// keep the connection fully usable for subsequent operations — the
+    /// connection is never returned with an unresolved transaction.
+    #[test]
+    fn commit_failure_rolls_back_and_keeps_connection_usable() {
+        let db_path = std::env::temp_dir().join("test_commit_failure.db");
+        let _ = std::fs::remove_file(&db_path);
+
+        let db = Database::open(&db_path).unwrap();
+        {
+            // In-module access: defer FK enforcement to COMMIT time so the
+            // INSERT succeeds but COMMIT itself fails.
+            let conn = db.conn.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute_batch("PRAGMA defer_foreign_keys=ON;").unwrap();
+        }
+
+        // The round insert references a session that does not exist; with
+        // deferred FKs the INSERT succeeds and COMMIT fails.
+        let result = db.in_transaction(|conn| {
+            conn.execute(
+                "INSERT INTO rounds (session_id, round_index, question) VALUES (?1, ?2, ?3)",
+                params!["ghost-session", 0, "Q"],
+            )?;
+            Ok(())
+        });
+
+        assert!(
+            result.is_err(),
+            "COMMIT must fail on the deferred FK violation"
+        );
+        assert!(
+            db.get_rounds("ghost-session").unwrap().is_empty(),
+            "no uncommitted row may become visible after a failed COMMIT"
+        );
+
+        // The connection must be fully usable: a real session + round persist
+        // normally after the failed commit.
+        db.create_session("real-session", "Alice").unwrap();
+        db.insert_round_with_session_update(
+            "real-session",
+            0,
+            "Q1",
+            "A1",
+            "/tmp/r0.wav",
+            "sha0",
+            4000,
+            16000,
+            1,
+            100,
+            false,
+        )
+        .unwrap();
+        assert_eq!(db.get_rounds("real-session").unwrap().len(), 1);
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// RC-3: an application-statement failure (duplicate round) rolls back the
+    /// whole round+session transaction — no partial mutation is visible and
+    /// the connection remains usable for the next round.
+    #[test]
+    fn insert_round_with_session_update_rolls_back_on_error() {
+        let db_path = std::env::temp_dir().join("test_round_rollback.db");
+        let _ = std::fs::remove_file(&db_path);
+
+        let db = Database::open(&db_path).unwrap();
+        db.create_session("s", "Bob").unwrap();
+
+        db.insert_round_with_session_update(
+            "s",
+            0,
+            "Q1",
+            "A1",
+            "/tmp/0.wav",
+            "sha0",
+            4000,
+            16000,
+            1,
+            100,
+            false,
+        )
+        .unwrap();
+        assert_eq!(db.get_rounds("s").unwrap().len(), 1);
+
+        // Duplicate (session_id, round_index) -> UNIQUE violation -> rollback.
+        let dup = db.insert_round_with_session_update(
+            "s",
+            0,
+            "Q1b",
+            "A1b",
+            "/tmp/0b.wav",
+            "sha1",
+            4000,
+            16000,
+            1,
+            100,
+            false,
+        );
+        assert!(dup.is_err(), "duplicate round must fail");
+
+        // No partial mutation visible: still 1 round, counter not double-
+        // counted, original transcription intact.
+        let rounds = db.get_rounds("s").unwrap();
+        assert_eq!(rounds.len(), 1);
+        assert_eq!(rounds[0].transcription, "A1");
+        let session = db.get_session("s").unwrap().unwrap();
+        assert_eq!(session.total_rounds, 1);
+
+        // Connection remains usable: the next round persists.
+        db.insert_round_with_session_update(
+            "s",
+            1,
+            "Q2",
+            "A2",
+            "/tmp/1.wav",
+            "sha2",
+            4000,
+            16000,
+            1,
+            100,
+            false,
+        )
+        .unwrap();
+        assert_eq!(db.get_rounds("s").unwrap().len(), 2);
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// RC-3: a round whose session update affects zero rows (missing session)
+    /// fails and rolls back — a round can never be persisted against a
+    /// session that does not exist.
+    #[test]
+    fn insert_round_for_missing_session_rolls_back() {
+        let db_path = std::env::temp_dir().join("test_missing_session_rollback.db");
+        let _ = std::fs::remove_file(&db_path);
+
+        let db = Database::open(&db_path).unwrap();
+        let result = db.insert_round_with_session_update(
+            "ghost",
+            0,
+            "Q",
+            "A",
+            "/tmp/x.wav",
+            "sha",
+            4000,
+            16000,
+            1,
+            100,
+            false,
+        );
+        assert!(result.is_err(), "missing session must fail the transaction");
+        assert!(db.get_rounds("ghost").unwrap().is_empty());
+
+        // Connection remains usable.
+        db.create_session("real", "Carol").unwrap();
+        db.insert_round_with_session_update(
+            "real",
+            0,
+            "Q",
+            "A",
+            "/tmp/x.wav",
+            "sha",
+            4000,
+            16000,
+            1,
+            100,
+            false,
+        )
+        .unwrap();
+        assert_eq!(db.get_rounds("real").unwrap().len(), 1);
+
+        let _ = std::fs::remove_file(&db_path);
     }
 }

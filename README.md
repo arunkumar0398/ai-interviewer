@@ -13,7 +13,7 @@ If startup reports a missing tool, re-extract the complete ZIP. Antivirus quaran
 
 ## Interview data
 
-Portable describes how the application is distributed; interview data is deliberately stored outside the extracted program folder in Tauri's Windows application-data directory (normally `%APPDATA%\com.ai-interviewer.app`). This keeps data across application upgrades and prevents it from being mixed with packaged tools.
+Portable describes how the application is distributed; interview data is deliberately stored outside the extracted program folder in the Tauri application-data directory returned by `app.path().app_data_dir()`. For this bundle identifier (`com.ai-interviewer.app`) that resolves to `%APPDATA%\com.ai-interviewer.app` on Windows. This keeps data across application upgrades and prevents it from being mixed with packaged tools.
 
 The data directory contains:
 

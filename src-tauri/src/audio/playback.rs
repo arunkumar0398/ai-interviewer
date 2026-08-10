@@ -442,9 +442,24 @@ pub async fn generate_tts(
     // exist (cross-platform, no overwrite). If a concurrent same-ID call
     // already claimed the final, this fails with AlreadyExists.
     finalize_tts_output(&temp_path, &output_path)?;
-    temp_guard.disarm();
+    // RC-8: disarm the temp guard ONLY after the temp removal is CONFIRMED.
+    // finalize_tts_output unlinks the temp best-effort; if that unlink failed
+    // (e.g. a transient Windows file lock), the temp still exists and the
+    // guard stays armed so its Drop performs a final best-effort cleanup
+    // attempt. The final WAV is already intact and is never touched again.
+    disarm_after_temp_confirmed(&mut temp_guard, &temp_path);
 
     Ok(())
+}
+
+/// RC-8: disarm the temp guard ONLY after the temp file is confirmed gone.
+/// If the atomic final claim succeeded but the temp unlink failed, the guard
+/// stays armed so its Drop retries the removal — the final WAV is intact and
+/// never touched again.
+fn disarm_after_temp_confirmed(guard: &mut TtsTempGuard, temp_path: &Path) {
+    if !temp_path.exists() {
+        guard.disarm();
+    }
 }
 
 /// Generate TTS using paths resolved by `AppPaths`
@@ -736,5 +751,60 @@ mod tests {
             "re-finalization after a successful claim must be rejected"
         );
         let _ = std::fs::remove_file(&temp_c);
+    }
+
+    /// RC-8: a successful final claim leaves no invocation temp behind, and
+    /// the final WAV carries the complete content.
+    #[test]
+    fn finalize_tts_output_leaves_no_temp_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("tts.uuid.wav.tmp");
+        let final_path = dir.path().join("tts.wav");
+        std::fs::write(&temp, b"audio-content").unwrap();
+
+        finalize_tts_output(&temp, &final_path).unwrap();
+
+        assert!(final_path.exists(), "final WAV must be intact");
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"audio-content");
+        assert!(
+            !temp.exists(),
+            "successful claim must not leave a temp file"
+        );
+    }
+
+    /// RC-8: when the temp is confirmed gone, the guard is disarmed (no
+    /// redundant cleanup attempt).
+    #[test]
+    fn tts_temp_guard_disarms_when_temp_confirmed_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("tts.uuid.wav.tmp");
+        std::fs::write(&temp, b"audio").unwrap();
+
+        let mut guard = TtsTempGuard::new(temp.clone());
+        // Successful claim + unlink: remove the temp, then confirm.
+        std::fs::remove_file(&temp).unwrap();
+        disarm_after_temp_confirmed(&mut guard, &temp);
+        drop(guard);
+    }
+
+    /// RC-8: a temp that still exists after the claim (simulated unlink
+    /// failure) keeps the guard ARMED, so its Drop retries the removal — no
+    /// stale temp survives and the final WAV (already claimed) is untouched.
+    #[test]
+    fn tts_temp_guard_stays_armed_until_temp_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("tts.uuid.wav.tmp");
+        std::fs::write(&temp, b"audio").unwrap();
+
+        let mut guard = TtsTempGuard::new(temp.clone());
+        // Unlink failure simulation: the temp still exists -> not disarmed.
+        disarm_after_temp_confirmed(&mut guard, &temp);
+        assert!(
+            temp.exists(),
+            "precondition: temp still exists (simulated unlink failure)"
+        );
+        // Guard Drop performs the final best-effort cleanup attempt.
+        drop(guard);
+        assert!(!temp.exists(), "armed guard Drop must retry temp removal");
     }
 }

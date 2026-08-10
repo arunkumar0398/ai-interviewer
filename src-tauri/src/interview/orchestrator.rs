@@ -220,6 +220,7 @@ pub async fn run_interview_round(
         record_event_tx.clone(),
         record_auto_stop,
         completion,
+        true, // RC-1: interview rounds RETAIN the final WAV (provisional evidence)
     )
     .await;
 
