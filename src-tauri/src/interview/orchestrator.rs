@@ -287,6 +287,14 @@ pub async fn wait_for_stop(flag: Arc<AtomicBool>) {
     }
 }
 
+/// Read Whisper's transcript and remove the per-round temp output before
+/// propagating either success or failure (including invalid UTF-8).
+fn read_transcript_and_remove(path: &Path) -> std::io::Result<String> {
+    let result = std::fs::read_to_string(path);
+    let _ = std::fs::remove_file(path);
+    result
+}
+
 /// Transcribe a WAV file using whisper.cpp — temp output isolated to temp/<session_id>/<round_id>.txt
 async fn transcribe_wav(
     paths: &crate::paths::AppPaths,
@@ -384,8 +392,7 @@ async fn transcribe_wav(
         );
     }
 
-    let text = std::fs::read_to_string(&txt_path)?;
-    let _ = std::fs::remove_file(&txt_path);
+    let text = read_transcript_and_remove(&txt_path)?;
 
     Ok(text.trim().to_string())
 }
@@ -393,6 +400,21 @@ async fn transcribe_wav(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcript_read_failure_still_removes_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("round.txt");
+        std::fs::write(&transcript, [0xff, 0xfe, 0xfd]).unwrap();
+
+        let result = read_transcript_and_remove(&transcript);
+
+        assert!(result.is_err(), "invalid UTF-8 must fail transcription");
+        assert!(
+            !transcript.exists(),
+            "failed transcript reads must not leave temp output behind"
+        );
+    }
 
     /// A WAV left uncommitted (round failed before persistence) must be
     /// deleted when the guard drops, including any partial temp file.

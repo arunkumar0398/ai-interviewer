@@ -66,7 +66,7 @@ function storedRoundToResult(round: StoredInterviewRound): InterviewRoundResult 
 
 function hasContiguousRoundHistory(rounds: StoredInterviewRound[]): boolean {
   return (
-    rounds.length <= INTERVIEW_QUESTIONS.length &&
+    rounds.length < INTERVIEW_QUESTIONS.length &&
     rounds.every((round, index) => round.round_index === index)
   );
 }

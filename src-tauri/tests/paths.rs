@@ -369,6 +369,53 @@ fn validate_readiness_canonical_all_present() {
     assert!(readiness.issues.is_empty());
 }
 
+/// Required runtime assets must be regular files. Directories at the exact
+/// expected paths are damaged installations, not a ready workstation.
+#[test]
+fn validate_readiness_rejects_directories_at_required_file_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tool = tmp.path().join("tools");
+    let required_paths = [
+        tool.join("piper").join("piper.exe"),
+        tool.join("piper").join("model.onnx"),
+        tool.join("piper").join("model.onnx.json"),
+        tool.join("piper").join("espeak-ng.dll"),
+        tool.join("piper").join("piper_phonemize.dll"),
+        tool.join("piper").join("onnxruntime.dll"),
+        tool.join("piper").join("onnxruntime_providers_shared.dll"),
+        tool.join("piper").join("espeak-ng-data").join("phontab"),
+        tool.join("whisper").join("Release").join("main.exe"),
+        tool.join("models").join("ggml-tiny.en.bin"),
+    ];
+    for path in required_paths {
+        fs::create_dir_all(path).unwrap();
+    }
+
+    let paths = AppPaths::from_tool_dir(tool, tmp.path().join("data")).unwrap();
+    let readiness = paths.validate_readiness();
+    let codes: Vec<&str> = readiness
+        .issues
+        .iter()
+        .map(|issue| issue.code.as_str())
+        .collect();
+
+    assert!(!readiness.ready);
+    for code in [
+        "PIPER_BINARY_MISSING",
+        "PIPER_MODEL_MISSING",
+        "PIPER_MODEL_CONFIG_MISSING",
+        "PIPER_ESPEAK_DLL_MISSING",
+        "PIPER_PHONEMIZE_DLL_MISSING",
+        "PIPER_ONNX_RUNTIME_MISSING",
+        "PIPER_ONNX_PROVIDER_MISSING",
+        "PIPER_ESPEAK_DATA_MISSING",
+        "WHISPER_BINARY_MISSING",
+        "WHISPER_MODEL_MISSING",
+    ] {
+        assert!(codes.contains(&code), "directory path must report {code}");
+    }
+}
+
 /// Test: readiness passes with legacy layout (P2-3: full legacy companions)
 #[test]
 fn validate_readiness_legacy_all_present() {

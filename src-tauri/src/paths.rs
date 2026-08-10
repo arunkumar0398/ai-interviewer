@@ -384,7 +384,7 @@ impl AppPaths {
                 // runtime directory.
                 for (asset, code, message) in PIPER_RUNTIME_ASSETS {
                     let path = piper.runtime_dir.join(asset);
-                    if !path.exists() {
+                    if !path.is_file() {
                         issues.push(AppConfigurationIssue {
                             code: (*code).into(),
                             message: (*message).into(),
@@ -393,14 +393,14 @@ impl AppPaths {
                     }
                 }
                 // The selected layout's model/config pair.
-                if !piper.model.exists() {
+                if !piper.model.is_file() {
                     issues.push(AppConfigurationIssue {
                         code: "PIPER_MODEL_MISSING".into(),
                         message: "Piper model not found".into(),
                         expected_path: Some(piper.model.display().to_string()),
                     });
                 }
-                if !piper.model_config.exists() {
+                if !piper.model_config.is_file() {
                     issues.push(AppConfigurationIssue {
                         code: "PIPER_MODEL_CONFIG_MISSING".into(),
                         message: "Piper model config not found".into(),
@@ -441,7 +441,7 @@ impl AppPaths {
             .join("whisper")
             .join("Release")
             .join("main.exe");
-        if !whisper_path.exists() {
+        if !whisper_path.is_file() {
             issues.push(AppConfigurationIssue {
                 code: "WHISPER_BINARY_MISSING".into(),
                 message: "Whisper binary not found".into(),
@@ -451,7 +451,7 @@ impl AppPaths {
 
         // Whisper model: tools/models/ggml-tiny.en.bin
         let whisper_model = self.tool_dir.join("models").join("ggml-tiny.en.bin");
-        if !whisper_model.exists() {
+        if !whisper_model.is_file() {
             issues.push(AppConfigurationIssue {
                 code: "WHISPER_MODEL_MISSING".into(),
                 message: "Whisper model not found".into(),

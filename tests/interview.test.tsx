@@ -673,6 +673,58 @@ describe("Interview Page", () => {
     window.history.replaceState({}, "", "/");
   });
 
+  it("rejects an incomplete handed-off session that already has every interview round", async () => {
+    const handedOffSession = "44444444-5555-6666-7777-888888888888";
+    window.history.replaceState({}, "", `/interview?session=${handedOffSession}`);
+    let deviceCheckCalls = 0;
+    let roundCalls = 0;
+
+    mockInvoke.mockImplementation((cmd: string) => {
+      switch (cmd) {
+        case "get_app_config":
+          return Promise.resolve(mockAppConfig);
+        case "get_session":
+          return Promise.resolve({
+            id: handedOffSession,
+            candidate_name: "Alice",
+            started_at: "2026-01-01T00:00:00Z",
+            completed_at: null,
+            total_rounds: INTERVIEW_QUESTIONS.length,
+          });
+        case "get_rounds":
+          return Promise.resolve(
+            INTERVIEW_QUESTIONS.map((_, roundIndex) =>
+              mockStoredRound(handedOffSession, roundIndex)
+            )
+          );
+        case "check_audio_devices":
+          deviceCheckCalls += 1;
+          return Promise.resolve({});
+        case "run_interview_round":
+          roundCalls += 1;
+          return Promise.resolve({});
+        default:
+          return Promise.reject(new Error(`Unexpected command: ${cmd}`));
+      }
+    });
+
+    await act(async () => {
+      render(<InterviewPage />);
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("This session has an inconsistent round history and cannot be resumed.")
+      ).toBeInTheDocument();
+    });
+    expect(screen.queryByText("Round 6 of 5")).not.toBeInTheDocument();
+    expect(screen.queryByText("Check Devices")).not.toBeInTheDocument();
+    expect(deviceCheckCalls).toBe(0);
+    expect(roundCalls).toBe(0);
+
+    window.history.replaceState({}, "", "/");
+  });
+
   it("rejects a handed-off session with more persisted rounds than the interview allows", async () => {
     const handedOffSession = "44444444-5555-6666-7777-888888888888";
     window.history.replaceState({}, "", `/interview?session=${handedOffSession}`);

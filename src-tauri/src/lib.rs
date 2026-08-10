@@ -156,6 +156,21 @@ impl<T: Send + 'static> RecordingGuard<T> {
     }
 }
 
+/// Wait for an owned recording worker without consuming its JoinHandle until
+/// it has finished. On deadline expiry the caller returns an error with the
+/// guard still armed, so Drop retains the slot and all physical-worker
+/// lifecycle signals until deferred cleanup has actually completed.
+async fn take_recording_result_before_deadline<T: Send + 'static>(
+    guard: &mut RecordingGuard<T>,
+    deadline: std::time::Duration,
+    timeout_error: &str,
+) -> Result<Option<Result<T, tokio::task::JoinError>>, String> {
+    tokio::time::timeout(deadline, guard.wait_worker())
+        .await
+        .map_err(|_| timeout_error.to_string())?;
+    Ok(guard.take_result().await)
+}
+
 /// Bounded cooperative-shutdown grace for the RecordingGuard drop safety net
 /// (P1-1). After the stop flag is set, the nested blocking capture is given
 /// this long to observe the flag and terminate NORMALLY. Only when the grace
@@ -391,7 +406,20 @@ async fn run_audio_test(
     let stop_clone = stop_flag.clone();
     let completion = recording_guard.completion();
     let worker = tokio::spawn(async move {
-        audio::capture::record_to_wav(path_clone, 16000, 1, event_tx, stop_clone, completion).await
+        let result = audio::capture::record_to_wav(
+            path_clone.clone(),
+            16000,
+            1,
+            event_tx,
+            stop_clone,
+            completion,
+        )
+        .await;
+        // The worker owns cleanup so a command-level timeout cannot return
+        // before the native capture and then miss a late-created WAV.
+        let _ = std::fs::remove_file(&path_clone);
+        let _ = std::fs::remove_file(path_clone.with_extension("wav.tmp"));
+        result
     });
     recording_guard.attach_worker(worker);
 
@@ -400,19 +428,20 @@ async fn run_audio_test(
     // native device call blocks, the audio slot stays occupied until the
     // physical worker exits rather than detaching it.
     const AUDIO_TEST_MAX_SECS: u64 = 10;
+    const AUDIO_TEST_COMMAND_DEADLINE_SECS: u64 = 15;
     let max_stop = stop_flag.clone();
     let timer = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(AUDIO_TEST_MAX_SECS)).await;
         max_stop.store(true, Ordering::SeqCst);
     });
 
-    let join_result = recording_guard.take_result().await;
+    let join_result = take_recording_result_before_deadline(
+        &mut recording_guard,
+        std::time::Duration::from_secs(AUDIO_TEST_COMMAND_DEADLINE_SECS),
+        "Audio test timed out while waiting for the audio device",
+    )
+    .await?;
     timer.abort();
-
-    // The test never persists evidence: delete the temp WAV (and any partial
-    // temp file) regardless of outcome.
-    let _ = std::fs::remove_file(&tmp_path);
-    let _ = std::fs::remove_file(tmp_path.with_extension("wav.tmp"));
 
     // Release the slot and disarm the guard on EVERY outcome.
     clear_active_recording(&state).await;
@@ -516,7 +545,13 @@ async fn check_audio_devices(
 
     // Release the slot on every outcome (success, error, timeout) and disarm
     // the safety net.
-    let join_result = recording_guard.take_result().await;
+    const DEVICE_CHECK_COMMAND_DEADLINE_SECS: u64 = 10;
+    let join_result = take_recording_result_before_deadline(
+        &mut recording_guard,
+        std::time::Duration::from_secs(DEVICE_CHECK_COMMAND_DEADLINE_SECS),
+        "Audio device check timed out while waiting for the audio device",
+    )
+    .await?;
     clear_active_recording(&state).await;
     recording_guard.disarm();
 
@@ -1322,6 +1357,74 @@ mod tests {
     ) -> (RecordingGuard<()>, Arc<std::sync::atomic::AtomicBool>) {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         (RecordingGuard::<()>::new(state.clone(), stop.clone()), stop)
+    }
+
+    /// An outer command deadline must return promptly without consuming or
+    /// detaching the worker. The still-armed guard retains the recording slot
+    /// until the scheduled physical worker actually terminates.
+    #[tokio::test]
+    async fn recording_worker_deadline_returns_while_guard_retains_ownership() {
+        let state = Arc::new(RecordingState {
+            handle: Mutex::new(None),
+        });
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        acquire_recording(&state, fake_handle()).await.unwrap();
+
+        let mut guard = RecordingGuard::new(state.clone(), stop.clone());
+        guard.drop_grace = std::time::Duration::from_millis(50);
+        let completion = guard.completion();
+        let completion_for_test = completion.clone();
+        let blocking_release = release.clone();
+        let worker = tokio::spawn(async move {
+            completion.mark_scheduled();
+            let _ = tokio::task::spawn_blocking(move || {
+                while !blocking_release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                completion.signal();
+            })
+            .await;
+        });
+        guard.attach_worker(worker);
+
+        for _ in 0..200 {
+            if completion_for_test.scheduled() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(completion_for_test.scheduled());
+
+        let started = std::time::Instant::now();
+        let result = take_recording_result_before_deadline(
+            &mut guard,
+            std::time::Duration::from_millis(25),
+            "Audio command timed out",
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), "Audio command timed out");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+
+        drop(guard);
+        assert!(stop.load(Ordering::SeqCst));
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            state.handle.lock().await.is_some(),
+            "slot must remain owned while the physical worker is blocked"
+        );
+
+        release.store(true, Ordering::SeqCst);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if state.handle.lock().await.is_none() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("slot must clear after physical worker termination");
     }
 
     /// Controlled path: after the worker terminates, the command explicitly
