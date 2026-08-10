@@ -228,9 +228,23 @@ impl Database {
     pub fn create_session(&self, session_id: &str, candidate_name: &str) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
-            "INSERT INTO sessions (id, candidate_name) VALUES (?1, ?2)",
+            "INSERT INTO sessions (id, candidate_name) VALUES (?1, ?2) ON CONFLICT(id) DO NOTHING",
             params![session_id, candidate_name],
         )?;
+
+        let stored_candidate_name: String = conn.query_row(
+            "SELECT candidate_name FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+
+        if stored_candidate_name != candidate_name {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+                Some("Session ID already exists for a different candidate".into()),
+            ));
+        }
+
         Ok(())
     }
 

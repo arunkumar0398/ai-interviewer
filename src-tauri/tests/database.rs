@@ -192,7 +192,7 @@ fn db_sessions_ordered_by_recency() {
     let _ = std::fs::remove_file(&db_path);
 }
 
-/// Test: Duplicate session ID insertion fails (PRIMARY KEY constraint)
+/// Test: Reusing a session ID for a different candidate fails without changing it.
 #[test]
 fn db_duplicate_session_id_fails() {
     let db_path = std::env::temp_dir().join("test_dup_session.db");
@@ -202,7 +202,36 @@ fn db_duplicate_session_id_fails() {
     db.create_session("dup-session", "Alice").unwrap();
 
     let result = db.create_session("dup-session", "Bob");
-    assert!(result.is_err(), "Duplicate session ID should fail");
+    let error = result.expect_err("Conflicting session ID reuse should fail");
+    match error {
+        rusqlite::Error::SqliteFailure(sqlite_error, Some(message)) => {
+            assert_eq!(sqlite_error.code, rusqlite::ErrorCode::ConstraintViolation);
+            assert!(message.contains("Session ID already exists for a different candidate"));
+        }
+        other => panic!("Expected a SQLite constraint error, got {other:?}"),
+    }
+
+    let sessions = db.get_sessions().unwrap();
+    assert_eq!(sessions.len(), 1, "Conflicting reuse must not add a row");
+    assert_eq!(sessions[0].candidate_name, "Alice");
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+/// Test: Retrying session creation with the same candidate is idempotent.
+#[test]
+fn db_create_session_same_id_same_candidate_is_idempotent() {
+    let db_path = std::env::temp_dir().join("test_idempotent_session.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
+    db.create_session("retry-session", "Alice").unwrap();
+    db.create_session("retry-session", "Alice").unwrap();
+
+    let sessions = db.get_sessions().unwrap();
+    assert_eq!(sessions.len(), 1, "Retry must not create a second session");
+    assert_eq!(sessions[0].id, "retry-session");
+    assert_eq!(sessions[0].candidate_name, "Alice");
 
     let _ = std::fs::remove_file(&db_path);
 }
