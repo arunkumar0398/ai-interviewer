@@ -34,6 +34,43 @@ interface InterviewRoundResult {
   transcription: string;
 }
 
+/** Serialized Rust db::InterviewRound returned by get_rounds. */
+interface StoredInterviewRound {
+  id: number;
+  session_id: string;
+  round_index: number;
+  question: string;
+  transcription: string;
+  audio_path: string;
+  sha256: string;
+  duration_ms: number;
+  sample_rate: number;
+  channels: number;
+  file_size_bytes: number;
+  created_at: string;
+}
+
+function storedRoundToResult(round: StoredInterviewRound): InterviewRoundResult {
+  return {
+    metadata: {
+      file_path: round.audio_path,
+      sha256: round.sha256,
+      duration_ms: round.duration_ms,
+      sample_rate: round.sample_rate,
+      channels: round.channels,
+      file_size_bytes: round.file_size_bytes,
+    },
+    transcription: round.transcription,
+  };
+}
+
+function hasContiguousRoundHistory(rounds: StoredInterviewRound[]): boolean {
+  return (
+    rounds.length <= INTERVIEW_QUESTIONS.length &&
+    rounds.every((round, index) => round.round_index === index)
+  );
+}
+
 interface InterviewSession {
   id: string;
   candidate_name: string;
@@ -258,6 +295,22 @@ export default function InterviewPage() {
           setSessionInitState("completed");
           return;
         }
+        const rounds = await invoke<StoredInterviewRound[]>("get_rounds", {
+          sessionId,
+        });
+        if (cancelled) return;
+        if (!hasContiguousRoundHistory(rounds)) {
+          handoffFailedRef.current = true;
+          setSessionInitState("error");
+          setPhase("error");
+          setRetryTarget(null);
+          setError(
+            "This session has an inconsistent round history and cannot be resumed."
+          );
+          return;
+        }
+        setRoundResults(rounds.map(storedRoundToResult));
+        setCurrentRound(rounds.length);
         setSessionInitState("ready");
       } catch (e) {
         if (cancelled) return;
@@ -329,7 +382,8 @@ export default function InterviewPage() {
     if (
       sessionInitState === "creating" ||
       sessionInitState === "verifying" ||
-      sessionInitState === "error"
+      sessionInitState === "error" ||
+      sessionInitState === "completed"
     )
       return;
     isStartingRound.current = true;

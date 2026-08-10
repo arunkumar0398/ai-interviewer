@@ -32,6 +32,23 @@ const mockAppConfigWithMissingTools = {
   },
 };
 
+function mockStoredRound(sessionId: string, roundIndex: number) {
+  return {
+    id: roundIndex + 1,
+    session_id: sessionId,
+    round_index: roundIndex,
+    question: INTERVIEW_QUESTIONS[roundIndex] ?? `Unexpected question ${roundIndex}`,
+    transcription: `Persisted answer ${roundIndex + 1}`,
+    audio_path: `/tmp/persisted-round-${roundIndex}.wav`,
+    sha256: `persisted-sha-${roundIndex}`,
+    duration_ms: 4000,
+    sample_rate: 16000,
+    channels: 1,
+    file_size_bytes: 100,
+    created_at: "2026-01-01T00:01:00Z",
+  };
+}
+
 describe("Interview Page", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -446,6 +463,7 @@ describe("Interview Page", () => {
 
     let createSessionCalls = 0;
     let getSessionCalls = 0;
+    let getRoundsCalls = 0;
     let roundSessionId: string | null = null;
     mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
       switch (cmd) {
@@ -470,6 +488,10 @@ describe("Interview Page", () => {
             total_rounds: 0,
           });
         }
+        case "get_rounds":
+          getRoundsCalls += 1;
+          expect(args?.sessionId).toBe(handedOffSession);
+          return Promise.resolve([]);
         case "create_session":
           createSessionCalls += 1;
           return Promise.resolve();
@@ -500,6 +522,7 @@ describe("Interview Page", () => {
     await waitFor(() => {
       expect(getSessionCalls).toBe(1);
     });
+    expect(getRoundsCalls).toBe(1);
     await waitFor(() => {
       expect(screen.getByText("Check Devices")).toBeInTheDocument();
     });
@@ -519,6 +542,187 @@ describe("Interview Page", () => {
     expect(roundSessionId).toBe(handedOffSession);
 
     // Restore the URL for other tests.
+    window.history.replaceState({}, "", "/");
+  });
+
+  it.each([1, 2, 3, 4])(
+    "resumes a handed-off session at persisted round %i",
+    async (persistedCount) => {
+      const handedOffSession = "22222222-3333-4444-5555-666666666666";
+      window.history.replaceState({}, "", `/interview?session=${handedOffSession}`);
+      let runRoundArgs: Record<string, unknown> | null = null;
+      const storedRounds = Array.from({ length: persistedCount }, (_, roundIndex) =>
+        mockStoredRound(handedOffSession, roundIndex)
+      );
+
+      mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+        switch (cmd) {
+          case "get_app_config":
+            return Promise.resolve(mockAppConfig);
+          case "get_session":
+            return Promise.resolve({
+              id: handedOffSession,
+              candidate_name: "Alice",
+              started_at: "2026-01-01T00:00:00Z",
+              completed_at: null,
+              total_rounds: 0,
+            });
+          case "get_rounds":
+            return Promise.resolve(storedRounds);
+          case "check_audio_devices":
+            return Promise.resolve({
+              mic_available: true,
+              mic_name: "Mic",
+              speaker_available: true,
+              speaker_name: "Speaker",
+              mic_test_ok: true,
+              errors: [],
+            });
+          case "run_interview_round":
+            runRoundArgs = args ?? null;
+            return Promise.resolve({
+              metadata: {
+                file_path: "/tmp/round.wav",
+                sha256: "next-sha",
+                duration_ms: 5000,
+                sample_rate: 16000,
+                channels: 1,
+                file_size_bytes: 100,
+              },
+              transcription: "Next answer",
+            });
+          default:
+            return Promise.reject(new Error(`Unexpected command: ${cmd}`));
+        }
+      });
+
+      await act(async () => {
+        render(<InterviewPage />);
+      });
+
+      await waitFor(() => {
+        expect(screen.getByText("Check Devices")).toBeInTheDocument();
+      });
+      fireEvent.click(screen.getByText("Check Devices"));
+      await waitFor(() => {
+        expect(screen.getByText("Next Question")).toBeInTheDocument();
+      });
+      fireEvent.click(screen.getByText("Next Question"));
+
+      await waitFor(() => {
+        expect(runRoundArgs).not.toBeNull();
+      });
+      expect(runRoundArgs).toMatchObject({
+        sessionId: handedOffSession,
+        roundIndex: persistedCount,
+        question: INTERVIEW_QUESTIONS[persistedCount],
+      });
+
+      window.history.replaceState({}, "", "/");
+    }
+  );
+
+  it("rejects a handed-off session with a gap in its persisted round history", async () => {
+    const handedOffSession = "33333333-4444-5555-6666-777777777777";
+    window.history.replaceState({}, "", `/interview?session=${handedOffSession}`);
+    let deviceCheckCalls = 0;
+    let roundCalls = 0;
+
+    mockInvoke.mockImplementation((cmd: string) => {
+      switch (cmd) {
+        case "get_app_config":
+          return Promise.resolve(mockAppConfig);
+        case "get_session":
+          return Promise.resolve({
+            id: handedOffSession,
+            candidate_name: "Alice",
+            started_at: "2026-01-01T00:00:00Z",
+            completed_at: null,
+            total_rounds: 2,
+          });
+        case "get_rounds":
+          return Promise.resolve(
+            [0, 2].map((roundIndex) => mockStoredRound(handedOffSession, roundIndex))
+          );
+        case "check_audio_devices":
+          deviceCheckCalls += 1;
+          return Promise.resolve({});
+        case "run_interview_round":
+          roundCalls += 1;
+          return Promise.resolve({});
+        default:
+          return Promise.reject(new Error(`Unexpected command: ${cmd}`));
+      }
+    });
+
+    await act(async () => {
+      render(<InterviewPage />);
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("This session has an inconsistent round history and cannot be resumed.")
+      ).toBeInTheDocument();
+    });
+    expect(screen.queryByText("Check Devices")).not.toBeInTheDocument();
+    expect(screen.queryByText("Start Interview")).not.toBeInTheDocument();
+    expect(screen.queryByText("Retry")).not.toBeInTheDocument();
+    expect(deviceCheckCalls).toBe(0);
+    expect(roundCalls).toBe(0);
+
+    window.history.replaceState({}, "", "/");
+  });
+
+  it("rejects a handed-off session with more persisted rounds than the interview allows", async () => {
+    const handedOffSession = "44444444-5555-6666-7777-888888888888";
+    window.history.replaceState({}, "", `/interview?session=${handedOffSession}`);
+    let deviceCheckCalls = 0;
+    let roundCalls = 0;
+
+    mockInvoke.mockImplementation((cmd: string) => {
+      switch (cmd) {
+        case "get_app_config":
+          return Promise.resolve(mockAppConfig);
+        case "get_session":
+          return Promise.resolve({
+            id: handedOffSession,
+            candidate_name: "Alice",
+            started_at: "2026-01-01T00:00:00Z",
+            completed_at: null,
+            total_rounds: 5,
+          });
+        case "get_rounds":
+          return Promise.resolve(
+            Array.from({ length: 6 }, (_, roundIndex) =>
+              mockStoredRound(handedOffSession, roundIndex)
+            )
+          );
+        case "check_audio_devices":
+          deviceCheckCalls += 1;
+          return Promise.resolve({});
+        case "run_interview_round":
+          roundCalls += 1;
+          return Promise.resolve({});
+        default:
+          return Promise.reject(new Error(`Unexpected command: ${cmd}`));
+      }
+    });
+
+    await act(async () => {
+      render(<InterviewPage />);
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("This session has an inconsistent round history and cannot be resumed.")
+      ).toBeInTheDocument();
+    });
+    expect(screen.queryByText("Check Devices")).not.toBeInTheDocument();
+    expect(screen.queryByText("Start Interview")).not.toBeInTheDocument();
+    expect(screen.queryByText("Retry")).not.toBeInTheDocument();
+    expect(deviceCheckCalls).toBe(0);
+    expect(roundCalls).toBe(0);
+
     window.history.replaceState({}, "", "/");
   });
 
