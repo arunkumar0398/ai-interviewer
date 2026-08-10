@@ -1,5 +1,5 @@
 use crate::audio::capture::{BlockingLifecycle, CaptureCompletion};
-use crate::audio::pipe::{terminate_child, StderrDrain};
+use crate::audio::pipe::{ChildProcessGuard, ProcessCompletion, StderrDrain};
 use crate::audio::playback::{
     await_playback, pcm_bytes_to_samples, PlaybackOutcome, PLAYBACK_TIMEOUT_SECS,
 };
@@ -74,12 +74,19 @@ impl PiperSupervisor {
     /// the shared audio slot stays occupied until the real Piper question
     /// playback has physically ended — even if the owning command is dropped
     /// or aborted while the blocking output is inside native audio calls.
+    ///
+    /// `process_completion` is the CHILD-PROCESS lifecycle signal (RC-2B):
+    /// marked Running before every spawn and signalled Reaped only after the
+    /// child has been conclusively killed + waited, so a force-abort of this
+    /// task can never resolve slot/evidence ownership while a Piper process
+    /// may still be alive.
     pub async fn speak(
         &self,
         text: &str,
         event_tx: mpsc::Sender<TtsEvent>,
         stop_flag: Arc<AtomicBool>,
         output_completion: CaptureCompletion,
+        process_completion: ProcessCompletion,
     ) -> anyhow::Result<()> {
         if text.trim().is_empty() {
             return Ok(());
@@ -104,8 +111,12 @@ impl PiperSupervisor {
                 return Ok(());
             }
 
+            // RC-2B: mark Running BEFORE spawn (no await in between) so a
+            // force-abort can never resolve ownership while the child may be
+            // alive.
+            process_completion.mark_running();
             // Spawn Piper with tokio async process — stdout/stderr are async
-            let mut child = match Command::new(&piper_bin)
+            let child = match Command::new(&piper_bin)
                 .arg("--model")
                 .arg(&model_path)
                 .arg("--output-raw")
@@ -117,16 +128,22 @@ impl PiperSupervisor {
             {
                 Ok(c) => c,
                 Err(e) => {
+                    // Spawn failed — nothing was ever alive to reap.
+                    process_completion.signal_reaped();
                     let _ = event_tx.try_send(TtsEvent::Error {
                         message: format!("Failed to start Piper: {}", e),
                     });
                     return Err(anyhow::anyhow!("Failed to start Piper: {}", e));
                 }
             };
+            // The child's kill+wait lifecycle is RAII-owned: on EVERY exit
+            // path (including force-abort) the child is reaped before the
+            // completion signals Reaped (RC-2B).
+            let mut proc_guard = ChildProcessGuard::new(child, process_completion.clone());
 
             // Drain stderr concurrently so Piper can never block on a full
             // stderr pipe while we consume its stdout PCM.
-            let stderr_drain = child.stderr.take().map(StderrDrain::start);
+            let stderr_drain = proc_guard.child_mut().stderr.take().map(StderrDrain::start);
 
             // ONE absolute deadline for this process lifecycle (P2-4): stdout
             // reads, cancellation, child exit, and the final wait share the
@@ -135,14 +152,14 @@ impl PiperSupervisor {
                 tokio::time::Instant::now() + tokio::time::Duration::from_secs(PIPER_TIMEOUT_SECS);
 
             // Write text to stdin
-            if let Some(mut stdin) = child.stdin.take() {
+            if let Some(mut stdin) = proc_guard.child_mut().stdin.take() {
                 use tokio::io::AsyncWriteExt;
                 if let Err(e) = stdin.write_all(text.as_bytes()).await {
                     let _ = event_tx.try_send(TtsEvent::Error {
                         message: format!("Failed to write to Piper stdin: {}", e),
                     });
                     // Child may still be running — kill and reap explicitly.
-                    terminate_child(&mut child).await;
+                    proc_guard.terminate().await;
                     return Err(anyhow::anyhow!("Stdin write failed: {}", e));
                 }
                 drop(stdin);
@@ -152,7 +169,7 @@ impl PiperSupervisor {
 
             // Read raw PCM from stdout with async I/O and cancellation
             let mut pcm_data = Vec::new();
-            let mut stdout = child.stdout.take();
+            let mut stdout = proc_guard.child_mut().stdout.take();
             let mut buf = vec![0u8; STDOUT_CHUNK_SIZE];
 
             let read_result: anyhow::Result<()> = loop {
@@ -181,12 +198,12 @@ impl PiperSupervisor {
                     }
                     // Check stop flag — polling wake-up ensures reliable cancellation
                     _ = crate::interview::orchestrator::wait_for_stop(stop_flag.clone()) => {
-                        terminate_child(&mut child).await;
+                        proc_guard.terminate().await;
                         return Ok(());
                     }
                     // Check deadline
                     _ = tokio::time::sleep_until(deadline) => {
-                        terminate_child(&mut child).await;
+                        proc_guard.terminate().await;
                         let _ = event_tx.try_send(TtsEvent::Error {
                             message: format!(
                                 "Piper timed out after {}s — process killed",
@@ -204,7 +221,7 @@ impl PiperSupervisor {
             if let Err(e) = read_result {
                 // Child may still be running (stdout read error) — kill and
                 // reap explicitly.
-                terminate_child(&mut child).await;
+                proc_guard.terminate().await;
                 let _ = event_tx.try_send(TtsEvent::Error {
                     message: format!("Piper read error: {}", e),
                 });
@@ -213,10 +230,14 @@ impl PiperSupervisor {
 
             // Wait for process to finish — the SAME absolute deadline (P2-4),
             // so EOF does not grant a fresh timeout budget.
-            let wait_result = tokio::time::timeout_at(deadline, child.wait()).await;
+            let wait_result =
+                tokio::time::timeout_at(deadline, proc_guard.child_mut().wait()).await;
 
             match wait_result {
                 Ok(Ok(status)) => {
+                    // The child exited and was waited — conclusively reaped on
+                    // this controlled path (RC-2B).
+                    proc_guard.mark_reaped();
                     if status.success() {
                         // Play the collected PCM data. A playback failure must
                         // surface as an error: the candidate did not actually
@@ -270,7 +291,7 @@ impl PiperSupervisor {
                     // Child state is uncertain after a wait error — terminate
                     // and reap explicitly before propagating (P2-2);
                     // kill_on_drop stays only as defense-in-depth.
-                    terminate_child(&mut child).await;
+                    proc_guard.terminate().await;
                     let stderr_text = match &stderr_drain {
                         Some(d) => d.text().await,
                         None => String::new(),
@@ -282,7 +303,7 @@ impl PiperSupervisor {
                 }
                 Err(_) => {
                     // Timeout waiting for child to exit — force kill and reap.
-                    terminate_child(&mut child).await;
+                    proc_guard.terminate().await;
                     let _ = event_tx.try_send(TtsEvent::Error {
                         message: format!(
                             "Piper timed out after {}s — process killed",

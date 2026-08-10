@@ -464,7 +464,7 @@ fn db_duplicate_round_index_errors() {
     let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
     db.create_session("dup-round-session", "Test").unwrap();
 
-    db.insert_round_with_session_update(
+    let outcome = db.insert_round_with_session_update(
         "dup-round-session",
         0,
         "Q1",
@@ -476,9 +476,14 @@ fn db_duplicate_round_index_errors() {
         1,
         160044,
         false,
-    )
-    .unwrap();
-
+    );
+    assert!(
+        matches!(
+            outcome,
+            ai_interviewer_lib::db::PersistenceOutcome::Committed(_)
+        ),
+        "round insert must commit"
+    );
     // Second insert with same (session_id, round_index) should fail with UNIQUE error
     let result = db.insert_round_with_session_update(
         "dup-round-session",
@@ -493,7 +498,13 @@ fn db_duplicate_round_index_errors() {
         168044,
         false,
     );
-    assert!(result.is_err(), "Duplicate round_index should error");
+    assert!(
+        matches!(
+            result,
+            ai_interviewer_lib::db::PersistenceOutcome::NotCommitted { .. }
+        ),
+        "Duplicate round_index should be conclusively NotCommitted"
+    );
 
     let rounds = db.get_rounds("dup-round-session").unwrap();
     assert_eq!(rounds.len(), 1, "Only original round should exist");
@@ -519,7 +530,7 @@ fn db_insert_round_with_session_update() {
         0
     );
 
-    db.insert_round_with_session_update(
+    let outcome = db.insert_round_with_session_update(
         "update-session",
         0,
         "Q1",
@@ -531,8 +542,14 @@ fn db_insert_round_with_session_update() {
         1,
         160044,
         false,
-    )
-    .unwrap();
+    );
+    assert!(
+        matches!(
+            outcome,
+            ai_interviewer_lib::db::PersistenceOutcome::Committed(_)
+        ),
+        "round insert must commit"
+    );
     assert_eq!(
         db.get_session("update-session")
             .unwrap()
@@ -541,7 +558,7 @@ fn db_insert_round_with_session_update() {
         1
     );
 
-    db.insert_round_with_session_update(
+    let outcome = db.insert_round_with_session_update(
         "update-session",
         1,
         "Q2",
@@ -553,8 +570,14 @@ fn db_insert_round_with_session_update() {
         1,
         192044,
         false,
-    )
-    .unwrap();
+    );
+    assert!(
+        matches!(
+            outcome,
+            ai_interviewer_lib::db::PersistenceOutcome::Committed(_)
+        ),
+        "round insert must commit"
+    );
     assert_eq!(
         db.get_session("update-session")
             .unwrap()
@@ -579,7 +602,7 @@ fn db_insert_round_with_session_update_rollback() {
     db.create_session("rollback-session", "Test").unwrap();
 
     // First insert succeeds
-    db.insert_round_with_session_update(
+    let outcome = db.insert_round_with_session_update(
         "rollback-session",
         0,
         "Q1",
@@ -591,8 +614,14 @@ fn db_insert_round_with_session_update_rollback() {
         1,
         160044,
         false,
-    )
-    .unwrap();
+    );
+    assert!(
+        matches!(
+            outcome,
+            ai_interviewer_lib::db::PersistenceOutcome::Committed(_)
+        ),
+        "round insert must commit"
+    );
     assert_eq!(
         db.get_session("rollback-session")
             .unwrap()
@@ -616,7 +645,13 @@ fn db_insert_round_with_session_update_rollback() {
         168044,
         false,
     );
-    assert!(result.is_err(), "Duplicate round_index should error");
+    assert!(
+        matches!(
+            result,
+            ai_interviewer_lib::db::PersistenceOutcome::NotCommitted { .. }
+        ),
+        "Duplicate round_index should be conclusively NotCommitted"
+    );
     assert_eq!(
         db.get_session("rollback-session")
             .unwrap()
@@ -642,7 +677,7 @@ fn db_final_round_commits_round_and_session_completion() {
     let session_before = db.get_session("final-session").unwrap().unwrap();
     assert!(session_before.completed_at.is_none());
 
-    db.insert_round_with_session_update(
+    let outcome = db.insert_round_with_session_update(
         "final-session",
         0,
         "Q-final",
@@ -654,9 +689,14 @@ fn db_final_round_commits_round_and_session_completion() {
         1,
         224044,
         true,
-    )
-    .unwrap();
-
+    );
+    assert!(
+        matches!(
+            outcome,
+            ai_interviewer_lib::db::PersistenceOutcome::Committed(_)
+        ),
+        "round insert must commit"
+    );
     // Round persisted and session finalized together.
     let rounds = db.get_rounds("final-session").unwrap();
     assert_eq!(rounds.len(), 1);
@@ -681,7 +721,7 @@ fn db_non_final_round_does_not_complete_session() {
     let db = ai_interviewer_lib::db::Database::open(&db_path).unwrap();
     db.create_session("nonfinal-session", "Test").unwrap();
 
-    db.insert_round_with_session_update(
+    let outcome = db.insert_round_with_session_update(
         "nonfinal-session",
         0,
         "Q1",
@@ -693,9 +733,14 @@ fn db_non_final_round_does_not_complete_session() {
         1,
         160044,
         false,
-    )
-    .unwrap();
-
+    );
+    assert!(
+        matches!(
+            outcome,
+            ai_interviewer_lib::db::PersistenceOutcome::Committed(_)
+        ),
+        "round insert must commit"
+    );
     let session = db.get_session("nonfinal-session").unwrap().unwrap();
     assert_eq!(session.total_rounds, 1);
     assert!(
@@ -728,7 +773,13 @@ fn db_final_round_missing_session_rolls_back_everything() {
         160044,
         true,
     );
-    assert!(result.is_err(), "Insert for a missing session must error");
+    assert!(
+        matches!(
+            result,
+            ai_interviewer_lib::db::PersistenceOutcome::NotCommitted { .. }
+        ),
+        "Insert for a missing session must be conclusively NotCommitted"
+    );
 
     let rounds = db.get_rounds("no-such-session").unwrap();
     assert!(
@@ -1167,7 +1218,7 @@ fn db_schema_v1_to_v2_reconciled_count_continues_to_completion() {
 
     // Complete rounds 2, 3, 4 (final).
     for (index, is_final) in [(2, false), (3, false), (4, true)] {
-        db.insert_round_with_session_update(
+        let outcome = db.insert_round_with_session_update(
             "s1",
             index,
             &format!("Q{}", index + 1),
@@ -1179,8 +1230,14 @@ fn db_schema_v1_to_v2_reconciled_count_continues_to_completion() {
             1,
             160044,
             is_final,
-        )
-        .unwrap();
+        );
+        assert!(
+            matches!(
+                outcome,
+                ai_interviewer_lib::db::PersistenceOutcome::Committed(_)
+            ),
+            "round insert must commit"
+        );
     }
 
     let session = db.get_session("s1").unwrap().unwrap();

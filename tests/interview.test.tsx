@@ -952,6 +952,82 @@ describe("Interview Page", () => {
     expect(screen.queryByText("Error")).not.toBeInTheDocument();
   });
 
+  // RC-7: the session identity starts in the explicit "resolving" state — a
+  // handed-off /interview?session=<uuid> must NEVER display actionable
+  // new-session UI (Device Check / Start Interview) before the handoff is
+  // verified. The tools check may resolve first (phase -> device-check), but
+  // the session-sensitive controls stay hidden while resolving AND while
+  // verifying, and appear only after verification completes.
+  it("holds session-sensitive controls until the handoff is verified (RC-7)", async () => {
+    const handedOffSession = "55555555-6666-7777-8888-999999999999";
+    window.history.replaceState({}, "", `/interview?session=${handedOffSession}`);
+
+    let resolveConfig!: (value: unknown) => void;
+    const configPromise = new Promise((res) => {
+      resolveConfig = res;
+    });
+    let resolveSession!: (value: unknown) => void;
+    const sessionPromise = new Promise((res) => {
+      resolveSession = res;
+    });
+    let getSessionCalls = 0;
+    mockInvoke.mockImplementation((cmd: string) => {
+      switch (cmd) {
+        case "get_app_config":
+          return configPromise;
+        case "get_session":
+          getSessionCalls += 1;
+          return sessionPromise;
+        case "get_rounds":
+          return Promise.resolve([]);
+        default:
+          return Promise.reject(new Error(`Unexpected command: ${cmd}`));
+      }
+    });
+
+    await act(async () => {
+      render(<InterviewPage />);
+    });
+
+    // Immediately after mount, while the query param has not been resolved,
+    // no session-sensitive control may be present.
+    expect(screen.queryByText("Check Devices")).not.toBeInTheDocument();
+    expect(screen.queryByText("Start Interview")).not.toBeInTheDocument();
+
+    // Tools readiness resolves first — the phase advances to device-check,
+    // but the session identity is still resolving: controls stay hidden.
+    await act(async () => {
+      resolveConfig(mockAppConfig);
+    });
+    expect(screen.queryByText("Check Devices")).not.toBeInTheDocument();
+    expect(screen.queryByText("Start Interview")).not.toBeInTheDocument();
+
+    // The mount effect resolves the handoff into "verifying" (get_session is
+    // held open). Still no actionable UI.
+    await waitFor(() => {
+      expect(getSessionCalls).toBe(1);
+    });
+    expect(screen.getByText("Verifying session...")).toBeInTheDocument();
+    expect(screen.queryByText("Check Devices")).not.toBeInTheDocument();
+    expect(screen.queryByText("Start Interview")).not.toBeInTheDocument();
+
+    // Verification completes (incomplete session) -> controls appear.
+    await act(async () => {
+      resolveSession({
+        id: handedOffSession,
+        candidate_name: "Alice",
+        started_at: "2026-01-01T00:00:00Z",
+        completed_at: null,
+        total_rounds: 0,
+      });
+    });
+    await waitFor(() => {
+      expect(screen.getByText("Check Devices")).toBeInTheDocument();
+    });
+
+    window.history.replaceState({}, "", "/");
+  });
+
   // RC-4: hydration safety — the query string is NEVER read during render, so
   // the server/static-rendered tree equals the first client-rendered tree for
   // both /interview?session=<uuid> and /interview. Hydration must produce NO

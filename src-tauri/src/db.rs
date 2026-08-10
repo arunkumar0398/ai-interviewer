@@ -36,6 +36,23 @@ pub struct InterviewSession {
     pub total_rounds: i32,
 }
 
+/// Outcome of a round-persistence attempt (RC-4). A COMMIT error is NOT
+/// automatically equivalent to "nothing persisted" — an exceptional commit
+/// failure (SQLITE_IOERR, SQLITE_FULL, SQLITE_INTERRUPT, SQLITE_NOMEM,
+/// filesystem/storage failure) can be ambiguous, so the caller reconciles
+/// before deciding evidence fate.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PersistenceOutcome {
+    /// The round row conclusively exists (commit succeeded, or the
+    /// reconciliation query proved the committed row matches).
+    Committed(i64),
+    /// The round is conclusively absent — evidence cleanup may proceed.
+    NotCommitted { source: String },
+    /// Commit state could not be determined — evidence must NOT be deleted;
+    /// quarantine/reconcile instead.
+    Unknown { source: String },
+}
+
 /// Reject databases created by a NEWER build. A newer schema is not
 /// downgradable — silently relabeling it as an older version would corrupt
 /// the data model. This check runs before ANY pragma or schema mutation so
@@ -295,10 +312,19 @@ impl Database {
     /// INSERT, the session total_rounds increment, and — when `is_final` is
     /// true — the session completed_at timestamp all commit in ONE
     /// transaction. Uses plain INSERT — UNIQUE(session_id, round_index)
-    /// violation returns a domain error so the caller can surface
-    /// "Round N already exists". The session update must affect exactly one
-    /// row (the session must exist); otherwise the whole transaction rolls
-    /// back and no round is persisted.
+    /// violation returns NotCommitted so the caller can surface "Round N
+    /// already exists". The session update must affect exactly one row (the
+    /// session must exist); otherwise the whole transaction rolls back and
+    /// no round is persisted.
+    ///
+    /// RC-4: statement failures (duplicate, missing session) are conclusively
+    /// NotCommitted. A COMMIT failure is AMBIGUOUS: the transaction is
+    /// rolled back best-effort (the connection stays usable), then the round
+    /// is queried by its authoritative identity (session_id + round_index)
+    /// and checksum. A matching persisted row means the commit actually went
+    /// through (Committed); a conclusively absent row means it did not
+    /// (NotCommitted); anything else (query error, mismatched checksum) is
+    /// Unknown — the caller must preserve the evidence.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_round_with_session_update(
         &self,
@@ -313,46 +339,86 @@ impl Database {
         channels: u16,
         file_size_bytes: u64,
         is_final: bool,
-    ) -> SqlResult<i64> {
+    ) -> PersistenceOutcome {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        // RC-3: RAII transaction — COMMIT failure triggers a best-effort
-        // ROLLBACK in Drop (the connection stays usable and the original
-        // commit error is surfaced), and any statement error drops the
-        // transaction (rolling it back) before the error propagates. A failed
-        // persistence is never partially visible.
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "INSERT INTO rounds (session_id, round_index, question, transcription, audio_path, sha256, duration_ms, sample_rate, channels, file_size_bytes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                session_id,
-                round_index,
-                question,
-                transcription,
-                audio_path,
-                sha256,
-                duration_ms,
-                sample_rate,
-                channels,
-                file_size_bytes,
-            ],
-        )?;
-        // Session must exist — verify exactly one row is updated. The
-        // completed_at timestamp is set in the same statement when this is
-        // the final round, so commit is all-or-nothing.
-        let affected = tx.execute(
-            "UPDATE sessions
-                SET total_rounds = total_rounds + 1,
-                    completed_at = CASE WHEN ?2 = 1 THEN datetime('now') ELSE completed_at END
-              WHERE id = ?1",
-            params![session_id, if is_final { 1 } else { 0 }],
-        )?;
-        if affected != 1 {
-            return Err(rusqlite::Error::QueryReturnedNoRows);
+        let tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+            Ok(tx) => tx,
+            Err(e) => {
+                return PersistenceOutcome::Unknown {
+                    source: format!("failed to begin persistence transaction: {e}"),
+                };
+            }
+        };
+        // Statement phase: any error here is a conclusive rollback — nothing
+        // was written.
+        let statement_result: SqlResult<i64> = (|| {
+            tx.execute(
+                "INSERT INTO rounds (session_id, round_index, question, transcription, audio_path, sha256, duration_ms, sample_rate, channels, file_size_bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    session_id,
+                    round_index,
+                    question,
+                    transcription,
+                    audio_path,
+                    sha256,
+                    duration_ms,
+                    sample_rate,
+                    channels,
+                    file_size_bytes,
+                ],
+            )?;
+            // Session must exist — verify exactly one row is updated. The
+            // completed_at timestamp is set in the same statement when this
+            // is the final round, so commit is all-or-nothing.
+            let affected = tx.execute(
+                "UPDATE sessions
+                    SET total_rounds = total_rounds + 1,
+                        completed_at = CASE WHEN ?2 = 1 THEN datetime('now') ELSE completed_at END
+                  WHERE id = ?1",
+                params![session_id, if is_final { 1 } else { 0 }],
+            )?;
+            if affected != 1 {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            Ok(tx.last_insert_rowid())
+        })();
+
+        let id = match statement_result {
+            Ok(id) => id,
+            Err(e) => {
+                // Conclusive: the transaction drops (best-effort rollback)
+                // and nothing was committed.
+                drop(tx);
+                return PersistenceOutcome::NotCommitted {
+                    source: e.to_string(),
+                };
+            }
+        };
+
+        match tx.commit() {
+            Ok(()) => PersistenceOutcome::Committed(id),
+            Err(e) => {
+                // RC-4: AMBIGUOUS commit failure. `commit` consumed the
+                // transaction (rollback on failure, so the connection stays
+                // usable). Reconcile against the authoritative row identity
+                // before the caller decides the evidence's fate.
+                reconcile_after_commit_failure(&conn, session_id, round_index, sha256, &e)
+            }
         }
-        let id = tx.last_insert_rowid();
-        tx.commit()?;
-        Ok(id)
+    }
+
+    /// Whether a round row references the given absolute audio path (RC-1E
+    /// evidence reconciliation). Used by startup reconciliation to decide
+    /// whether a WAV under recordings/ is durable evidence.
+    pub fn round_exists_with_audio_path(&self, audio_path: &str) -> SqlResult<bool> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM rounds WHERE audio_path = ?1",
+            params![audio_path],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     /// Get all rounds for a session
@@ -431,6 +497,46 @@ impl Database {
     }
 }
 
+/// RC-4: reconcile an AMBIGUOUS COMMIT failure against the authoritative row
+/// identity before any evidence decision:
+///
+/// - row exists AND sha256 matches -> the commit actually went through:
+///   `Committed` (evidence retained);
+/// - row conclusively absent -> `NotCommitted` (evidence cleanup may
+///   proceed);
+/// - the reconciliation query itself fails, or the row exists with a
+///   mismatched checksum (an anomaly) -> `Unknown` (evidence must NOT be
+///   deleted — quarantine/reconcile).
+fn reconcile_after_commit_failure(
+    conn: &Connection,
+    session_id: &str,
+    round_index: i32,
+    expected_sha256: &str,
+    commit_error: &rusqlite::Error,
+) -> PersistenceOutcome {
+    let row: SqlResult<(i64, String)> = conn.query_row(
+        "SELECT id, sha256 FROM rounds WHERE session_id = ?1 AND round_index = ?2",
+        params![session_id, round_index],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    );
+    match row {
+        Ok((id, stored_sha)) if stored_sha == expected_sha256 => PersistenceOutcome::Committed(id),
+        Ok((_id, stored_sha)) => PersistenceOutcome::Unknown {
+            source: format!(
+                "COMMIT failed ({commit_error}) and a row exists with a mismatched checksum ({stored_sha:?} != {expected_sha256:?}) — evidence preserved for reconciliation"
+            ),
+        },
+        Err(rusqlite::Error::QueryReturnedNoRows) => PersistenceOutcome::NotCommitted {
+            source: format!("COMMIT failed: {commit_error}"),
+        },
+        Err(e) => PersistenceOutcome::Unknown {
+            source: format!(
+                "COMMIT failed ({commit_error}) and the reconciliation query failed ({e}) — evidence preserved for reconciliation"
+            ),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,7 +580,7 @@ mod tests {
         // The connection must be fully usable: a real session + round persist
         // normally after the failed commit.
         db.create_session("real-session", "Alice").unwrap();
-        db.insert_round_with_session_update(
+        let outcome = db.insert_round_with_session_update(
             "real-session",
             0,
             "Q1",
@@ -486,8 +592,8 @@ mod tests {
             1,
             100,
             false,
-        )
-        .unwrap();
+        );
+        assert!(matches!(outcome, PersistenceOutcome::Committed(_)));
         assert_eq!(db.get_rounds("real-session").unwrap().len(), 1);
 
         let _ = std::fs::remove_file(&db_path);
@@ -504,7 +610,7 @@ mod tests {
         let db = Database::open(&db_path).unwrap();
         db.create_session("s", "Bob").unwrap();
 
-        db.insert_round_with_session_update(
+        let first = db.insert_round_with_session_update(
             "s",
             0,
             "Q1",
@@ -516,11 +622,12 @@ mod tests {
             1,
             100,
             false,
-        )
-        .unwrap();
+        );
+        assert!(matches!(first, PersistenceOutcome::Committed(_)));
         assert_eq!(db.get_rounds("s").unwrap().len(), 1);
 
-        // Duplicate (session_id, round_index) -> UNIQUE violation -> rollback.
+        // Duplicate (session_id, round_index) -> UNIQUE violation ->
+        // conclusively NotCommitted (rolled back).
         let dup = db.insert_round_with_session_update(
             "s",
             0,
@@ -534,7 +641,10 @@ mod tests {
             100,
             false,
         );
-        assert!(dup.is_err(), "duplicate round must fail");
+        assert!(
+            matches!(dup, PersistenceOutcome::NotCommitted { .. }),
+            "duplicate round must be conclusively NotCommitted"
+        );
 
         // No partial mutation visible: still 1 round, counter not double-
         // counted, original transcription intact.
@@ -545,7 +655,7 @@ mod tests {
         assert_eq!(session.total_rounds, 1);
 
         // Connection remains usable: the next round persists.
-        db.insert_round_with_session_update(
+        let next = db.insert_round_with_session_update(
             "s",
             1,
             "Q2",
@@ -557,8 +667,8 @@ mod tests {
             1,
             100,
             false,
-        )
-        .unwrap();
+        );
+        assert!(matches!(next, PersistenceOutcome::Committed(_)));
         assert_eq!(db.get_rounds("s").unwrap().len(), 2);
 
         let _ = std::fs::remove_file(&db_path);
@@ -586,12 +696,15 @@ mod tests {
             100,
             false,
         );
-        assert!(result.is_err(), "missing session must fail the transaction");
+        assert!(
+            matches!(result, PersistenceOutcome::NotCommitted { .. }),
+            "missing session must be conclusively NotCommitted"
+        );
         assert!(db.get_rounds("ghost").unwrap().is_empty());
 
         // Connection remains usable.
         db.create_session("real", "Carol").unwrap();
-        db.insert_round_with_session_update(
+        let ok = db.insert_round_with_session_update(
             "real",
             0,
             "Q",
@@ -603,9 +716,162 @@ mod tests {
             1,
             100,
             false,
-        )
-        .unwrap();
+        );
+        assert!(matches!(ok, PersistenceOutcome::Committed(_)));
         assert_eq!(db.get_rounds("real").unwrap().len(), 1);
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// RC-4: a normal commit succeeds -> Committed (evidence retained).
+    #[test]
+    fn insert_round_normal_commit_is_committed() {
+        let db_path = std::env::temp_dir().join("test_normal_commit.db");
+        let _ = std::fs::remove_file(&db_path);
+
+        let db = Database::open(&db_path).unwrap();
+        db.create_session("s", "Dave").unwrap();
+        let outcome = db.insert_round_with_session_update(
+            "s",
+            0,
+            "Q",
+            "A",
+            "/tmp/r0.wav",
+            "sha0",
+            4000,
+            16000,
+            1,
+            100,
+            true,
+        );
+        assert!(matches!(outcome, PersistenceOutcome::Committed(id) if id > 0));
+        assert_eq!(db.get_rounds("s").unwrap().len(), 1);
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// RC-4: after an ambiguous COMMIT failure, a matching persisted row
+    /// (same authoritative identity AND checksum) means the commit actually
+    /// went through -> Committed, so the evidence must be retained.
+    #[test]
+    fn reconcile_after_commit_failure_matching_row_is_committed() {
+        let db_path = std::env::temp_dir().join("test_reconcile_match.db");
+        let _ = std::fs::remove_file(&db_path);
+
+        let db = Database::open(&db_path).unwrap();
+        db.create_session("s", "Eve").unwrap();
+        // Simulate a commit that actually landed at the storage level: the
+        // row is present with the expected checksum.
+        let outcome = db.insert_round_with_session_update(
+            "s",
+            0,
+            "Q",
+            "A",
+            "/tmp/r0.wav",
+            "sha0",
+            4000,
+            16000,
+            1,
+            100,
+            false,
+        );
+        assert!(matches!(outcome, PersistenceOutcome::Committed(_)));
+
+        // Now simulate the ambiguous-commit path with a matching row: the
+        // reconciler must conclude Committed, not delete evidence.
+        let conn = db.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let synthetic_error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+            Some("simulated storage error".into()),
+        );
+        let reconciled = reconcile_after_commit_failure(&conn, "s", 0, "sha0", &synthetic_error);
+        assert!(
+            matches!(reconciled, PersistenceOutcome::Committed(_)),
+            "matching row + checksum must be treated as committed"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// RC-4: after an ambiguous COMMIT failure with NO persisted row, the
+    /// round is conclusively absent -> NotCommitted (evidence cleanup may
+    /// proceed).
+    #[test]
+    fn reconcile_after_commit_failure_no_row_is_not_committed() {
+        let db_path = std::env::temp_dir().join("test_reconcile_absent.db");
+        let _ = std::fs::remove_file(&db_path);
+
+        let db = Database::open(&db_path).unwrap();
+        db.create_session("s", "Frank").unwrap();
+        let conn = db.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let synthetic_error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            Some("simulated full disk".into()),
+        );
+        let reconciled = reconcile_after_commit_failure(&conn, "s", 0, "sha0", &synthetic_error);
+        assert!(
+            matches!(reconciled, PersistenceOutcome::NotCommitted { .. }),
+            "no row must be conclusively NotCommitted"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// RC-4: when the reconciliation query itself fails (broken table), the
+    /// outcome is Unknown — the evidence must NOT be deleted blindly.
+    #[test]
+    fn reconcile_after_commit_failure_query_error_is_unknown() {
+        let db_path = std::env::temp_dir().join("test_reconcile_unknown.db");
+        let _ = std::fs::remove_file(&db_path);
+
+        let db = Database::open(&db_path).unwrap();
+        db.create_session("s", "Grace").unwrap();
+        {
+            let conn = db.conn.lock().unwrap_or_else(|e| e.into_inner());
+            // Break the rounds table so the reconciliation query errors.
+            conn.execute_batch("DROP TABLE rounds;").unwrap();
+            let synthetic_error = rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                Some("simulated storage error".into()),
+            );
+            let reconciled =
+                reconcile_after_commit_failure(&conn, "s", 0, "sha0", &synthetic_error);
+            assert!(
+                matches!(reconciled, PersistenceOutcome::Unknown { .. }),
+                "an unresolvable reconciliation must be Unknown, never a false NotCommitted"
+            );
+        }
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// RC-1E: round_exists_with_audio_path distinguishes durable evidence
+    /// from orphaned WAVs.
+    #[test]
+    fn round_exists_with_audio_path_reconciles_evidence() {
+        let db_path = std::env::temp_dir().join("test_evidence_reconcile.db");
+        let _ = std::fs::remove_file(&db_path);
+
+        let db = Database::open(&db_path).unwrap();
+        db.create_session("s", "Heidi").unwrap();
+        assert!(!db.round_exists_with_audio_path("/tmp/never.wav").unwrap());
+
+        let outcome = db.insert_round_with_session_update(
+            "s",
+            0,
+            "Q",
+            "A",
+            "/tmp/r0.wav",
+            "sha0",
+            4000,
+            16000,
+            1,
+            100,
+            false,
+        );
+        assert!(matches!(outcome, PersistenceOutcome::Committed(_)));
+        assert!(db.round_exists_with_audio_path("/tmp/r0.wav").unwrap());
+        assert!(!db.round_exists_with_audio_path("/tmp/other.wav").unwrap());
 
         let _ = std::fs::remove_file(&db_path);
     }

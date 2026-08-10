@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
+use std::collections::HashMap;
 use std::env;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tauri::Manager;
 use uuid::Uuid;
 
@@ -274,6 +278,17 @@ impl AppPaths {
     pub fn tts_output_path(&self, request_id: Uuid) -> PathBuf {
         self.tts_dir
             .join(format!("{}.wav", uuid_to_path(&request_id)))
+    }
+
+    /// Quarantine directory for ambiguous/unreconciled candidate evidence
+    /// (RC-4). Evidence that cannot be conclusively classified is moved here
+    /// — preserved for review, never destroyed. Startup reconciliation
+    /// reports (but never deletes) its contents.
+    pub fn quarantine_dir(&self) -> PathBuf {
+        self.recordings_dir
+            .parent()
+            .unwrap_or(&self.recordings_dir)
+            .join("quarantine")
     }
 
     /// Build paths from an explicit tool directory (used by tests and the
@@ -679,9 +694,12 @@ fn dev_tools_dir() -> PathBuf {
 // Tauri integration
 // ---------------------------------------------------------------------------
 
-/// Shared state managed by Tauri, holds the resolved `AppPaths`.
+/// Shared state managed by Tauri, holds the resolved `AppPaths` plus a
+/// CACHED runtime-integrity result (RC-6): critical pinned assets are hashed
+/// once (first `get_app_config`), never on every readiness request.
 pub struct PathsState {
     pub paths: AppPaths,
+    pub(crate) integrity: OnceLock<RuntimeIntegrity>,
 }
 
 /// Resolve paths at application startup.
@@ -713,13 +731,150 @@ pub fn resolve_app_paths(app: &tauri::AppHandle) -> Result<PathsState, String> {
     let app_paths =
         AppPaths::resolve_from_input(input).map_err(|e| format!("Path resolution failed: {e}"))?;
     app_paths.ensure_directories()?;
-    Ok(PathsState { paths: app_paths })
+    Ok(PathsState {
+        paths: app_paths,
+        integrity: OnceLock::new(),
+    })
 }
 
 /// Tauri command: return compact config (with readiness) to the frontend.
+/// The runtime-integrity check is computed ONCE and cached (RC-6) — hashing
+/// the multi-hundred-MB model assets on every readiness request is never
+/// acceptable. Tool files are static for the lifetime of an app session, so
+/// a single authoritative verification at first use is correct.
 #[tauri::command]
 pub fn get_app_config(paths: tauri::State<'_, PathsState>) -> AppConfig {
-    paths.paths.to_app_config()
+    let integrity = paths
+        .integrity
+        .get_or_init(|| verify_runtime_integrity(&paths.paths.tool_dir));
+    let mut config = paths.paths.to_app_config();
+    if !integrity.verified {
+        config.readiness.ready = false;
+        config
+            .readiness
+            .issues
+            .extend(integrity.issues.iter().cloned());
+    }
+    config
+}
+
+// ---------------------------------------------------------------------------
+// Runtime asset integrity (RC-6)
+// ---------------------------------------------------------------------------
+
+/// The authoritative tool manifest, embedded at compile time. This is the
+/// SAME manifest packaging/CI verifies (`resources/tool-manifest.json`), so
+/// runtime integrity matches the release policy exactly.
+const TOOL_MANIFEST_JSON: &str = include_str!("../../resources/tool-manifest.json");
+
+#[derive(Deserialize)]
+struct ToolManifest {
+    tools: HashMap<String, ManifestToolEntry>,
+}
+
+#[derive(Deserialize)]
+struct ManifestToolEntry {
+    #[serde(rename = "type")]
+    tool_type: String,
+    sha256: Option<String>,
+    destination: Option<String>,
+}
+
+/// Result of the cached runtime-integrity verification (RC-6).
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeIntegrity {
+    verified: bool,
+    issues: Vec<AppConfigurationIssue>,
+}
+
+/// SHA-256 hex digest of a file.
+pub fn sha256_hex(path: &Path) -> anyhow::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Verify a single file against its expected normalized SHA-256 hex.
+fn verify_file_hash(path: &Path, expected_hex: &str) -> Result<(), String> {
+    let actual =
+        sha256_hex(path).map_err(|e| format!("failed to hash {}: {}", path.display(), e))?;
+    if actual.eq_ignore_ascii_case(expected_hex.trim()) {
+        Ok(())
+    } else {
+        Err(format!(
+            "checksum mismatch for {} (expected {}, got {})",
+            path.display(),
+            expected_hex,
+            actual
+        ))
+    }
+}
+
+/// RC-6: verify critical pinned assets against the authoritative manifest
+/// hashes. Only `type: "file"` entries carry per-file hashes in the
+/// manifest; `type: "archive"` entries hash the archive, not the extracted
+/// contents, so extracted binaries/DLLs remain existence-validated (by
+/// `validate_readiness`) — the manifest does not contain executable hashes
+/// and none are invented here. Missing files are skipped (the existing
+/// missing-asset readiness path reports them); a file that EXISTS but hashes
+/// differently makes integrity fail — a modified/corrupted critical asset
+/// can never report fully ready.
+pub(crate) fn verify_runtime_integrity(tool_dir: &Path) -> RuntimeIntegrity {
+    let mut issues = Vec::new();
+    let manifest: ToolManifest = match serde_json::from_str(TOOL_MANIFEST_JSON) {
+        Ok(m) => m,
+        Err(e) => {
+            // The embedded manifest is part of the binary — a parse failure
+            // is a build integrity problem, reported rather than ignored.
+            issues.push(AppConfigurationIssue {
+                code: "MANIFEST_UNREADABLE".into(),
+                message: format!("Tool manifest could not be parsed: {e}"),
+                expected_path: None,
+            });
+            return RuntimeIntegrity {
+                verified: false,
+                issues,
+            };
+        }
+    };
+
+    for (name, entry) in &manifest.tools {
+        if entry.tool_type != "file" {
+            continue;
+        }
+        let Some(expected) = entry.sha256.as_deref() else {
+            continue;
+        };
+        let Some(destination) = entry.destination.as_deref() else {
+            continue;
+        };
+        let path = tool_dir.join(destination);
+        if !path.is_file() {
+            // Missing assets are reported by validate_readiness with the
+            // existing missing-code behavior — do not duplicate.
+            continue;
+        }
+        if let Err(msg) = verify_file_hash(&path, expected) {
+            issues.push(AppConfigurationIssue {
+                code: format!("{}_INTEGRITY", name.to_uppercase().replace('-', "_")),
+                message: msg,
+                expected_path: Some(path.display().to_string()),
+            });
+        }
+    }
+
+    RuntimeIntegrity {
+        verified: issues.is_empty(),
+        issues,
+    }
 }
 
 #[cfg(test)]
@@ -1525,5 +1680,76 @@ mod tests {
             resolve_tools(&tool6).ready(),
             "complete legacy must be ready"
         );
+    }
+
+    /// RC-6: a file whose hash matches the expected value passes.
+    #[test]
+    fn verify_file_hash_known_good_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("asset.bin");
+        let content = b"known-good-content";
+        fs::write(&path, content).unwrap();
+
+        let expected = format!("{:x}", sha2::Sha256::digest(content));
+        assert!(verify_file_hash(&path, &expected).is_ok());
+    }
+
+    /// RC-6: a one-byte modification flips the hash and fails verification.
+    #[test]
+    fn verify_file_hash_one_byte_change_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("asset.bin");
+        let mut content = b"known-good-content".to_vec();
+        fs::write(&path, &content).unwrap();
+        let expected = format!("{:x}", sha2::Sha256::digest(&content));
+
+        // Flip one byte.
+        content[0] ^= 0xFF;
+        fs::write(&path, &content).unwrap();
+        let result = verify_file_hash(&path, &expected);
+        assert!(result.is_err(), "one-byte change must fail verification");
+        assert!(result.unwrap_err().contains("checksum mismatch"));
+    }
+
+    /// RC-6: a corrupted critical asset (model bytes changed) fails runtime
+    /// integrity — a modified model can never report fully ready.
+    #[test]
+    fn verify_runtime_integrity_detects_corrupt_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("tools");
+        // Empty files cannot match the manifest hashes of the real models.
+        create_canonical_runtime(&tool);
+
+        let integrity = verify_runtime_integrity(&tool);
+        assert!(
+            !integrity.verified,
+            "corrupt assets must fail runtime integrity"
+        );
+        let codes: Vec<&str> = integrity.issues.iter().map(|i| i.code.as_str()).collect();
+        assert!(
+            codes.iter().any(|c| c.contains("PIPER_MODEL_INTEGRITY")),
+            "corrupt piper model must be reported, got {codes:?}"
+        );
+        assert!(
+            codes.iter().any(|c| c.contains("WHISPER_MODEL_INTEGRITY")),
+            "corrupt whisper model must be reported, got {codes:?}"
+        );
+    }
+
+    /// RC-6: missing assets do not produce integrity issues (the existing
+    /// missing-asset readiness path reports them) — integrity only rejects
+    /// assets that EXIST but hash differently.
+    #[test]
+    fn verify_runtime_integrity_missing_assets_are_not_corrupt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("tools");
+        fs::create_dir_all(&tool).unwrap();
+
+        let integrity = verify_runtime_integrity(&tool);
+        assert!(
+            integrity.verified,
+            "an empty tools dir has no corrupt assets — existence handles it"
+        );
+        assert!(integrity.issues.is_empty());
     }
 }

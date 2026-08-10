@@ -40,36 +40,29 @@ pub async fn run_device_check(
     let mut errors = Vec::new();
 
     // INPUT probe — tracked by `completion`. The tracked closure performs the
-    // default-input lookup AND records the test clip, returning the tested
-    // microphone name. A missing default input surfaces as "No microphone
-    // detected"; any other probe failure keeps mic_available true (a mic
-    // exists) while failing mic_test_ok so overall readiness still fails.
+    // default-input lookup AND records the test clip, returning metadata only
+    // (RC-1B): the clip is deleted inside the physical closure before
+    // Finished is signalled, so this Device Check never owns test-file
+    // deletion and an outer abort can never orphan a `device_test_*.wav`. A
+    // missing default input surfaces as "No microphone detected"; any other
+    // probe failure keeps mic_available true (a mic exists) while failing
+    // mic_test_ok so overall readiness still fails.
     let (mic_available, mic_name, mic_test_ok) = match record_test_clip(
         16000,
         1,
         2,
         temp_dir,
         event_tx.clone(),
-        stop_flag,
+        stop_flag.clone(),
         completion,
     )
     .await
     {
-        Ok((path, name)) => {
-            // Check file has reasonable size (at least 1 second of 16kHz 16-bit mono)
-            let metadata = std::fs::metadata(&path);
-            let ok = metadata
-                .as_ref()
-                .map(|m| m.len() > 32000) // ~1 second at 16kHz 16-bit
-                .unwrap_or(false);
-
-            // Clean up test file
-            let _ = std::fs::remove_file(&path);
-
-            if !ok {
+        Ok(probe) => {
+            if !probe.test_ok {
                 errors.push("Microphone test recording too short".to_string());
             }
-            (true, Some(name), ok)
+            (true, Some(probe.device_name), probe.test_ok)
         }
         Err(e) => {
             let msg = format!("Mic test failed: {}", e);
@@ -82,6 +75,21 @@ pub async fn run_device_check(
             (!no_device, None, false)
         }
     };
+
+    // RC-2A: a cancelled Device Check must not schedule new physical work.
+    // Between the sequential input and output probes, observe the owning
+    // command's cancellation so a stop lands promptly and no output stream is
+    // started after the input probe was already cancelled.
+    if stop_flag.load(std::sync::atomic::Ordering::SeqCst) {
+        return DeviceCheckResult {
+            mic_available,
+            mic_name,
+            speaker_available: false,
+            speaker_name: None,
+            mic_test_ok,
+            errors: vec!["Device check cancelled".to_string()],
+        };
+    }
 
     // OUTPUT probe — tracked by `speaker_completion`. The tracked closure
     // performs the default-output lookup AND the production playback smoke,

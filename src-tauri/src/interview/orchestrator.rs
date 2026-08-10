@@ -1,5 +1,5 @@
 use crate::audio::capture::{self, CaptureCompletion, CaptureEvent};
-use crate::audio::pipe::{terminate_child, StderrDrain};
+use crate::audio::pipe::StderrDrain;
 use crate::audio::tts_supervisor::{PiperSupervisor, TtsEvent};
 use crate::paths::uuid_to_path;
 use sha2::Digest;
@@ -48,6 +48,8 @@ pub struct UnpersistedAudio {
     wav_path: std::path::PathBuf,
     owns_wav: bool,
     committed: bool,
+    /// Explicit controlled cleanup succeeded — Drop must not retry.
+    cleaned: bool,
 }
 
 impl UnpersistedAudio {
@@ -59,6 +61,7 @@ impl UnpersistedAudio {
             wav_path,
             owns_wav: true,
             committed: false,
+            cleaned: false,
         }
     }
 
@@ -67,11 +70,49 @@ impl UnpersistedAudio {
     pub fn commit(&mut self) {
         self.committed = true;
     }
+
+    /// Explicit CONTROLLED cleanup (RC-1C) for the conclusive-failure path
+    /// (persistence conclusively absent). Returns Err with the details when
+    /// any owned artifact could not be removed — the guard stays armed, so
+    /// Drop retries best-effort, and startup reconciliation catches whatever
+    /// remains. Success is never reported while a known artifact remains.
+    pub fn cleanup(&mut self) -> Result<(), String> {
+        let mut failures = Vec::new();
+        for path in [
+            self.wav_path.clone(),
+            self.wav_path.with_extension("wav.tmp"),
+        ] {
+            if !path.exists() {
+                continue;
+            }
+            let outcome = crate::cleanup::remove_owned(&path);
+            if outcome.failed() {
+                failures.push(crate::cleanup::describe(&outcome, &path));
+            }
+        }
+        if failures.is_empty() {
+            self.cleaned = true;
+            Ok(())
+        } else {
+            Err(format!(
+                "candidate evidence cleanup failed: {}",
+                failures.join("; ")
+            ))
+        }
+    }
+
+    /// Preserve the WAV in place (ambiguous persistence outcome — RC-4):
+    /// neither committed nor deleted. Drop is disarmed so the evidence
+    /// survives for startup reconciliation.
+    pub fn preserve(&mut self) {
+        self.committed = true;
+        self.cleaned = true;
+    }
 }
 
 impl Drop for UnpersistedAudio {
     fn drop(&mut self) {
-        if !self.committed && self.owns_wav {
+        if !self.committed && !self.cleaned && self.owns_wav {
             let _ = std::fs::remove_file(&self.wav_path);
             // Partial recordings land in a temp file next to the final path.
             let _ = std::fs::remove_file(self.wav_path.with_extension("wav.tmp"));
@@ -140,6 +181,7 @@ pub async fn run_interview_round(
     phase_tx: Option<mpsc::Sender<InterviewPhase>>,
     completion: CaptureCompletion,
     output_completion: CaptureCompletion,
+    process_completion: crate::audio::pipe::ProcessCompletion,
 ) -> anyhow::Result<(AudioMetadata, String, UnpersistedAudio)> {
     let piper = PiperSupervisor::new(paths)?;
 
@@ -159,6 +201,7 @@ pub async fn run_interview_round(
             tts_event_tx.clone(),
             stop_flag.clone(),
             output_completion,
+            process_completion.clone(),
         )
         .await?;
 
@@ -260,7 +303,15 @@ pub async fn run_interview_round(
         .as_ref()
         .map(|tx| tx.try_send(InterviewPhase::Processing));
 
-    let transcription = transcribe_wav(paths, &wav_path, session_id, round_id, stop_flag).await?;
+    let transcription = transcribe_wav(
+        paths,
+        &wav_path,
+        session_id,
+        round_id,
+        stop_flag,
+        process_completion,
+    )
+    .await?;
 
     // NOTE: "complete" is deliberately NOT emitted here. The frontend must
     // only see "complete" after the round is durably persisted, which happens
@@ -288,21 +339,69 @@ pub async fn wait_for_stop(flag: Arc<AtomicBool>) {
     }
 }
 
-/// Read Whisper's transcript and remove the per-round temp output before
-/// propagating either success or failure (including invalid UTF-8).
-fn read_transcript_and_remove(path: &Path) -> std::io::Result<String> {
-    let result = std::fs::read_to_string(path);
-    let _ = std::fs::remove_file(path);
-    result
+/// Invocation-owned Whisper transcript temp file (RC-3). The path is
+/// invocation-unique (`<round>.<invocation>.txt`), so a stale transcript from
+/// a previous crashed invocation or a deterministic legacy `<round>.txt` can
+/// never be read or deleted by this invocation. The guard is armed from
+/// creation and disarmed only after a CONTROLLED deletion is confirmed; Drop
+/// stays as a best-effort fallback and startup reconciliation sweeps any
+/// `.txt` under the session temp dir.
+struct TranscriptTempGuard {
+    path: std::path::PathBuf,
+    armed: bool,
 }
 
-/// Transcribe a WAV file using whisper.cpp — temp output isolated to temp/<session_id>/<round_id>.txt
+impl TranscriptTempGuard {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    /// Controlled deletion (RC-1D): failure is observable, never swallowed.
+    /// On success the guard is disarmed; on failure it stays armed so Drop
+    /// retries and the leftover is reconcilable at startup.
+    fn cleanup(&mut self) -> crate::cleanup::CleanupOutcome {
+        let outcome = crate::cleanup::remove_owned(&self.path);
+        if outcome.succeeded() {
+            self.armed = false;
+        }
+        outcome
+    }
+}
+
+impl Drop for TranscriptTempGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Read Whisper's transcript — ONLY this invocation's unique temp file. The
+/// caller owns cleanup via `TranscriptTempGuard`.
+fn read_transcript(path: &Path) -> std::io::Result<String> {
+    std::fs::read_to_string(path)
+}
+
+/// RC-3: build the invocation-unique Whisper output stem.
+/// `temp/<session>/<round>.<invocation>.txt` — the legacy deterministic
+/// `<round>.txt` is never produced or read by this code.
+fn whisper_output_stem(round_id: Uuid, invocation: Uuid) -> String {
+    format!("{}.{}", uuid_to_path(&round_id), uuid_to_path(&invocation))
+}
+
+/// Transcribe a WAV file using whisper.cpp. The output stem is
+/// INVOCATION-UNIQUE (RC-3): `temp/<session>/<round>.<invocation>` — never a
+/// deterministic shared `temp/<session>/<round>.txt` — so a retry, a stale
+/// file from a crashed run, or a concurrently-created transcript can never be
+/// read or deleted by a different invocation. Only the transcription text is
+/// persisted; the temp file needs no stable name.
 async fn transcribe_wav(
     paths: &crate::paths::AppPaths,
     wav_path: &std::path::Path,
     session_id: Uuid,
     round_id: Uuid,
     stop_flag: Arc<AtomicBool>,
+    process_completion: crate::audio::pipe::ProcessCompletion,
 ) -> anyhow::Result<String> {
     use std::process::Stdio;
 
@@ -323,10 +422,19 @@ async fn transcribe_wav(
 
     let output_dir = paths.temp_dir.join(session_id.hyphenated().to_string());
     std::fs::create_dir_all(&output_dir)?;
-    let stem = uuid_to_path(&round_id);
+    // RC-3: unique stem per invocation — `<round>.<invocation>`. The legacy
+    // deterministic `<round>.txt` is never produced or read by this code.
+    let invocation = uuid::Uuid::new_v4();
+    let stem = whisper_output_stem(round_id, invocation);
     let txt_path = output_dir.join(format!("{}.txt", stem));
+    // Owns THIS invocation's transcript from here: armed until deletion is
+    // confirmed (RC-1D/RC-3).
+    let mut transcript_guard = TranscriptTempGuard::new(txt_path.clone());
 
-    let mut child = tokio::process::Command::new(&whisper_bin)
+    // RC-2B: mark Running BEFORE spawn (no await in between) so a force-abort
+    // can never resolve ownership while the Whisper child may be alive.
+    process_completion.mark_running();
+    let child = match tokio::process::Command::new(&whisper_bin)
         .arg("--model")
         .arg(&model_path)
         .arg("--file")
@@ -342,9 +450,22 @@ async fn transcribe_wav(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .spawn()?;
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            // Spawn failed — nothing was ever alive to reap.
+            process_completion.signal_reaped();
+            return Err(anyhow::anyhow!("Failed to start Whisper: {}", e));
+        }
+    };
+    // The child's kill+wait lifecycle is RAII-owned (RC-2B): on every exit
+    // path — including force-abort — the child is reaped before the
+    // completion signals Reaped.
+    let mut proc_guard =
+        crate::audio::pipe::ChildProcessGuard::new(child, process_completion.clone());
 
-    let stderr_drain = child.stderr.take().map(StderrDrain::start);
+    let stderr_drain = proc_guard.child_mut().stderr.take().map(StderrDrain::start);
 
     let deadline =
         tokio::time::Instant::now() + tokio::time::Duration::from_secs(WHISPER_TIMEOUT_SECS);
@@ -352,17 +473,15 @@ async fn transcribe_wav(
     let wait_result = tokio::select! {
         biased;
 
-        result = child.wait() => result,
+        result = proc_guard.child_mut().wait() => result,
         _ = wait_for_stop(stop_flag) => {
-            terminate_child(&mut child).await;
-            let _ = std::fs::remove_file(&txt_path);
-            anyhow::bail!("Whisper cancelled — process killed, temp cleaned");
+            proc_guard.terminate().await;
+            anyhow::bail!("Whisper cancelled — process killed");
         }
         _ = tokio::time::sleep_until(deadline) => {
-            terminate_child(&mut child).await;
-            let _ = std::fs::remove_file(&txt_path);
+            proc_guard.terminate().await;
             anyhow::bail!(
-                "Whisper timed out after {}s — process killed, temp cleaned",
+                "Whisper timed out after {}s — process killed",
                 WHISPER_TIMEOUT_SECS
             );
         }
@@ -374,14 +493,15 @@ async fn transcribe_wav(
             // Child state is uncertain after a wait error — terminate and
             // reap explicitly before propagating (P2-2); kill_on_drop stays
             // only as defense-in-depth.
-            terminate_child(&mut child).await;
-            let _ = std::fs::remove_file(&txt_path);
+            proc_guard.terminate().await;
             anyhow::bail!("Whisper wait error: {}", e);
         }
     };
+    // The child exited and was waited — conclusively reaped (RC-2B).
+    proc_guard.mark_reaped();
     if !status.success() {
-        // Non-zero exit — remove the partial transcript and surface stderr.
-        let _ = std::fs::remove_file(&txt_path);
+        // Non-zero exit — surface stderr. The transcript guard cleans this
+        // invocation's temp on drop.
         let stderr_text = match &stderr_drain {
             Some(d) => d.text().await,
             None => String::new(),
@@ -393,28 +513,141 @@ async fn transcribe_wav(
         );
     }
 
-    let text = read_transcript_and_remove(&txt_path)?;
-
-    Ok(text.trim().to_string())
+    // Read ONLY this invocation's file. On success OR failure (e.g. invalid
+    // UTF-8) the temp is cleaned up with controlled semantics (RC-1D); a
+    // cleanup failure is observable and reconcilable, never swallowed.
+    let read_result = read_transcript(&txt_path);
+    match read_result {
+        Ok(text) => {
+            let outcome = transcript_guard.cleanup();
+            if outcome.failed() {
+                eprintln!(
+                    "[transcribe] transcript cleanup failed: {}",
+                    crate::cleanup::describe(&outcome, &txt_path)
+                );
+            }
+            Ok(text.trim().to_string())
+        }
+        Err(e) => {
+            let outcome = transcript_guard.cleanup();
+            if outcome.failed() {
+                eprintln!(
+                    "[transcribe] transcript cleanup failed: {}",
+                    crate::cleanup::describe(&outcome, &txt_path)
+                );
+            }
+            Err(anyhow::anyhow!("Failed to read transcript: {}", e))
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// RC-3: two invocations for the same logical round get DIFFERENT output
+    /// stems — a retry can never share a transcript path with a previous
+    /// invocation, and the legacy deterministic `<round>.txt` is never the
+    /// active output.
     #[test]
-    fn transcript_read_failure_still_removes_temp_file() {
+    fn whisper_output_stem_is_invocation_unique() {
+        let round_id = uuid::Uuid::new_v4();
+        let invocation_a = uuid::Uuid::new_v4();
+        let invocation_b = uuid::Uuid::new_v4();
+
+        let stem_a = whisper_output_stem(round_id, invocation_a);
+        let stem_b = whisper_output_stem(round_id, invocation_b);
+        assert_ne!(stem_a, stem_b, "invocations must not share a stem");
+
+        // The active path is `<round>.<invocation>.txt` — never the legacy
+        // deterministic `<round>.txt`.
+        assert_ne!(
+            format!("{}.txt", stem_a),
+            format!("{}.txt", uuid_to_path(&round_id)),
+            "the deterministic legacy path must never be the active output"
+        );
+        assert!(
+            stem_a.starts_with(&format!("{}.", uuid_to_path(&round_id))),
+            "the stem must carry the round identity as a prefix"
+        );
+    }
+
+    /// RC-3: a stale legacy deterministic `<round>.txt` (from a previous
+    /// crashed invocation) is never the path a new invocation reads — the
+    /// new invocation reads only its own unique file.
+    #[test]
+    fn stale_legacy_transcript_cannot_be_consumed() {
         let dir = tempfile::tempdir().unwrap();
-        let transcript = dir.path().join("round.txt");
+        let round_id = uuid::Uuid::new_v4();
+        let invocation = uuid::Uuid::new_v4();
+
+        // Pre-create the legacy deterministic path with stale content.
+        let legacy = dir.path().join(format!("{}.txt", uuid_to_path(&round_id)));
+        std::fs::write(&legacy, b"STALE TRANSCRIPT THAT MUST NEVER BE READ").unwrap();
+
+        // The invocation reads its own unique path — the stale legacy file is
+        // untouched and never read.
+        let own = dir
+            .path()
+            .join(format!("{}.txt", whisper_output_stem(round_id, invocation)));
+        assert_ne!(legacy, own);
+        std::fs::write(&own, b"fresh").unwrap();
+        assert_eq!(read_transcript(&own).unwrap(), "fresh");
+        // The stale file is still exactly as it was — never read, never
+        // deleted by this invocation.
+        assert_eq!(
+            std::fs::read(&legacy).unwrap(),
+            b"STALE TRANSCRIPT THAT MUST NEVER BE READ"
+        );
+    }
+
+    /// RC-1D/RC-3: an invalid-UTF-8 transcript read fails AND the owned temp
+    /// is still cleaned up with controlled semantics.
+    #[test]
+    fn transcript_read_failure_still_cleans_up_owned_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("round.inv.txt");
         std::fs::write(&transcript, [0xff, 0xfe, 0xfd]).unwrap();
 
-        let result = read_transcript_and_remove(&transcript);
-
+        let result = read_transcript(&transcript);
         assert!(result.is_err(), "invalid UTF-8 must fail transcription");
+
+        let mut guard = TranscriptTempGuard::new(transcript.clone());
+        let outcome = guard.cleanup();
+        assert!(outcome.succeeded(), "controlled cleanup must succeed");
         assert!(
             !transcript.exists(),
             "failed transcript reads must not leave temp output behind"
         );
+    }
+
+    /// RC-1D: a TranscriptTempGuard is disarmed only after a CONFIRMED
+    /// deletion — a failed removal keeps it armed so Drop retries.
+    #[test]
+    fn transcript_temp_guard_disarms_only_after_confirmed_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("round.inv.txt");
+        std::fs::write(&transcript, b"x").unwrap();
+
+        // Successful removal -> disarmed -> Drop does nothing.
+        {
+            let mut guard = TranscriptTempGuard::new(transcript.clone());
+            assert!(guard.cleanup().succeeded());
+            drop(guard);
+        }
+        assert!(!transcript.exists());
+
+        // Unremovable target (a directory) -> cleanup fails -> guard stays
+        // armed -> Drop retries (still fails, but the failure path exists and
+        // the leftover is reconcilable at startup).
+        let target = dir.path().join("a-directory");
+        std::fs::create_dir_all(&target).unwrap();
+        {
+            let mut guard = TranscriptTempGuard::new(target.clone());
+            let outcome = guard.cleanup();
+            assert!(outcome.failed(), "unremovable target must report failure");
+            drop(guard); // Drop retries best-effort
+        }
     }
 
     /// A WAV left uncommitted (round failed before persistence) must be
@@ -437,6 +670,67 @@ mod tests {
 
         assert!(!wav.exists(), "uncommitted WAV must be deleted");
         assert!(!tmp.exists(), "partial temp WAV must be deleted");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RC-1C: explicit controlled cleanup removes the WAV and temp, and its
+    /// result is observable — success is never claimed while an artifact may
+    /// remain; a failed removal keeps the guard armed so Drop retries.
+    #[test]
+    fn unpersisted_audio_explicit_cleanup_result_is_observable() {
+        let dir = std::env::temp_dir().join("unpersisted_audio_cleanup_result_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let wav = dir.join("round.wav");
+        let tmp = dir.join("round.wav.tmp");
+        std::fs::write(&wav, b"audio").unwrap();
+        std::fs::write(&tmp, b"partial").unwrap();
+
+        {
+            let mut unpersisted = UnpersistedAudio::new(wav.clone());
+            assert!(unpersisted.cleanup().is_ok(), "cleanup must succeed");
+            drop(unpersisted);
+        }
+        assert!(!wav.exists(), "explicit cleanup must remove the WAV");
+        assert!(!tmp.exists(), "explicit cleanup must remove the temp");
+
+        // Failure path: an unremovable target (a directory) reports Err; the
+        // guard stays armed and Drop retries best-effort.
+        let target = dir.join("a-directory");
+        std::fs::create_dir_all(&target).unwrap();
+        {
+            let mut unpersisted = UnpersistedAudio::new(target.clone());
+            assert!(
+                unpersisted.cleanup().is_err(),
+                "unremovable target must report a cleanup failure"
+            );
+            drop(unpersisted); // Drop retries best-effort (still fails)
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RC-4: preserve() disarms deletion — ambiguous-persistence evidence is
+    /// never deleted based on an unverified assumption.
+    #[test]
+    fn unpersisted_audio_preserve_never_deletes() {
+        let dir = std::env::temp_dir().join("unpersisted_audio_preserve_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let wav = dir.join("round.wav");
+        std::fs::write(&wav, b"audio").unwrap();
+
+        {
+            let mut unpersisted = UnpersistedAudio::new(wav.clone());
+            unpersisted.preserve();
+        }
+        assert!(
+            wav.exists(),
+            "preserved evidence must never be deleted, even on drop"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -534,10 +534,8 @@ pub async fn record_to_wav(
 
         let duration_ms = (total_frames * 1000) / sr as u64;
         let file_size_bytes = std::fs::metadata(&output_path)?.len();
-        // Fully committed — the final WAV must be preserved.
-        cleanup.commit();
 
-        // RC-1: when the caller does not retain the output (audio test), the
+        // RC-1A: when the caller does not retain the output (audio test), the
         // final WAV is removed HERE, inside the physical capture closure,
         // before it signals Finished. The size was already captured above, so
         // the returned RecordResult stays accurate. This is the ONLY cleanup
@@ -545,9 +543,28 @@ pub async fn record_to_wav(
         // closure always runs to completion, and Finished is signalled only
         // after the artifact is gone — the slot owner never sees Finished
         // while a test WAV could still exist.
+        //
+        // The removal is a CONTROLLED cleanup (RC-1): failure is surfaced, not
+        // swallowed. On failure the guard is NOT committed, so its Drop
+        // retries the removal best-effort, and the closure returns Err — the
+        // caller can never report "nothing saved" while the WAV may still
+        // exist. Startup reconciliation additionally sweeps `audio_test_*`
+        // leftovers.
         if !retain_output {
-            let _ = std::fs::remove_file(&output_path);
+            match crate::cleanup::remove_owned(&output_path) {
+                crate::cleanup::CleanupOutcome::Removed
+                | crate::cleanup::CleanupOutcome::AlreadyAbsent => {}
+                outcome => {
+                    return Err(anyhow::anyhow!(
+                        "Audio test failed to remove its recording: {}",
+                        crate::cleanup::describe(&outcome, &output_path)
+                    ));
+                }
+            }
         }
+        // Fully committed — the final WAV must be preserved (retained) or is
+        // already confirmed gone (audio test).
+        cleanup.commit();
 
         let _ = event_tx.try_send(CaptureEvent::Stopped {
             file_path: output_path.to_string_lossy().to_string(),
@@ -559,34 +576,6 @@ pub async fn record_to_wav(
             duration_ms,
             file_size_bytes,
         })
-    })
-    .await?
-}
-
-/// List available audio input devices
-pub async fn list_input_devices() -> anyhow::Result<Vec<String>> {
-    tokio::task::spawn_blocking(|| {
-        use cpal::traits::{DeviceTrait, HostTrait};
-        let host = cpal::default_host();
-        let devices = host
-            .input_devices()?
-            .filter_map(|d| d.name().ok().map(|n| n.to_string()))
-            .collect();
-        Ok(devices)
-    })
-    .await?
-}
-
-/// List available audio output devices
-pub async fn list_output_devices() -> anyhow::Result<Vec<String>> {
-    tokio::task::spawn_blocking(|| {
-        use cpal::traits::{DeviceTrait, HostTrait};
-        let host = cpal::default_host();
-        let devices = host
-            .output_devices()?
-            .filter_map(|d| d.name().ok().map(|n| n.to_string()))
-            .collect();
-        Ok(devices)
     })
     .await?
 }
@@ -747,8 +736,25 @@ pub async fn validate_production_playback_stream(
     .await?
 }
 
+/// Result of a microphone probe (RC-1B). The device-test clip is deleted
+/// INSIDE the tracked physical closure before it signals Finished — the
+/// caller never receives a path and never owns test-file deletion, so an
+/// abort of the outer Device Check cannot orphan a `device_test_*.wav`.
+#[derive(Debug, Clone)]
+pub struct MicProbeResult {
+    pub device_name: String,
+    pub captured_bytes: u64,
+    pub duration_ms: u64,
+    pub test_ok: bool,
+}
+
+/// Minimum bytes for a usable device-test clip (~1s of 16 kHz 16-bit mono).
+/// A shorter clip fails the probe (the file is still deleted in-closure).
+const MIN_DEVICE_CLIP_BYTES: u64 = 32000;
+
 /// Record a short audio clip for device verification (3 seconds max).
-/// Returns the path to the recorded temp file.
+/// Returns metadata only — the test clip itself is removed inside the
+/// physical closure, before `Finished` is signalled (RC-1B).
 /// The capture polling loop enforces a deadline (duration + 2s) so the check
 /// terminates instead of looping forever if the stream delivers no frames.
 /// If a native device call itself blocks before the loop (`default_input_device()`,
@@ -762,7 +768,7 @@ pub async fn record_test_clip(
     event_tx: mpsc::Sender<CaptureEvent>,
     stop_flag: Arc<AtomicBool>,
     completion: CaptureCompletion,
-) -> anyhow::Result<(PathBuf, String)> {
+) -> anyhow::Result<MicProbeResult> {
     // P2-1: UUID-based name so concurrent device checks can never target the
     // same path (a PID alone is not unique across concurrent checks).
     let tmp_path = temp_dir.join(format!("device_test_{}.wav", uuid::Uuid::new_v4()));
@@ -776,7 +782,7 @@ pub async fn record_test_clip(
     // enumeration worker.
     completion.mark_scheduled();
 
-    let device_name = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+    let probe_result = tokio::task::spawn_blocking(move || -> anyhow::Result<MicProbeResult> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
         // P1-1: signal the physical capture lifecycle on every exit path.
@@ -884,8 +890,43 @@ pub async fn record_test_clip(
             );
         }
         writer.finalize()?;
-        // The clip is fully written — hand ownership to the caller (which
-        // validates the size and removes the file itself).
+
+        // RC-1B: validate size AND delete the test clip INSIDE this physical
+        // closure, before Finished is signalled — the caller never owns
+        // test-file deletion. A stat failure still unwinds with the armed
+        // guard, so the file is removed on drop; a too-short clip is a failed
+        // test, not evidence. Deletion failure is surfaced (never swallowed),
+        // and the guard stays armed (not committed) so its Drop retries.
+        let metadata = match std::fs::metadata(&path_clone) {
+            Ok(m) => m,
+            Err(e) => {
+                return Err(anyhow::anyhow!("failed to stat device test clip: {}", e));
+            }
+        };
+        let captured_bytes = metadata.len();
+        if captured_bytes < 100 {
+            let outcome = crate::cleanup::remove_owned(&path_clone);
+            if outcome.failed() {
+                return Err(anyhow::anyhow!(
+                    "failed to remove device test clip: {}",
+                    crate::cleanup::describe(&outcome, &path_clone)
+                ));
+            }
+            cleanup.commit();
+            anyhow::bail!("Test clip too short ({} bytes)", captured_bytes);
+        }
+
+        match crate::cleanup::remove_owned(&path_clone) {
+            crate::cleanup::CleanupOutcome::Removed
+            | crate::cleanup::CleanupOutcome::AlreadyAbsent => {}
+            outcome => {
+                return Err(anyhow::anyhow!(
+                    "failed to remove device test clip: {}",
+                    crate::cleanup::describe(&outcome, &path_clone)
+                ));
+            }
+        }
+        // Removal confirmed — the guard no longer owns anything.
         cleanup.commit();
 
         let duration_ms = (total_frames * 1000) / sample_rate as u64;
@@ -894,19 +935,16 @@ pub async fn record_test_clip(
             duration_ms,
         });
 
-        Ok(device_name)
+        Ok(MicProbeResult {
+            device_name,
+            captured_bytes,
+            duration_ms,
+            test_ok: captured_bytes >= MIN_DEVICE_CLIP_BYTES,
+        })
     })
     .await??;
 
-    // Verify the file was created and has content. A too-short clip is a
-    // failed test, not evidence: delete the file so nothing is left behind.
-    let metadata = std::fs::metadata(&tmp_path)?;
-    if metadata.len() < 100 {
-        let _ = std::fs::remove_file(&tmp_path);
-        anyhow::bail!("Test clip too short ({} bytes)", metadata.len());
-    }
-
-    Ok((tmp_path, device_name))
+    Ok(probe_result)
 }
 
 #[cfg(test)]
@@ -1154,11 +1192,12 @@ mod tests {
         );
     }
 
-    /// RC-3: on EVERY outcome (success or error — including device lookup /
-    /// stream build / play / timeout failures) the device-test call leaves no
-    /// stray `device_test_*.wav` behind: the RAII guard removes this
-    /// invocation's file on all failure paths, and the caller removes it on
-    /// success.
+    /// RC-1B/RC-3: on EVERY outcome (success or error — including device
+    /// lookup / stream build / play / timeout failures) the device-test call
+    /// leaves no stray `device_test_*.wav` behind: deletion runs INSIDE the
+    /// tracked physical closure (before Finished is signalled), the RAII
+    /// guard removes this invocation's file on failure paths, and the caller
+    /// never owns test-file deletion.
     #[tokio::test]
     async fn record_test_clip_leaves_no_stray_wav_after_outcome() {
         let dir = tempfile::tempdir().unwrap();
@@ -1174,9 +1213,13 @@ mod tests {
         )
         .await;
 
-        if let Ok((path, _name)) = result {
-            assert!(path.exists(), "successful clip must exist for the caller");
-            let _ = std::fs::remove_file(&path);
+        // The caller receives metadata only — never a path. On success the
+        // clip is already gone.
+        if let Ok(probe) = result {
+            assert!(
+                !probe.device_name.is_empty(),
+                "probe must report the tested device name"
+            );
         }
         let leftovers: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()

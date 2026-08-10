@@ -131,26 +131,32 @@ export default function InterviewPage() {
   // never in the URL). The interview then continues THAT session instead of
   // creating a second, orphan one (P1-1).
   //
-  // RC-4 (hydration safety): the query string is NOT read during render. The
-  // initial state is identical for the server/static render and the first
-  // client render (sessionId = null, sessionInitState = "idle"); a mount
-  // effect resolves the query param afterwards and transitions to "verifying"
-  // (handoff) or assigns a fresh UUID (direct /interview). The server-rendered
-  // tree therefore always equals the first client-rendered tree for both
-  // /interview and /interview?session=<uuid>. Nothing derived from the session
-  // is rendered, so the one-tick null window is invisible.
+  // RC-4/RC-7 (hydration safety + explicit resolution): the query string is
+  // NOT read during render. The initial state is identical for the
+  // server/static render and the first client render
+  // (sessionId = null, sessionInitState = "resolving"), so the server tree
+  // always equals the first client tree for both /interview and
+  // /interview?session=<uuid>. A mount effect resolves the query param
+  // afterwards: a handoff transitions to "verifying", a direct /interview
+  // assigns a fresh UUID and transitions to "idle". While "resolving", NO
+  // session-sensitive control (device check, round start) is rendered — a
+  // handed-off session can never briefly behave as a new/direct session
+  // before its identity is verified.
   const [sessionId, setSessionId] = useState<string | null>(null);
   const sessionIdRef = useRef<string | null>(null);
   const [candidateName] = useState("Candidate");
 
   // Backend-authoritative session lifecycle: tracks whether create_session
-  // has been called and whether the session is ready for round execution. A
-  // handed-off session was already created by the Dashboard, so it enters
-  // VERIFYING (P2-1) once the query param is resolved: the backend is asked
-  // whether the session exists and is incomplete BEFORE any round flow.
-  // create_session is never called for a handed-off session;
-  // invalid/missing/completed handoffs never reach the round invoke.
+  // has been called and whether the session is ready for round execution.
+  // "resolving" is the explicit pre-resolution state (RC-7): the query
+  // param has not yet been read after hydration. A handed-off session was
+  // already created by the Dashboard, so it enters VERIFYING (P2-1) once the
+  // query param is resolved: the backend is asked whether the session exists
+  // and is incomplete BEFORE any round flow. create_session is never called
+  // for a handed-off session; invalid/missing/completed handoffs never reach
+  // the round invoke.
   type SessionInitState =
+    | "resolving"
     | "idle"
     | "creating"
     | "verifying"
@@ -158,14 +164,16 @@ export default function InterviewPage() {
     | "error"
     | "completed";
   const [sessionInitState, setSessionInitState] =
-    useState<SessionInitState>("idle");
+    useState<SessionInitState>("resolving");
 
-  // RC-4: resolve the handoff query parameter exactly once, after hydration.
-  // Runs only on the client after mount, so the first client render stays
-  // identical to the server/static render. The update is deferred out of the
-  // synchronous effect body (react-hooks/set-state-in-effect): the query
-  // string is static for the page lifetime, so a single deferred flush is
-  // enough.
+  // RC-4/RC-7: resolve the handoff query parameter exactly once, after
+  // hydration. Runs only on the client after mount, so the first client
+  // render stays identical to the server/static render. The update is
+  // deferred out of the synchronous effect body
+  // (react-hooks/set-state-in-effect): the query string is static for the
+  // page lifetime, so a single deferred flush is enough. Until this runs the
+  // page is in the explicit "resolving" state and no session-sensitive
+  // control is rendered.
   useEffect(() => {
     const param = new URLSearchParams(window.location.search).get("session");
     const timer = window.setTimeout(() => {
@@ -174,6 +182,7 @@ export default function InterviewPage() {
         setSessionInitState("verifying");
       } else {
         setSessionId(crypto.randomUUID());
+        setSessionInitState("idle");
       }
     }, 0);
     return () => window.clearTimeout(timer);
@@ -395,8 +404,11 @@ export default function InterviewPage() {
     // Prevent concurrent double-starts while session creation or round startup
     if (isStartingRound.current) return;
     // Never execute a round while session initialization is pending, being
-    // verified, or failed (P2-1: a handed-off session must be verified first).
+    // resolved, verified, or failed (P2-1/RC-7: a handed-off session must be
+    // verified first, and nothing may start while the session identity is
+    // still resolving).
     if (
+      sessionInitState === "resolving" ||
       sessionInitState === "creating" ||
       sessionInitState === "verifying" ||
       sessionInitState === "error" ||

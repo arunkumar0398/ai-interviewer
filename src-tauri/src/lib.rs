@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod cleanup;
 pub mod db;
 pub mod interview;
 pub mod paths;
@@ -68,6 +69,11 @@ struct RecordingGuard<T: Send + 'static> {
     /// output task can outlive the outer worker — so the slot must stay
     /// occupied until BOTH completions are resolved.
     output_completion: audio::capture::CaptureCompletion,
+    /// Native child-process lifecycle signal (RC-2B): Piper/Whisper children
+    /// are marked Running before spawn and Reaped only after kill + wait, so
+    /// a force-abort can never resolve slot ownership while a child may be
+    /// alive.
+    process_completion: audio::pipe::ProcessCompletion,
     worker: Option<tokio::task::JoinHandle<T>>,
     armed: std::sync::atomic::AtomicBool,
     /// Drop-safety-net cooperative grace. Tests shrink this to exercise the
@@ -82,6 +88,7 @@ impl<T: Send + 'static> RecordingGuard<T> {
             stop,
             completion: audio::capture::CaptureCompletion::new(),
             output_completion: audio::capture::CaptureCompletion::new(),
+            process_completion: audio::pipe::ProcessCompletion::default(),
             worker: None,
             armed: std::sync::atomic::AtomicBool::new(true),
             drop_grace: std::time::Duration::from_secs(RECORDING_DROP_GRACE_SECS),
@@ -99,6 +106,12 @@ impl<T: Send + 'static> RecordingGuard<T> {
     /// report termination of its real output stream.
     fn output_completion(&self) -> audio::capture::CaptureCompletion {
         self.output_completion.clone()
+    }
+
+    /// Clone of the native child-process lifecycle signal (RC-2B), handed to
+    /// the interview worker so Piper/Whisper can report kill+wait completion.
+    fn process_completion(&self) -> audio::pipe::ProcessCompletion {
+        self.process_completion.clone()
     }
 
     /// Give the guard ownership of the spawned worker so a dropped command
@@ -182,95 +195,85 @@ impl<T: Send + 'static> Drop for RecordingGuard<T> {
             let state = self.state.clone();
             let completion = self.completion.clone();
             let output_completion = self.output_completion.clone();
+            let process_completion = self.process_completion.clone();
             let grace = self.drop_grace;
             // Spawn on the runtime; this runs even on panic. The slot is
             // cleared ONLY after the worker's lifecycle is resolved AND every
             // physical worker the operation may have started has terminated:
-            // the microphone capture (input probe) AND the speaker probe
-            // (output probe, RC-2). A device check starts a real output
-            // stream; aborting the outer async wrapper cannot kill an
-            // already-submitted spawn_blocking closure, so the slot stays
-            // occupied until EACH Scheduled-but-not-Finished completion
-            // signals termination:
+            // the microphone capture (input probe), the speaker probe
+            // (output probe, RC-2), and any native child process (Piper /
+            // Whisper, RC-2B).
+            //
+            // Order (RC-2A):
             //  1. stop flag set;
-            //  2. bounded cooperative grace for the scheduled blocking
-            //     workers to observe stop and exit normally;
+            //  2. bounded cooperative grace across the CURRENTLY scheduled
+            //     physical workers (advisory initial snapshot);
             //  3. if the grace expires, force-abort the outer wrapper
-            //     (best effort — aborting an async task cannot kill an
-            //     already-running spawn_blocking closure) and await it;
-            //  4. the slot STAYS occupied until every scheduled blocking
-            //     worker signals termination — overlapping physical
-            //     capture/playback is never allowed, so a stuck native
-            //     audio worker keeps the slot reserved (RC-3).
-            // A worker that never scheduled anything (e.g. aborted during
-            // TTS) has nothing to wait for and is simply aborted/awaited.
+            //     (aborting an async task cannot kill an already-submitted
+            //     spawn_blocking closure) and await it so the outer
+            //     scheduler is DEFINITIVELY dead; otherwise await the outer
+            //     wrapper normally;
+            //  4. AUTHORITATIVE POST-ABORT RESCAN: re-read EVERY physical
+            //     lifecycle tracker and wait out any still Scheduled —
+            //     including one that became Scheduled after the initial
+            //     snapshot (e.g. the device check's output probe scheduled
+            //     at the input probe's grace boundary). The pre-abort
+            //     snapshot is NOT authoritative;
+            //  5. wait any Running native child to be Reaped (the aborted
+            //     task's own RAII guard spawns the kill+wait task);
+            //  6. ONLY THEN clear the slot.
             tokio::runtime::Handle::current().spawn(async move {
                 if let Some(handle) = worker.as_ref() {
-                    // Every physical worker that is Scheduled but not
-                    // Finished must be waited out before the slot frees.
-                    let pending: Vec<audio::capture::CaptureCompletion> = {
-                        let mut v = Vec::new();
-                        if completion.scheduled() {
-                            v.push(completion.clone());
-                        }
-                        if output_completion.scheduled() {
-                            v.push(output_completion.clone());
-                        }
-                        v
-                    };
-
-                    if !pending.is_empty() {
-                        // Bounded cooperative grace across all scheduled
-                        // workers.
-                        let mut grace_expired = false;
-                        for c in &pending {
+                    // 2. Bounded cooperative grace across the currently
+                    // scheduled physical workers.
+                    let mut any_scheduled = false;
+                    let mut grace_expired = false;
+                    for c in [&completion, &output_completion] {
+                        if c.scheduled() {
+                            any_scheduled = true;
                             if tokio::time::timeout(grace, c.wait()).await.is_err() {
                                 grace_expired = true;
                             }
                         }
-                        if grace_expired {
-                            // Force-abort the outer wrapper (cannot kill the
-                            // blocking closures), await it, then wait out
-                            // EVERY real worker — overlapping physical
-                            // capture/playback is never allowed (RC-2/RC-3).
-                            handle.abort();
-                            if let Some(h) = worker {
-                                let _ = h.await;
-                            }
-                            for c in &pending {
-                                c.wait().await;
-                            }
-                        } else {
-                            // All physical workers finished within the
-                            // grace. Resolve the OUTER wrapper too (RC-7):
-                            // the slot clears only after both the physical
-                            // workers and the owned outer JoinHandle are
-                            // fully resolved.
-                            if let Some(h) = worker {
-                                let _ = h.await;
-                            }
-                        }
-                    } else {
-                        // Nothing scheduled yet. The outer wrapper is the
-                        // whole lifecycle so far: abort and await it. But the
-                        // worker may have raced to submit spawn_blocking
-                        // between our state read and the abort landing — the
-                        // submission is synchronous, so an abort cannot stop
-                        // it. Re-check AFTER the outer worker is confirmed
-                        // dead (its JoinHandle resolved): a worker that
-                        // became Scheduled in the meantime must be waited
-                        // out before the slot is freed.
+                    }
+                    if !any_scheduled || grace_expired {
+                        // 3a. Nothing was scheduled (the outer wrapper is the
+                        // whole lifecycle so far) or the grace expired:
+                        // force-abort the outer wrapper (aborting an async
+                        // task cannot kill the blocking closures), then await
+                        // it so the outer scheduler is confirmed dead.
                         handle.abort();
                         if let Some(h) = worker {
                             let _ = h.await;
                         }
-                        for c in [&completion, &output_completion] {
-                            if c.scheduled() {
-                                c.wait().await;
-                            }
+                    } else {
+                        // 3b. All scheduled workers finished within the
+                        // grace — resolve the OUTER wrapper too: the slot
+                        // clears only after the outer JoinHandle is fully
+                        // resolved.
+                        if let Some(h) = worker {
+                            let _ = h.await;
                         }
                     }
+                    // 4. AUTHORITATIVE post-abort rescan (RC-2A): the outer
+                    // scheduler is dead, so the lifecycle-tracker set is now
+                    // static. Re-read EVERY physical worker and wait out any
+                    // still Scheduled — a worker that became Scheduled after
+                    // the initial snapshot must keep the slot occupied.
+                    for c in [&completion, &output_completion] {
+                        if c.scheduled() {
+                            c.wait().await;
+                        }
+                    }
+                    // 5. Native child processes (RC-2B): a child that was
+                    // Running when the outer worker died is killed + waited
+                    // by the detached task spawned from the aborted task's
+                    // own RAII guard; the slot is not released until Reaped.
+                    if process_completion.running() {
+                        process_completion.wait().await;
+                    }
                 }
+                // 6. Only now is the shared audio slot released.
                 clear_active_recording(&state).await;
             });
         }
@@ -391,13 +394,6 @@ async fn generate_tts(
     .map_err(|_| "TTS generation timed out".to_string())?
     .map_err(|e| e.to_string())?;
     Ok(output_path.to_string_lossy().to_string())
-}
-
-#[tauri::command]
-async fn list_audio_devices() -> Result<Vec<String>, String> {
-    audio::capture::list_input_devices()
-        .await
-        .map_err(|e| e.to_string())
 }
 
 // --- Phase 2 Commands ---
@@ -701,6 +697,7 @@ async fn run_interview_round(
     let question_clone = question.clone();
     let completion = recording_guard.completion();
     let output_completion = recording_guard.output_completion();
+    let process_completion = recording_guard.process_completion();
     let worker = tokio::spawn(async move {
         interview::orchestrator::run_interview_round(
             &question_clone,
@@ -713,6 +710,7 @@ async fn run_interview_round(
             Some(phase_tx),
             completion,
             output_completion,
+            process_completion,
         )
         .await
     });
@@ -759,7 +757,7 @@ async fn run_interview_round(
                 // total_rounds increment + completed_at (when final) commit
                 // in ONE transaction. The WAV stays provisional (evidence
                 // armed) until this COMMIT succeeds.
-                let persist_result: Result<i64, String> = (async {
+                let persist_outcome = {
                     let guard = db_state.db.lock().await;
                     let db = guard
                         .as_ref()
@@ -777,19 +775,10 @@ async fn run_interview_round(
                         metadata.file_size_bytes,
                         is_final,
                     )
-                    .map_err(|e| {
-                        let msg = e.to_string();
-                        if msg.contains("UNIQUE constraint failed") {
-                            format!("Round {} already exists for this session", round_index + 1)
-                        } else {
-                            format!("Failed to persist round: {}", e)
-                        }
-                    })
-                })
-                .await;
+                };
 
-                match persist_result {
-                    Ok(_) => {
+                match persist_outcome {
+                    db::PersistenceOutcome::Committed(_) => {
                         // Durable: disarm the evidence guard (WAV retained)
                         // and only NOW emit "complete" — it means the round
                         // is durably persisted.
@@ -807,20 +796,60 @@ async fn run_interview_round(
                             transcription,
                         })
                     }
-                    Err(e) => {
-                        // Persistence failed — evidence is still armed and
-                        // drops at the end of this arm, deleting the WAV
-                        // and any partial temp file. "complete" is NEVER
-                        // emitted for an unpersisted round.
+                    db::PersistenceOutcome::NotCommitted { source } => {
+                        // Persistence is CONCLUSIVELY absent — the round was
+                        // never committed. Remove the provisional evidence
+                        // with explicit controlled cleanup (RC-1C): the
+                        // result is observable and failures are surfaced,
+                        // never silently converted to success.
+                        let cleanup_result = evidence.cleanup();
+                        let message = match cleanup_result {
+                            Ok(()) => source,
+                            Err(cleanup_err) => {
+                                format!("{} — {}", source, cleanup_err)
+                            }
+                        };
+                        // "complete" is NEVER emitted for an unpersisted
+                        // round.
                         let _ = app.emit(
                             "interview-phase",
                             PhaseEventPayload {
                                 phase: "error".to_string(),
-                                question: Some(e.clone()),
+                                question: Some(message.clone()),
                                 duration_ms: None,
                             },
                         );
-                        Err(e)
+                        Err(message)
+                    }
+                    db::PersistenceOutcome::Unknown { source } => {
+                        // AMBIGUOUS commit state (RC-4): the WAV is NEVER
+                        // deleted based on an unverified assumption. The
+                        // evidence is preserved in place, the
+                        // reconciliation-needed state is durably recorded,
+                        // and an explicit persistence-uncertain error is
+                        // surfaced. Startup reconciliation reconciles the
+                        // evidence against the DB (matching row -> retain;
+                        // unmatched -> quarantine, never delete).
+                        evidence.preserve();
+                        let note = record_reconciliation_needed(
+                            &paths.paths,
+                            &session_id_str,
+                            round_index,
+                            &metadata.file_path,
+                            &metadata.sha256,
+                            &source,
+                        );
+                        let message =
+                            format!("Round persistence is uncertain: {}. {}", source, note);
+                        let _ = app.emit(
+                            "interview-phase",
+                            PhaseEventPayload {
+                                phase: "error".to_string(),
+                                question: Some(message.clone()),
+                                duration_ms: None,
+                            },
+                        );
+                        Err(message)
                     }
                 }
             }
@@ -892,6 +921,14 @@ async fn run_interview_round(
         // closure, so Scheduled here means the closure is genuinely still
         // alive).
         let output_completion = recording_guard.output_completion();
+        // RC-2B: a native child (Piper/Whisper) that was Running when the
+        // outer worker died is being killed + reaped by the detached task
+        // spawned from the aborted task's own RAII guard. Slot/evidence
+        // ownership must not resolve before that reap completes.
+        let process_completion = recording_guard.process_completion();
+        if process_completion.running() {
+            process_completion.wait().await;
+        }
         // A worker that exited cooperatively finished its capture; a capture
         // that Finished or was never Scheduled has nothing left to run. Only
         // Scheduled-but-not-Finished can still do physical work.
@@ -919,8 +956,26 @@ async fn run_interview_round(
 
         // RC-7: truthful messaging — cleanup completion is reported only when
         // it actually happened (see `round_timeout_message`).
-        let timeout_message =
-            round_timeout_message(defer_cleanup, output_pending, ROUND_TIMEOUT_SECS);
+        let timeout_message = if defer_cleanup || output_pending {
+            round_timeout_message(defer_cleanup, output_pending, false, ROUND_TIMEOUT_SECS)
+        } else {
+            // No live physical capture (worker exited cooperatively, or the
+            // capture terminated within the grace, or none was ever
+            // Scheduled): the capture lifecycle is now static, so compute
+            // ownership and remove ONLY this invocation's artifacts, then
+            // release the slot — capture terminated -> owned artifacts
+            // removed -> slot released (RC-3). Cleanup failures are
+            // observable and reflected in the terminal message.
+            let ownership =
+                round_artifact_ownership(&paths.paths, session_id, round_id, &completion);
+            let cleanup_failed = ownership.remove_owned() > 0;
+            round_timeout_message(
+                defer_cleanup,
+                output_pending,
+                cleanup_failed,
+                ROUND_TIMEOUT_SECS,
+            )
+        };
         let _ = app.emit(
             "interview-phase",
             PhaseEventPayload {
@@ -968,15 +1023,6 @@ async fn run_interview_round(
             });
             recording_guard.disarm();
         } else {
-            // No live physical capture (worker exited cooperatively, or the
-            // capture terminated within the grace, or none was ever
-            // Scheduled): the capture lifecycle is now static, so compute
-            // ownership and remove ONLY this invocation's artifacts, then
-            // release the slot — capture terminated -> owned artifacts
-            // removed -> slot released (RC-3).
-            let ownership =
-                round_artifact_ownership(&paths.paths, session_id, round_id, &completion);
-            ownership.remove_owned();
             clear_active_recording(&state).await;
             recording_guard.disarm();
         }
@@ -988,10 +1034,16 @@ async fn run_interview_round(
 /// RC-7: truthful terminal timeout message, chosen from the ACTUAL cleanup
 /// state. Cleanup completion is claimed only when it truly happened: a
 /// deferred cleanup (physical worker still alive after the grace) explicitly
-/// says the artifacts will be removed after the worker exits, and a pending
-/// output worker reports that playback is still shutting down — neither ever
-/// claims cleanup already finished.
-fn round_timeout_message(defer_cleanup: bool, output_pending: bool, timeout_secs: u64) -> String {
+/// says the artifacts will be removed after the worker exits, a pending
+/// output worker reports that playback is still shutting down, and a failed
+/// cleanup reports that artifacts will be reconciled at startup — none ever
+/// claims cleanup already finished when it did not.
+fn round_timeout_message(
+    defer_cleanup: bool,
+    output_pending: bool,
+    cleanup_failed: bool,
+    timeout_secs: u64,
+) -> String {
     if defer_cleanup {
         format!(
             "Round timed out after {}s. Cancellation was requested; temporary artifacts will be removed after the audio worker exits.",
@@ -1002,11 +1054,133 @@ fn round_timeout_message(defer_cleanup: bool, output_pending: bool, timeout_secs
             "Round timed out after {}s. Cancellation was requested; audio playback is still shutting down.",
             timeout_secs
         )
+    } else if cleanup_failed {
+        format!(
+            "Round timed out after {}s — processes terminated, but some temporary artifacts could not be removed and will be reconciled at next startup",
+            timeout_secs
+        )
     } else {
         format!(
             "Round timed out after {}s — processes terminated, partial artifacts cleaned up",
             timeout_secs
         )
+    }
+}
+
+/// RC-1E/RC-4: startup reconciliation of candidate EVIDENCE (final WAVs
+/// under `recordings/`). These are NEVER deleted: a WAV with a matching DB
+/// round is durable evidence and is left untouched; a WAV with no DB
+/// reference is ambiguous orphaned evidence and is MOVED to the quarantine
+/// directory (preserved for review, reported); the reconciliation-needed
+/// journal from an Unknown COMMIT outcome is reported but never touched.
+fn reconcile_orphaned_evidence(paths: &crate::paths::AppPaths, db: &db::Database) -> Vec<String> {
+    let mut messages = Vec::new();
+    let quarantine = paths.quarantine_dir();
+
+    // 1. Report pending reconciliation-needed entries (Unknown COMMIT
+    // outcomes) — never delete them.
+    let journal = quarantine.join("reconciliation-needed.log");
+    if let Ok(content) = std::fs::read_to_string(&journal) {
+        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+            messages.push(format!(
+                "[startup-reconcile] pending reconciliation: {line}"
+            ));
+        }
+    }
+
+    // 2. Final WAVs under recordings/ — reconcile against the DB.
+    if let Ok(sessions) = std::fs::read_dir(&paths.recordings_dir) {
+        for session in sessions.flatten() {
+            let session_dir = session.path();
+            if !session_dir.is_dir() {
+                continue;
+            }
+            if let Ok(files) = std::fs::read_dir(&session_dir) {
+                for file in files.flatten() {
+                    let path = file.path();
+                    let is_final_wav = path.is_file()
+                        && path.extension().map(|e| e == "wav").unwrap_or(false)
+                        && !path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().ends_with(".wav.tmp"))
+                            .unwrap_or(false);
+                    if !is_final_wav {
+                        continue;
+                    }
+                    let audio_path = path.to_string_lossy().to_string();
+                    match db.round_exists_with_audio_path(&audio_path) {
+                        Ok(true) => { /* durable evidence — untouched */ }
+                        Ok(false) => {
+                            // Ambiguous orphaned evidence: preserve by moving
+                            // to quarantine; never delete.
+                            if let Err(e) = std::fs::create_dir_all(&quarantine) {
+                                messages.push(format!(
+                                    "[startup-reconcile] cannot create quarantine dir: {e}"
+                                ));
+                                continue;
+                            }
+                            let dest = quarantine.join(file.file_name());
+                            match std::fs::rename(&path, &dest) {
+                                Ok(()) => messages.push(format!(
+                                    "[startup-reconcile] quarantined unreferenced evidence: {} -> {}",
+                                    path.display(),
+                                    dest.display()
+                                )),
+                                Err(e) => messages.push(format!(
+                                    "[startup-reconcile] could not quarantine {}: {e}",
+                                    path.display()
+                                )),
+                            }
+                        }
+                        Err(e) => messages.push(format!(
+                            "[startup-reconcile] could not reconcile {}: {e}",
+                            path.display()
+                        )),
+                    }
+                }
+            }
+        }
+    }
+    messages
+}
+
+/// RC-4: durably record an ambiguous-persistence (Unknown COMMIT outcome)
+/// entry for startup reconciliation. The evidence is NEVER deleted on an
+/// unknown outcome — it is preserved in place and this journal entry makes
+/// the reconciliation-needed state durable across restarts. Returns a short
+/// user-facing note.
+fn record_reconciliation_needed(
+    paths: &crate::paths::AppPaths,
+    session_id: &str,
+    round_index: i32,
+    audio_path: &str,
+    sha256: &str,
+    source: &str,
+) -> String {
+    let dir = paths.quarantine_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return format!("(could not record reconciliation state: {e})");
+    }
+    let journal = dir.join("reconciliation-needed.log");
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let entry = format!(
+        "{ts} | session={session_id} | round_index={round_index} | audio_path={audio_path} | sha256={sha256} | source={source}\n"
+    );
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&journal)
+        .and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(entry.as_bytes())
+        }) {
+        Ok(()) => {
+            "Your recording was preserved for review and the case was recorded for startup reconciliation.".to_string()
+        }
+        Err(e) => format!("(could not record reconciliation state: {e})"),
     }
 }
 
@@ -1037,24 +1211,79 @@ fn ensure_round_evidence_absent(
 struct RoundArtifactOwnership {
     wav_path: std::path::PathBuf,
     temp_path: std::path::PathBuf,
-    transcript_path: std::path::PathBuf,
+    /// Invocation-unique transcript temps this round owns (RC-3): files in
+    /// `temp/<session>/` named `<round>.txt` (legacy) or starting with
+    /// `<round>.` and ending `.txt` (invocation-unique). The round UUID
+    /// prefix is unambiguous — no other invocation can share it.
+    transcript_paths: Vec<std::path::PathBuf>,
     owns_final: bool,
     owns_temp: bool,
     owns_transcript: bool,
 }
 
 impl RoundArtifactOwnership {
-    fn remove_owned(&self) {
+    /// Controlled removal (RC-1): returns the count of artifacts that could
+    /// NOT be removed (0 = everything owned is confirmed gone). Failures are
+    /// logged for reconciliation — success is never claimed silently.
+    fn remove_owned(&self) -> usize {
+        let mut failed = 0usize;
+        let mut candidates: Vec<&std::path::Path> = Vec::new();
         if self.owns_final {
-            let _ = std::fs::remove_file(&self.wav_path);
+            candidates.push(&self.wav_path);
         }
         if self.owns_temp {
-            let _ = std::fs::remove_file(&self.temp_path);
+            candidates.push(&self.temp_path);
         }
         if self.owns_transcript {
-            let _ = std::fs::remove_file(&self.transcript_path);
+            candidates.extend(self.transcript_paths.iter().map(|p| p.as_path()));
+        }
+        for path in candidates {
+            let outcome = crate::cleanup::remove_owned(path);
+            if outcome.failed() {
+                failed += 1;
+                eprintln!(
+                    "[round-cleanup] {}",
+                    crate::cleanup::describe(&outcome, path)
+                );
+            }
+        }
+        failed
+    }
+}
+
+/// Enumerate the invocation-unique transcript temps this round owns (RC-3):
+/// any `.txt` in `temp/<session>/` whose name is exactly `<round>.txt`
+/// (legacy deterministic form) or starts with `<round>.` (invocation-unique
+/// `<round>.<invocation>.txt`). The round-UUID prefix is unambiguous — no
+/// other invocation can share it — and a stale file from a crashed attempt
+/// of the same logical round is provably owned.
+fn owned_transcript_paths(
+    paths: &crate::paths::AppPaths,
+    session_id: uuid::Uuid,
+    round_id: uuid::Uuid,
+) -> Vec<std::path::PathBuf> {
+    let session_dir = paths.temp_dir.join(session_id.hyphenated().to_string());
+    let round_prefix = uuid_to_path(&round_id);
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&session_dir) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            continue;
+        };
+        let is_txt = path.extension().map(|e| e == "txt").unwrap_or(false);
+        let round_owned =
+            name == format!("{round_prefix}.txt") || name.starts_with(&format!("{round_prefix}."));
+        if is_txt && round_owned {
+            found.push(path);
         }
     }
+    found
 }
 
 /// Compute artifact ownership for a timed-out round from the physical
@@ -1066,8 +1295,9 @@ impl RoundArtifactOwnership {
 ///   error cleaned up its own temp and created no final.
 /// - The `.wav.tmp` is owned iff a capture was Scheduled and the file
 ///   exists (record_to_wav clears stale temps before writing its own).
-/// - The round transcript temp is owned iff the final WAV is owned — only a
-///   successfully recorded round can have started transcription.
+/// - Transcript temps are owned iff the final WAV is owned — only a
+///   successfully recorded round can have started transcription — and the
+///   files match this round's invocation-unique prefix (RC-3).
 fn round_artifact_ownership(
     paths: &crate::paths::AppPaths,
     session_id: uuid::Uuid,
@@ -1076,19 +1306,20 @@ fn round_artifact_ownership(
 ) -> RoundArtifactOwnership {
     let wav_path = paths.round_audio_path(session_id, round_id);
     let temp_path = wav_path.with_extension("wav.tmp");
-    let transcript_path = paths
-        .temp_dir
-        .join(session_id.hyphenated().to_string())
-        .join(format!("{}.txt", uuid_to_path(&round_id)));
     let capture_attempted = completion.scheduled() || completion.finished();
     let owns_final = completion.finished() && wav_path.exists();
+    let transcript_paths = if owns_final {
+        owned_transcript_paths(paths, session_id, round_id)
+    } else {
+        Vec::new()
+    };
     RoundArtifactOwnership {
         owns_final,
         owns_temp: capture_attempted && temp_path.exists(),
-        owns_transcript: owns_final && transcript_path.exists(),
+        owns_transcript: !transcript_paths.is_empty(),
         wav_path,
         temp_path,
-        transcript_path,
+        transcript_paths,
     }
 }
 
@@ -1231,7 +1462,19 @@ pub fn run() {
                 e
             })?;
 
-            // 3. Manage all states
+            // 3. RC-1E: startup reconciliation — remove provably-owned stale
+            // temporary artifacts (test clips, partial WAVs, transcript and
+            // TTS temps) and reconcile candidate EVIDENCE against the DB
+            // (unreferenced WAVs are quarantined for review, NEVER deleted;
+            // pending reconciliation-needed entries are reported).
+            for message in cleanup::reconcile_stale_artifacts(&paths.paths) {
+                eprintln!("{}", message);
+            }
+            for message in reconcile_orphaned_evidence(&paths.paths, &database) {
+                eprintln!("{}", message);
+            }
+
+            // 4. Manage all states
             app.manage(paths);
             app.manage(Arc::new(RecordingState {
                 handle: Mutex::new(None),
@@ -1246,7 +1489,6 @@ pub fn run() {
             get_app_config,
             run_audio_test,
             generate_tts,
-            list_audio_devices,
             check_audio_devices,
             run_interview_round,
             retry_interview_round,
@@ -1450,11 +1692,12 @@ mod tests {
     }
 
     /// RC-7: the terminal timeout message is truthful about the cleanup
-    /// state — a deferred cleanup or pending output never claims artifacts
-    /// were already cleaned up; an actually-completed cleanup reports it.
+    /// state — a deferred cleanup, pending output, or failed cleanup never
+    /// claims artifacts were already cleaned up; an actually-completed
+    /// cleanup reports it.
     #[test]
     fn round_timeout_message_is_truthful() {
-        let deferred = round_timeout_message(true, false, 300);
+        let deferred = round_timeout_message(true, false, false, 300);
         assert!(deferred.contains("Cancellation was requested"));
         assert!(deferred.contains("will be removed after the audio worker exits"));
         assert!(
@@ -1463,7 +1706,7 @@ mod tests {
             deferred
         );
 
-        let output_shutdown = round_timeout_message(false, true, 300);
+        let output_shutdown = round_timeout_message(false, true, false, 300);
         assert!(output_shutdown.contains("audio playback is still shutting down"));
         assert!(
             !output_shutdown.contains("cleaned up"),
@@ -1471,7 +1714,19 @@ mod tests {
             output_shutdown
         );
 
-        let done = round_timeout_message(false, false, 300);
+        let failed = round_timeout_message(false, false, true, 300);
+        assert!(
+            failed.contains("could not be removed and will be reconciled"),
+            "failed cleanup must be reported, not claimed complete: {}",
+            failed
+        );
+        assert!(
+            !failed.contains("cleaned up"),
+            "failed cleanup must not claim completion: {}",
+            failed
+        );
+
+        let done = round_timeout_message(false, false, false, 300);
         assert!(done.contains("processes terminated, partial artifacts cleaned up"));
         assert!(done.contains("300s"));
     }
@@ -2297,6 +2552,211 @@ mod tests {
         assert!(state.handle.lock().await.is_some());
     }
 
+    /// RC-2A regression: the Drop safety net MUST re-read every physical
+    /// lifecycle tracker AFTER the outer worker is resolved. Model the exact
+    /// review topology: the initial snapshot contains ONLY the input probe; a
+    /// second physical worker (the output probe) becomes Scheduled after that
+    /// snapshot (the device check schedules it as the input probe finishes)
+    /// while the guard's cleanup is still running. The slot must stay
+    /// occupied until the late-scheduled output finishes — a pre-abort
+    /// snapshot is NOT authoritative.
+    #[tokio::test]
+    async fn recording_guard_drop_rescans_completions_after_snapshot() {
+        let state = Arc::new(RecordingState {
+            handle: Mutex::new(None),
+        });
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let input_release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let schedule_output = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let output_release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        acquire_recording(&state, fake_handle()).await.unwrap();
+
+        let completion_for_test;
+        let output_completion_for_test;
+        {
+            let mut guard = RecordingGuard::new(state.clone(), stop.clone());
+            guard.drop_grace = std::time::Duration::from_millis(150);
+            let completion = guard.completion();
+            let output_completion = guard.output_completion();
+            completion_for_test = completion.clone();
+            output_completion_for_test = output_completion.clone();
+            let worker = {
+                let blocking_input_release = input_release.clone();
+                let blocking_schedule = schedule_output.clone();
+                let blocking_output_release = output_release.clone();
+                let completion = completion.clone();
+                let output_completion = output_completion.clone();
+                tokio::spawn(async move {
+                    // Input probe: Scheduled immediately (RC-2 ordering).
+                    completion.mark_scheduled();
+                    let input = tokio::task::spawn_blocking(move || {
+                        while !blocking_input_release.load(Ordering::SeqCst) {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        completion.signal();
+                    });
+                    // The device-check continuation: once the input finishes,
+                    // the NEXT probe (output) is scheduled. Modelled as a
+                    // child task — the outcome is the same as the
+                    // grace-boundary race where the output probe is submitted
+                    // just before the outer abort lands.
+                    let sched = blocking_schedule.clone();
+                    let out_completion = output_completion.clone();
+                    let out_release = blocking_output_release.clone();
+                    tokio::spawn(async move {
+                        while !sched.load(Ordering::SeqCst) {
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        }
+                        // The output probe becomes Scheduled AFTER the guard's
+                        // initial snapshot.
+                        out_completion.mark_scheduled();
+                        let output = tokio::task::spawn_blocking(move || {
+                            while !out_release.load(Ordering::SeqCst) {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                            out_completion.signal();
+                        });
+                        let _ = output.await;
+                    });
+                    let _ = input.await;
+                })
+            };
+            guard.attach_worker(worker);
+
+            // Wait until the input probe is Scheduled (the snapshot the Drop
+            // will take) before dropping.
+            let mut scheduled = false;
+            for _ in 0..200 {
+                if completion_for_test.state() == CaptureState::Scheduled {
+                    scheduled = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert!(scheduled, "input probe must be Scheduled before drop");
+            assert!(
+                !output_completion_for_test.scheduled(),
+                "output probe must NOT be Scheduled at the initial snapshot"
+            );
+            // Dropped while armed — cancellation of the outer device-check
+            // command while the input probe is scheduled.
+        }
+
+        // Schedule the output probe AFTER the drop's initial snapshot (the
+        // grace-boundary race), then release the input probe.
+        schedule_output.store(true, Ordering::SeqCst);
+        input_release.store(true, Ordering::SeqCst);
+
+        // Give the drop cleanup time to resolve the outer worker and run its
+        // rescan. The late-scheduled output probe must keep the slot
+        // occupied.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(
+            matches!(
+                output_completion_for_test.state(),
+                CaptureState::Scheduled | CaptureState::Finished
+            ),
+            "output probe must have been scheduled by now"
+        );
+        assert!(
+            state.handle.lock().await.is_some(),
+            "slot must stay occupied while the late-scheduled output probe is unresolved"
+        );
+        let second = acquire_recording(&state, fake_handle()).await;
+        assert!(
+            second.is_err(),
+            "second acquire must fail while the output probe is unresolved"
+        );
+
+        // Release the output probe -> it signals Finished -> only then does
+        // the slot clear.
+        output_release.store(true, Ordering::SeqCst);
+        let mut cleared = false;
+        for _ in 0..300 {
+            if state.handle.lock().await.is_none() {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            cleared,
+            "slot must clear only after the late-scheduled output probe finishes"
+        );
+        assert_eq!(output_completion_for_test.state(), CaptureState::Finished);
+    }
+
+    /// RC-2B: the Drop safety net waits for a Running native child to be
+    /// Reaped before clearing the slot — a force-abort of the outer worker
+    /// can never release ownership while a Piper/Whisper process may be
+    /// alive.
+    #[tokio::test]
+    async fn recording_guard_drop_waits_for_running_process() {
+        let state = Arc::new(RecordingState {
+            handle: Mutex::new(None),
+        });
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        acquire_recording(&state, fake_handle()).await.unwrap();
+
+        let process_for_test;
+        {
+            let mut guard = RecordingGuard::new(state.clone(), stop.clone());
+            guard.drop_grace = std::time::Duration::from_millis(150);
+            let process_completion = guard.process_completion();
+            process_for_test = process_completion.clone();
+            let worker = tokio::spawn(async move {
+                // The worker marks a child Running (Piper/Whisper spawn) and
+                // is then force-aborted while the child is still alive — it
+                // never reaps the child itself.
+                process_completion.mark_running();
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            });
+            guard.attach_worker(worker);
+
+            let mut running = false;
+            for _ in 0..200 {
+                if process_for_test.running() {
+                    running = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert!(running, "process must be Running before drop");
+            // Dropped while armed — the owning round command is cancelled
+            // while a native child may be alive.
+        }
+
+        // The outer worker was force-aborted, but the child is not yet
+        // reaped — the slot must stay occupied and a second acquire must
+        // fail.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(
+            state.handle.lock().await.is_some(),
+            "slot must stay occupied while a child may be running"
+        );
+        let second = acquire_recording(&state, fake_handle()).await;
+        assert!(
+            second.is_err(),
+            "second acquire must fail while the child is unreaped"
+        );
+
+        // The child is conclusively reaped (in the real flow, the aborted
+        // task's own RAII guard kills + waits and then signals Reaped) —
+        // only now may the slot clear.
+        process_for_test.signal_reaped();
+        let mut cleared = false;
+        for _ in 0..300 {
+            if state.handle.lock().await.is_none() {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(cleared, "slot must clear only after the process is Reaped");
+    }
+
     // ------------------------------------------------------------------
     // RC-1: PRODUCTION interview TTS playback is owned by
     // RecordingGuard.output_completion — the real Piper question-playback
@@ -2698,7 +3158,7 @@ mod tests {
     }
 
     fn insert_round(db: &db::Database, session: &str, index: i32, is_final: bool) {
-        db.insert_round_with_session_update(
+        let outcome = db.insert_round_with_session_update(
             session,
             index,
             &format!("Q{}", index),
@@ -2710,8 +3170,8 @@ mod tests {
             1,
             160044,
             is_final,
-        )
-        .unwrap();
+        );
+        assert!(matches!(outcome, db::PersistenceOutcome::Committed(_)));
     }
 
     #[test]
