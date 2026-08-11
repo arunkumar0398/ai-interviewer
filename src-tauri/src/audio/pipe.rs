@@ -90,6 +90,7 @@ pub struct ProcessCompletion {
 }
 
 // 0 = NotStarted (the default), 1 = Running, 2 = Reaped, 3 = ReapFailed.
+const PROC_NOT_STARTED: u8 = 0;
 const PROC_RUNNING: u8 = 1;
 const PROC_REAPED: u8 = 2;
 const PROC_REAP_FAILED: u8 = 3;
@@ -105,6 +106,15 @@ impl ProcessCompletion {
     /// Whether a child may currently be alive (spawned but not reaped).
     pub fn running(&self) -> bool {
         self.state.load(Ordering::SeqCst) == PROC_RUNNING
+    }
+
+    /// Whether any child lifecycle has begun at all (Running, Reaped, or
+    /// ReapFailed) — distinct from NotStarted. Owners use this to decide
+    /// whether a terminal state must be awaited (RC-G1): a NotStarted
+    /// completion has nothing to wait for, while a ReapFailed completion is
+    /// already terminal and `wait()` resolves immediately without blocking.
+    pub fn started(&self) -> bool {
+        self.state.load(Ordering::SeqCst) != PROC_NOT_STARTED
     }
 
     /// Whether the child has been conclusively killed + waited.

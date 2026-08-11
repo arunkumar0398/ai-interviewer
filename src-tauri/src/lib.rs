@@ -14,20 +14,34 @@ use paths::{get_app_config, resolve_app_paths, uuid_to_path, PathsState};
 /// Holds the current recording handle — the shared EXCLUSIVE audio-slot
 /// lease. Every raw microphone/audio command acquires it before touching a
 /// device and clears it only after the physical worker has fully terminated.
+///
+/// RC-G1: a second, sticky `poisoned` flag makes the subsystem fail closed.
+/// When a native child process (Piper/Whisper) could not be conclusively
+/// reaped, the subsystem is poisoned for the remainder of the app session:
+/// every future acquisition is rejected with an explicit restart-required
+/// error, and ordinary `clear_active_recording` can never erase the poison.
 struct RecordingState {
     handle: Mutex<Option<audio::capture::RecordingHandle>>,
+    poisoned: Mutex<Option<String>>,
 }
 
-/// Holds the database connection
-struct DbState {
-    db: Mutex<Option<db::Database>>,
-}
+/// RC-G1: acquire must check the poison FIRST — Poisoned is distinct from
+/// "already active" and is never presented as ordinary busy.
+const POISONED_ACQUIRE_ERROR: &str =
+    "Audio subsystem is unavailable because a previous native process could not be \
+     conclusively terminated. Restart the application before continuing.";
 
-/// Atomically acquire the recording slot. Returns Err if already active.
+/// Atomically acquire the recording slot. Returns Err if the subsystem is
+/// poisoned (RC-G1, restart required) or if already active.
 async fn acquire_recording(
     state: &RecordingState,
     handle: audio::capture::RecordingHandle,
 ) -> Result<(), String> {
+    let poisoned = state.poisoned.lock().await;
+    if let Some(reason) = poisoned.as_ref() {
+        return Err(format!("{POISONED_ACQUIRE_ERROR} (reason: {reason})"));
+    }
+    drop(poisoned);
     let mut guard = state.handle.lock().await;
     if guard.is_some() {
         return Err("A recording is already active".to_string());
@@ -36,10 +50,28 @@ async fn acquire_recording(
     Ok(())
 }
 
-/// Clear the recording slot unconditionally.
+/// Clear the recording slot unconditionally. RC-G1: this NEVER clears a
+/// poisoned state — poison is sticky for the app lifetime and survives every
+/// ordinary release.
 async fn clear_active_recording(state: &RecordingState) {
     let mut guard = state.handle.lock().await;
     *guard = None;
+}
+
+/// RC-G1: mark the shared audio/process subsystem poisoned/unavailable. Once
+/// set, the reason is sticky for the app lifetime; the FIRST recorded reason
+/// is kept and later failures never downgrade it to Free/reusable. Ordinary
+/// clears and guard disarms cannot erase it.
+async fn poison_recording(state: &RecordingState, reason: &str) {
+    let mut poisoned = state.poisoned.lock().await;
+    if poisoned.is_none() {
+        *poisoned = Some(reason.to_string());
+    }
+}
+
+/// Holds the database connection
+struct DbState {
+    db: Mutex<Option<db::Database>>,
 }
 
 /// Owner of the recording-slot lease, the worker's stop flag, the worker's
@@ -269,17 +301,24 @@ impl<T: Send + 'static> Drop for RecordingGuard<T> {
                     // Running when the outer worker died is killed + waited
                     // by the detached task spawned from the aborted task's
                     // own RAII guard; the slot is not released until Reaped.
-                    // RC-F4: wait() reports whether the child was
-                    // CONCLUSIVELY reaped — a failed wait is surfaced as an
-                    // explicit unresolved lifecycle, never a silent
-                    // "reaped" assumption.
-                    if process_completion.running() && !process_completion.wait().await {
+                    // RC-G1 fail-closed: a conclusive Reaped releases
+                    // normally; a failed wait (ReapFailed) POISONS the audio
+                    // subsystem so no later operation can reuse the slot
+                    // while a child state is unresolved — the user must
+                    // restart before continuing.
+                    if process_completion.started() && !process_completion.wait().await {
+                        poison_recording(
+                            &state,
+                            "a native process could not be conclusively reaped after an outer-worker abort",
+                        )
+                        .await;
                         eprintln!(
-                            "[process-lifecycle] process reap unresolved after outer-worker abort — child state not proven Reaped"
+                            "[process-lifecycle] process reap unresolved after outer-worker abort — child state not proven Reaped; audio subsystem poisoned, restart required"
                         );
                     }
                 }
-                // 6. Only now is the shared audio slot released.
+                // 6. Only now is the shared audio slot released. The poison,
+                // if any, is sticky and survives this clear (RC-G1).
                 clear_active_recording(&state).await;
             });
         }
@@ -932,15 +971,12 @@ async fn run_interview_round(
         // spawned from the aborted task's own RAII guard. Slot/evidence
         // ownership must not resolve before that reap completes.
         let process_completion = recording_guard.process_completion();
-        if process_completion.running() {
-            // RC-F4: a failed wait leaves the lifecycle explicitly unresolved
-            // (ReapFailed) — surfaced, never reported as a proven Reaped.
-            if !process_completion.wait().await {
-                eprintln!(
-                    "[process-lifecycle] process reap unresolved at round timeout — child state not proven Reaped"
-                );
-            }
-        }
+        // RC-G1 fail-closed: a conclusive Reaped is normal; a failed wait
+        // (ReapFailed) poisons the audio subsystem so no later round/audio
+        // operation can reuse the slot, and the terminal message below
+        // surfaces the explicit restart-required lifecycle error.
+        let reap_unresolved =
+            resolve_process_lifecycle_at_timeout(&state, &process_completion).await;
         // A worker that exited cooperatively finished its capture; a capture
         // that Finished or was never Scheduled has nothing left to run. Only
         // Scheduled-but-not-Finished can still do physical work.
@@ -967,7 +1003,11 @@ async fn run_interview_round(
         let _ = phase_relay.await;
 
         // RC-7: truthful messaging — cleanup completion is reported only when
-        // it actually happened (see `round_timeout_message`).
+        // it actually happened (see `round_timeout_message`). RC-G1: a
+        // ReapFailed lifecycle is surfaced as an explicit restart-required
+        // condition appended to the terminal message, never folded into a
+        // generic timeout; the controlled artifact cleanup below still runs
+        // exactly as before.
         let timeout_message = if defer_cleanup || output_pending {
             round_timeout_message(defer_cleanup, output_pending, false, ROUND_TIMEOUT_SECS)
         } else {
@@ -987,6 +1027,13 @@ async fn run_interview_round(
                 cleanup_failed,
                 ROUND_TIMEOUT_SECS,
             )
+        };
+        let timeout_message = if reap_unresolved {
+            format!(
+                "{timeout_message}. A native process could not be conclusively terminated — the audio subsystem is unavailable until the application is restarted."
+            )
+        } else {
+            timeout_message
         };
         let _ = app.emit(
             "interview-phase",
@@ -1040,6 +1087,34 @@ async fn run_interview_round(
         }
 
         Err(timeout_message)
+    }
+}
+
+/// RC-G1: resolve a native child's lifecycle at round timeout. A conclusive
+/// Reaped is normal; a failed wait (ReapFailed) POISONS the audio/process
+/// subsystem so no later round or audio operation can reuse the slot — the
+/// user must restart before continuing. Returns whether the lifecycle is
+/// unresolved (subsystem poisoned). Bounded: a terminal ReapFailed resolves
+/// immediately, so this never waits forever on an unreapable process.
+async fn resolve_process_lifecycle_at_timeout(
+    state: &RecordingState,
+    process_completion: &audio::pipe::ProcessCompletion,
+) -> bool {
+    if !process_completion.started() {
+        return false;
+    }
+    if process_completion.wait().await {
+        false
+    } else {
+        poison_recording(
+            state,
+            "a native process could not be conclusively reaped at round timeout",
+        )
+        .await;
+        eprintln!(
+            "[process-lifecycle] process reap unresolved at round timeout — child state not proven Reaped; audio subsystem poisoned, restart required"
+        );
+        true
     }
 }
 
@@ -1126,22 +1201,42 @@ fn parse_journal_entry(line: &str) -> Option<(String, i32, String, String)> {
     Some((session, round_index, audio_path, sha256))
 }
 
-/// Classify one journal entry against authoritative DB state (RC-F2). The
-/// caller NEVER deletes evidence based on this classification — it only
+/// Classify one journal entry against authoritative DB state (RC-F2/RC-G2).
+/// The caller NEVER deletes evidence based on this classification — it only
 /// decides whether the pending record may be dropped.
 fn resolve_journal_entry(line: &str, db: &db::Database) -> JournalResolution {
     let Some((session, round_index, audio_path, sha256)) = parse_journal_entry(line) else {
         return JournalResolution::Malformed;
     };
-    match db.round_identity(&session, round_index) {
+    classify_journal_identity(
+        db.round_identity(&session, round_index)
+            .map_err(|e| e.to_string()),
+        &audio_path,
+        &sha256,
+    )
+}
+
+/// RC-G2: strict evidence identity. A journal entry may only resolve as
+/// Committed when the authoritative DB row matches BOTH the journal sha256
+/// AND the journal audio_path. Any partial identity (path-only or SHA-only
+/// match) stays Unknown/pending — reconciliation-needed evidence whose
+/// identity disagrees in any respect remains suspicious and is never treated
+/// as conclusively committed. This classification NEVER deletes evidence; it
+/// only decides whether the pending record may be dropped.
+fn classify_journal_identity(
+    stored: Result<Option<(String, String)>, String>,
+    journal_path: &str,
+    journal_sha: &str,
+) -> JournalResolution {
+    match stored {
         Err(e) => JournalResolution::Unknown(format!("DB query failed: {e}")),
         Ok(None) => JournalResolution::NotCommitted,
         Ok(Some((stored_sha, stored_path))) => {
-            if stored_sha == sha256 || stored_path == audio_path {
+            if stored_sha == journal_sha && stored_path == journal_path {
                 JournalResolution::Committed
             } else {
                 JournalResolution::Unknown(format!(
-                    "round row exists but identity mismatches (stored sha {stored_sha:?} != journal {sha256:?}, stored path {stored_path:?} != journal {audio_path:?})"
+                    "round row exists but identity is not an exact match (stored sha {stored_sha:?} vs journal {journal_sha:?}; stored path {stored_path:?} vs journal {journal_path:?}) — partial identity is not Committed"
                 ))
             }
         }
@@ -1662,6 +1757,7 @@ pub fn run() {
             app.manage(paths);
             app.manage(Arc::new(RecordingState {
                 handle: Mutex::new(None),
+                poisoned: Mutex::new(None),
             }));
             app.manage(Arc::new(DbState {
                 db: Mutex::new(Some(database)),
@@ -1705,6 +1801,19 @@ mod tests {
         (RecordingGuard::<()>::new(state.clone(), stop.clone()), stop)
     }
 
+    /// Wait (bounded) for the guard safety net to clear the recording slot.
+    /// Used by RC-G1 ownership tests: the safety net sets poison BEFORE the
+    /// clear, so once the slot is empty the poison decision is final.
+    async fn wait_for_slot_clear(state: &Arc<RecordingState>) {
+        for _ in 0..200 {
+            if state.handle.lock().await.is_none() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("recording slot was not cleared by the guard safety net");
+    }
+
     /// An outer command deadline must return promptly without consuming or
     /// detaching the worker. The still-armed guard retains the recording slot
     /// until the scheduled physical worker actually terminates.
@@ -1712,6 +1821,7 @@ mod tests {
     async fn recording_worker_deadline_returns_while_guard_retains_ownership() {
         let state = Arc::new(RecordingState {
             handle: Mutex::new(None),
+            poisoned: Mutex::new(None),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1791,6 +1901,7 @@ mod tests {
 
         let state = Arc::new(RecordingState {
             handle: Mutex::new(None),
+            poisoned: Mutex::new(None),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         acquire_recording(&state, fake_handle()).await.unwrap();
@@ -1922,6 +2033,7 @@ mod tests {
     async fn recording_slot_reusable_after_explicit_clear_and_disarm() {
         let state = Arc::new(RecordingState {
             handle: Mutex::new(None),
+            poisoned: Mutex::new(None),
         });
         let handle = fake_handle();
 
@@ -1940,12 +2052,151 @@ mod tests {
         assert!(state.handle.lock().await.is_some());
     }
 
+    // ------------------------------------------------------------------
+    // RC-G1: ReapFailed must fail closed — the audio/process subsystem is
+    // poisoned (sticky) and future acquisition is rejected with a
+    // restart-required error; Reaped still releases normally.
+    // ------------------------------------------------------------------
+
+    /// Test A: a guard whose child lifecycle ended in ReapFailed poisons the
+    /// subsystem — the safety net clears the slot (poison is set BEFORE the
+    /// clear) and a second acquire is REJECTED with a restart-required error.
+    #[tokio::test]
+    async fn reap_failed_poisons_subsystem_and_blocks_second_acquire() {
+        let state = Arc::new(RecordingState {
+            handle: Mutex::new(None),
+            poisoned: Mutex::new(None),
+        });
+        acquire_recording(&state, fake_handle()).await.unwrap();
+
+        // Simulate a child that was Running but whose wait failed: the
+        // lifecycle is ReapFailed — Running, then a failed wait.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut guard = RecordingGuard::<()>::new(state.clone(), stop);
+        let completion = guard.process_completion();
+        completion.mark_running();
+        completion.signal_reap_failed();
+        // Attach a trivial worker so the Drop safety net runs the process
+        // lifecycle path (and not the "nothing scheduled" shortcut).
+        guard.attach_worker(tokio::spawn(async {}));
+        drop(guard);
+
+        wait_for_slot_clear(&state).await;
+
+        assert!(
+            state.poisoned.lock().await.is_some(),
+            "ReapFailed must poison the subsystem"
+        );
+        let err = acquire_recording(&state, fake_handle()).await.unwrap_err();
+        assert!(
+            err.contains("Restart the application"),
+            "second acquire must be rejected with a restart-required error, got: {err}"
+        );
+    }
+
+    /// Test B: a conclusive Reaped releases the slot normally and a second
+    /// acquire SUCCEEDS — Reaped never poisons.
+    #[tokio::test]
+    async fn reaped_releases_slot_normally_and_second_acquire_succeeds() {
+        let state = Arc::new(RecordingState {
+            handle: Mutex::new(None),
+            poisoned: Mutex::new(None),
+        });
+        acquire_recording(&state, fake_handle()).await.unwrap();
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut guard = RecordingGuard::<()>::new(state.clone(), stop);
+        let completion = guard.process_completion();
+        completion.mark_running();
+        completion.signal_reaped();
+        guard.attach_worker(tokio::spawn(async {}));
+        drop(guard);
+
+        wait_for_slot_clear(&state).await;
+
+        assert!(
+            state.poisoned.lock().await.is_none(),
+            "a conclusive Reaped must never poison the subsystem"
+        );
+        acquire_recording(&state, fake_handle()).await.unwrap();
+        assert!(state.handle.lock().await.is_some());
+    }
+
+    /// Test C: the ordinary clear path cannot erase a poisoned state — the
+    /// poison is sticky and a second acquire is still rejected.
+    #[tokio::test]
+    async fn poison_survives_ordinary_clear() {
+        let state = Arc::new(RecordingState {
+            handle: Mutex::new(None),
+            poisoned: Mutex::new(None),
+        });
+        poison_recording(&state, "simulated reap failure").await;
+
+        // Ordinary release path must NOT erase the poison.
+        clear_active_recording(&state).await;
+        assert!(
+            state.poisoned.lock().await.is_some(),
+            "clear must never erase a poisoned state"
+        );
+        let err = acquire_recording(&state, fake_handle()).await.unwrap_err();
+        assert!(
+            err.contains("Restart the application"),
+            "still poisoned after clear, got: {err}"
+        );
+    }
+
+    /// Test D: the round-timeout ReapFailed policy — the extracted helper
+    /// surfaces the unresolved lifecycle, poisons the subsystem (bounded: a
+    /// terminal ReapFailed resolves immediately), and future acquisition is
+    /// rejected.
+    #[tokio::test]
+    async fn timeout_reap_failed_poisons_and_blocks_future_acquisition() {
+        let state = Arc::new(RecordingState {
+            handle: Mutex::new(None),
+            poisoned: Mutex::new(None),
+        });
+        let completion = audio::pipe::ProcessCompletion::default();
+        completion.mark_running();
+        completion.signal_reap_failed();
+
+        let unresolved = resolve_process_lifecycle_at_timeout(&state, &completion).await;
+        assert!(
+            unresolved,
+            "ReapFailed at round timeout must be surfaced as an unresolved lifecycle"
+        );
+        assert!(state.poisoned.lock().await.is_some());
+        let err = acquire_recording(&state, fake_handle()).await.unwrap_err();
+        assert!(
+            err.contains("Restart the application"),
+            "future acquisition must be rejected after a timeout ReapFailed, got: {err}"
+        );
+    }
+
+    /// Round-timeout counterpart: a conclusive Reaped at timeout is normal and
+    /// must NOT poison — the slot stays reusable.
+    #[tokio::test]
+    async fn timeout_reaped_does_not_poison() {
+        let state = Arc::new(RecordingState {
+            handle: Mutex::new(None),
+            poisoned: Mutex::new(None),
+        });
+        let completion = audio::pipe::ProcessCompletion::default();
+        completion.mark_running();
+        completion.signal_reaped();
+
+        let unresolved = resolve_process_lifecycle_at_timeout(&state, &completion).await;
+        assert!(!unresolved);
+        assert!(state.poisoned.lock().await.is_none());
+        acquire_recording(&state, fake_handle()).await.unwrap();
+    }
+
     /// Safety net: a guard dropped while still armed (panic/cancellation path)
     /// must still clear the slot.
     #[tokio::test]
     async fn recording_slot_cleared_by_guard_safety_net_on_drop() {
         let state = Arc::new(RecordingState {
             handle: Mutex::new(None),
+            poisoned: Mutex::new(None),
         });
         let handle = fake_handle();
         acquire_recording(&state, handle.clone()).await.unwrap();
@@ -1967,6 +2218,7 @@ mod tests {
     async fn recording_guard_drop_with_live_worker_terminates_before_clearing() {
         let state = Arc::new(RecordingState {
             handle: Mutex::new(None),
+            poisoned: Mutex::new(None),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         acquire_recording(&state, fake_handle()).await.unwrap();
@@ -2012,6 +2264,7 @@ mod tests {
     async fn recording_guard_drop_waits_for_nested_blocking_worker() {
         let state = Arc::new(RecordingState {
             handle: Mutex::new(None),
+            poisoned: Mutex::new(None),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2105,6 +2358,7 @@ mod tests {
     async fn recording_guard_drop_force_abort_does_not_free_slot_early() {
         let state = Arc::new(RecordingState {
             handle: Mutex::new(None),
+            poisoned: Mutex::new(None),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2202,6 +2456,7 @@ mod tests {
     async fn recording_guard_drop_scheduled_but_not_started_holds_slot() {
         let state = Arc::new(RecordingState {
             handle: Mutex::new(None),
+            poisoned: Mutex::new(None),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // The blocking closure cannot BEGIN executing (and therefore cannot
@@ -2345,6 +2600,7 @@ mod tests {
 
         let state = Arc::new(RecordingState {
             handle: Mutex::new(None),
+            poisoned: Mutex::new(None),
         });
         acquire_recording(&state, fake_handle()).await.unwrap();
 
@@ -2536,6 +2792,7 @@ mod tests {
     async fn recording_guard_drop_awaits_outer_worker_after_physical_completion() {
         let state = Arc::new(RecordingState {
             handle: Mutex::new(None),
+            poisoned: Mutex::new(None),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2638,6 +2895,7 @@ mod tests {
     async fn recording_guard_drop_waits_for_speaker_probe_output_completion() {
         let state = Arc::new(RecordingState {
             handle: Mutex::new(None),
+            poisoned: Mutex::new(None),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // The probe cannot BEGIN executing (and therefore cannot signal
@@ -2748,6 +3006,7 @@ mod tests {
     async fn recording_guard_drop_rescans_completions_after_snapshot() {
         let state = Arc::new(RecordingState {
             handle: Mutex::new(None),
+            poisoned: Mutex::new(None),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let input_release = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2878,6 +3137,7 @@ mod tests {
     async fn recording_guard_drop_waits_for_running_process() {
         let state = Arc::new(RecordingState {
             handle: Mutex::new(None),
+            poisoned: Mutex::new(None),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         acquire_recording(&state, fake_handle()).await.unwrap();
@@ -2962,6 +3222,7 @@ mod tests {
     async fn recording_guard_drop_waits_for_production_tts_output_scheduled_but_not_started() {
         let state = Arc::new(RecordingState {
             handle: Mutex::new(None),
+            poisoned: Mutex::new(None),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // The production output closure cannot BEGIN executing (and therefore
@@ -3076,6 +3337,7 @@ mod tests {
     async fn recording_guard_drop_holds_slot_until_production_tts_output_finishes() {
         let state = Arc::new(RecordingState {
             handle: Mutex::new(None),
+            poisoned: Mutex::new(None),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // The output worker runs (began) but stays alive a controlled delay
@@ -3177,6 +3439,7 @@ mod tests {
     async fn production_tts_output_completion_normal_exit_no_slot_leak() {
         let state = Arc::new(RecordingState {
             handle: Mutex::new(None),
+            poisoned: Mutex::new(None),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         acquire_recording(&state, fake_handle()).await.unwrap();
@@ -3230,6 +3493,7 @@ mod tests {
     async fn recording_guard_take_result_captures_once() {
         let state = Arc::new(RecordingState {
             handle: Mutex::new(None),
+            poisoned: Mutex::new(None),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         acquire_recording(&state, fake_handle()).await.unwrap();
@@ -3254,6 +3518,7 @@ mod tests {
     async fn recording_guard_abort_then_await_resolves_worker() {
         let state = Arc::new(RecordingState {
             handle: Mutex::new(None),
+            poisoned: Mutex::new(None),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         acquire_recording(&state, fake_handle()).await.unwrap();
@@ -3285,6 +3550,7 @@ mod tests {
     async fn acquire_rejects_while_slot_held() {
         let state = Arc::new(RecordingState {
             handle: Mutex::new(None),
+            poisoned: Mutex::new(None),
         });
         let handle = fake_handle();
         acquire_recording(&state, handle.clone()).await.unwrap();
@@ -3303,6 +3569,7 @@ mod tests {
     async fn recording_slot_held_through_persistence_window() {
         let state = Arc::new(RecordingState {
             handle: Mutex::new(None),
+            poisoned: Mutex::new(None),
         });
         let handle = fake_handle();
         acquire_recording(&state, handle.clone()).await.unwrap();
@@ -3793,6 +4060,146 @@ mod tests {
         assert!(
             content.contains(malformed),
             "malformed entry must be preserved verbatim"
+        );
+    }
+
+    /// RC-G2: journal identity requires an EXACT match of BOTH sha256 AND
+    /// audio path. Path-only, SHA-only, neither, no-row, and DB-failure
+    /// classifications are exercised directly on the pure classifier.
+    #[test]
+    fn journal_identity_requires_exact_sha_and_path() {
+        // Exact SHA + exact path -> Committed.
+        assert!(matches!(
+            classify_journal_identity(Ok(Some(("shaA".into(), "/p.wav".into()))), "/p.wav", "shaA"),
+            JournalResolution::Committed
+        ));
+        // Path-only match (stored sha differs) -> Unknown.
+        assert!(matches!(
+            classify_journal_identity(Ok(Some(("shaB".into(), "/p.wav".into()))), "/p.wav", "shaA"),
+            JournalResolution::Unknown(_)
+        ));
+        // SHA-only match (stored path differs) -> Unknown.
+        assert!(matches!(
+            classify_journal_identity(Ok(Some(("shaA".into(), "/q.wav".into()))), "/p.wav", "shaA"),
+            JournalResolution::Unknown(_)
+        ));
+        // Neither matches -> Unknown.
+        assert!(matches!(
+            classify_journal_identity(Ok(Some(("shaB".into(), "/q.wav".into()))), "/p.wav", "shaA"),
+            JournalResolution::Unknown(_)
+        ));
+        // No row -> NotCommitted.
+        assert!(matches!(
+            classify_journal_identity(Ok(None), "/p.wav", "shaA"),
+            JournalResolution::NotCommitted
+        ));
+        // DB query failure -> Unknown.
+        assert!(matches!(
+            classify_journal_identity(Err("simulated DB failure".into()), "/p.wav", "shaA"),
+            JournalResolution::Unknown(_)
+        ));
+    }
+
+    /// RC-G2: a stored row whose PATH matches the journal but whose SHA
+    /// differs must stay Unknown/pending — a checksum disagreement is not
+    /// "conclusively committed" — and the durable evidence is untouched.
+    #[test]
+    fn journal_path_only_match_stays_pending() {
+        let (_dir, paths) = temp_paths();
+        let db = db::Database::open(&paths.db_path).unwrap();
+        db.create_session(SESSION_UUID, "PathOnly").unwrap();
+
+        let wav = paths.recordings_dir.join(SESSION_UUID).join("round.wav");
+        std::fs::create_dir_all(wav.parent().unwrap()).unwrap();
+        std::fs::write(&wav, b"path-match-evidence").unwrap();
+        let audio_path = wav.to_string_lossy().to_string();
+        let outcome = db.insert_round_with_session_update(
+            SESSION_UUID,
+            0,
+            "Q",
+            "A",
+            &audio_path,
+            "stored-sha",
+            5000,
+            16000,
+            1,
+            160044,
+            false,
+        );
+        assert!(matches!(outcome, db::PersistenceOutcome::Committed(_)));
+        // Journal entry: same path, DIFFERENT sha -> path-only match.
+        record_reconciliation_needed(
+            &paths,
+            SESSION_UUID,
+            0,
+            &audio_path,
+            "journal-sha",
+            "path-only",
+        );
+
+        let messages = reconcile_orphaned_evidence(&paths, &db);
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("pending reconciliation")),
+            "path-only match must stay pending, got {messages:?}"
+        );
+        let content = std::fs::read_to_string(journal_path(&paths)).unwrap();
+        assert!(
+            content.contains("journal-sha"),
+            "path-only match must remain in the journal"
+        );
+        assert_eq!(
+            std::fs::read(&wav).unwrap(),
+            b"path-match-evidence",
+            "durable evidence must never be touched by journal classification"
+        );
+    }
+
+    /// RC-G2: a stored row whose SHA matches the journal but whose PATH
+    /// differs must stay Unknown/pending — path identity disagreement is not
+    /// "conclusively committed".
+    #[test]
+    fn journal_sha_only_match_stays_pending() {
+        let (_dir, paths) = temp_paths();
+        let db = db::Database::open(&paths.db_path).unwrap();
+        db.create_session(SESSION_UUID, "ShaOnly").unwrap();
+
+        let outcome = db.insert_round_with_session_update(
+            SESSION_UUID,
+            0,
+            "Q",
+            "A",
+            "/db/other.wav",
+            "sha-match",
+            5000,
+            16000,
+            1,
+            160044,
+            false,
+        );
+        assert!(matches!(outcome, db::PersistenceOutcome::Committed(_)));
+        // Journal entry: same sha, DIFFERENT path -> sha-only match.
+        record_reconciliation_needed(
+            &paths,
+            SESSION_UUID,
+            0,
+            "/journal/path.wav",
+            "sha-match",
+            "sha-only",
+        );
+
+        let messages = reconcile_orphaned_evidence(&paths, &db);
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("pending reconciliation")),
+            "sha-only match must stay pending, got {messages:?}"
+        );
+        let content = std::fs::read_to_string(journal_path(&paths)).unwrap();
+        assert!(
+            content.contains("sha-match"),
+            "sha-only match must remain in the journal"
         );
     }
 

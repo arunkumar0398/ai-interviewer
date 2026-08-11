@@ -373,9 +373,12 @@ impl AppPaths {
     /// Validate that critical binaries, models, AND Piper's required runtime
     /// companions are present (P2-3/P1-2). Packaging requires the full Piper
     /// runtime (espeak-ng.dll, piper_phonemize.dll, onnxruntime.dll,
-    /// onnxruntime_providers_shared.dll, espeak-ng-data/) — a damaged or
-    /// hand-supplied AI_INTERVIEWER_TOOLS directory that only has the exe
-    /// would otherwise report `ready = true` and then fail at runtime.
+    /// onnxruntime_providers_shared.dll, espeak-ng-data/) — a MISSING or
+    /// INCOMPLETE AI_INTERVIEWER_TOOLS directory (e.g. one that only has the
+    /// exe without its required companion DLLs/data) would otherwise report
+    /// `ready = true` and then fail at runtime. This is an existence/layout
+    /// check: it detects missing assets, not byte-for-byte tampering of a
+    /// present executable (see the Strategy-B integrity contract).
     ///
     /// Readiness resolves ONE coherent Piper layout first (canonical
     /// preferred, matching the runtime resolver) via `resolve_piper` and
@@ -1070,8 +1073,9 @@ mod tests {
         }
     }
 
-    /// A damaged tools dir with only the exe and model (no companions) must
-    /// NOT report ready (P2-3): Piper would fail at runtime.
+    /// An INCOMPLETE tools dir with only the exe and model (no companions)
+    /// must NOT report ready (P2-3): Piper would fail at runtime. Missing
+    /// companions are detected by existence/layout validation, not hashing.
     #[test]
     fn validate_readiness_rejects_exe_only_piper_dir() {
         let tmp = tempfile::tempdir().unwrap();
