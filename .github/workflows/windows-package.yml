@@ -1,0 +1,205 @@
+name: Windows Offline Package
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main, develop]
+  workflow_dispatch:
+  release:
+    types: [published]
+
+concurrency:
+  group: windows-package-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Portable Package
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint -- --max-warnings=0
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Unit tests
+        run: npx vitest run
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Fetch tool binaries
+        run: |
+          pwsh scripts/fetch-tools.ps1 -ManifestPath resources/tool-manifest.json -ToolsDir tools
+
+      - name: Verify tool binaries
+        run: |
+          pwsh scripts/verify-tools.ps1 -ManifestPath resources/tool-manifest.json -ToolsDir tools
+
+      - name: Build Tauri app
+        # --no-bundle: this workflow ships a portable ZIP, not installers.
+        # Building MSI/NSIS here downloads WiX/NSIS, produces installers that
+        # are immediately discarded, and falsely suggests they are part of the
+        # supported distribution.
+        run: npx tauri build --no-bundle
+
+      - name: Create portable package
+        run: |
+          $version = (Get-Content src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          $zipName = "ai-interviewer-$version-windows-x64-portable.zip"
+          # Wipe any prior staging directory
+          Remove-Item -Path "portable" -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path "portable/tools" -Force | Out-Null
+          Copy-Item -Path "out" -Destination "portable/out" -Recurse
+          # Copy tool contents (not the directory itself) to avoid tools/tools/ nesting
+          Copy-Item -Path "tools/*" -Destination "portable/tools/" -Recurse -Force
+          Copy-Item -Path "src-tauri/target/release/ai-interviewer.exe" -Destination "portable/"
+          Copy-Item -Path "LICENSE" -Destination "portable/"
+          Copy-Item -Path "README.md" -Destination "portable/"
+          Copy-Item -Path "resources/tool-manifest.json" -Destination "portable/"
+          Copy-Item -Path "THIRD_PARTY_NOTICES" -Destination "portable/"
+          # Stage license files from resources/licenses/ to portable/licenses/
+          New-Item -ItemType Directory -Path "portable/licenses" -Force | Out-Null
+          Copy-Item -Path "resources/licenses/Piper-LICENSE.txt" -Destination "portable/licenses/"
+          Copy-Item -Path "resources/licenses/WhisperCPP-LICENSE.txt" -Destination "portable/licenses/"
+          Copy-Item -Path "resources/licenses/model-attribution.txt" -Destination "portable/licenses/"
+          Compress-Archive -Path "portable/*" -DestinationPath $zipName
+          echo "PORTABLE_ZIP=$zipName" >> $env:GITHUB_ENV
+
+      - name: Artifact smoke test
+        run: scripts\smoke-test.bat --artifact-only
+
+      - name: Validate staged portable artifact
+        run: |
+          $zip = "${{ env.PORTABLE_ZIP }}"
+          if (-not (Test-Path $zip)) {
+            Write-Error "Portable ZIP not found: $zip"
+            exit 1
+          }
+          $size = (Get-Item $zip).Length
+          Write-Host "Portable ZIP: $zip ($size bytes)"
+          if ($size -lt 1MB) {
+            Write-Error "Portable ZIP suspiciously small ($size bytes)"
+            exit 1
+          }
+          # Verify it contains expected entries with exact relative paths
+          $extractDir = "$env:TEMP\validate-check-$(Get-Random)"
+          Expand-Archive -Path $zip -DestinationPath $extractDir -Force
+          $required = @(
+            "ai-interviewer.exe",
+            "LICENSE",
+            "tools\piper\piper.exe",
+            "tools\piper\model.onnx",
+            "tools\piper\model.onnx.json",
+            "tools\piper\espeak-ng-data\phontab",
+            "tools\piper\espeak-ng.dll",
+            "tools\piper\piper_phonemize.dll",
+            "tools\piper\onnxruntime.dll",
+            "tools\piper\onnxruntime_providers_shared.dll",
+            "tools\whisper\Release\main.exe",
+            "tools\models\ggml-tiny.en.bin",
+            "licenses\Piper-LICENSE.txt",
+            "licenses\WhisperCPP-LICENSE.txt",
+            "licenses\model-attribution.txt",
+            "tool-manifest.json",
+            "THIRD_PARTY_NOTICES",
+            "README.md"
+          )
+          $missing = @()
+          foreach ($relative in $required) {
+            $full = Join-Path $extractDir $relative
+            if (-not (Test-Path $full -PathType Leaf)) {
+              $missing += $relative
+            }
+          }
+          Remove-Item -Path $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+          if ($missing.Count -gt 0) {
+            Write-Error "Portable ZIP missing: $($missing -join ', ')"
+            exit 1
+          }
+          Write-Host "Portable artifact validated"
+
+      # Model-license policy (Policy A): the unresolved Piper voice model may
+      # be packaged into the portable ZIP and uploaded as a GitHub Actions
+      # artifact (retention 7 days). NOTE: this repository is PUBLIC, so the
+      # artifact is downloadable by anyone who can access the repository -
+      # Actions artifacts are not a privacy boundary for a distributable
+      # build. The artifact is intentionally permitted under Policy A; the
+      # PUBLIC GitHub Release upload remains gated by the RELEASE BLOCKER
+      # check in the `release` job below. If project policy changes to "no
+      # redistribution at all while unresolved" (Policy B), the license gate
+      # must run BEFORE this upload step instead.
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-portable
+          path: ${{ env.PORTABLE_ZIP }}
+          retention-days: 7
+
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # Policy A (documented at the build job's Upload artifact step): public
+      # GitHub Releases are prohibited while the model carries RELEASE
+      # BLOCKER. Actions artifacts (retention 7 days) are intentionally
+      # permitted under Policy A even though this public repo's artifacts are
+      # downloadable - the artifact is a CI build, not a release distribution
+      # channel. This gate must not be weakened.
+      - name: Release gate — voice-model licensing must be resolved
+        shell: pwsh
+        run: |
+          if (Select-String -Path resources/licenses/model-attribution.txt -Pattern 'RELEASE BLOCKER' -Quiet) {
+            Write-Error "Release blocked: resources/licenses/model-attribution.txt still marks the Piper voice model with a RELEASE BLOCKER. Resolve the voice-model distribution terms (or switch to a voice with documented redistribution rights) before publishing a release."
+            exit 1
+          }
+          Write-Host "Release gate passed: no RELEASE BLOCKER marker in model attribution."
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-portable
+
+      - name: Upload to release
+        # Write-capable third-party action: pinned to the full immutable commit
+        # SHA that the v2 tag resolves to (3bb12739c298aeb8a4eeaf626c5b8d85266b0e65)
+        # so a mutable tag cannot move underneath a `contents: write` token.
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+        with:
+          files: ai-interviewer-*.zip

@@ -25,6 +25,9 @@ Thumbs.db
 .env.local
 .env.*.local
 
+# TypeScript
+tsconfig.tsbuildinfo
+
 # Tauri
 src-tauri/WixTools/
 src-tauri/Frameworks/

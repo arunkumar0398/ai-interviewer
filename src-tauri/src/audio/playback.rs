@@ -1,22 +1,104 @@
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use crate::audio::pipe::StderrDrain;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
 use tokio::sync::mpsc;
-
 /// Piper outputs raw PCM at 22050 Hz mono — tied to the en_US-amy-medium model
-const PIPER_SAMPLE_RATE: u32 = 22050;
+pub(crate) const PIPER_SAMPLE_RATE: u32 = 22050;
+
+/// Maximum time allowed for a single playback operation before it is cancelled.
+/// Shared with the Piper supervisor's raw-PCM playback, which uses the same
+/// absolute bound for a stalled output device.
+pub(crate) const PLAYBACK_TIMEOUT_SECS: u64 = 120;
+
+/// Process-level timeout for standalone TTS generation. The child process owner
+/// enforces this directly — any outer timeout is only defense-in-depth.
+const GENERATE_TTS_TIMEOUT_SECS: u64 = 25;
+
+/// Maximum chunk size for reading Piper stdout in bounded reads.
+const STDOUT_CHUNK_SIZE: usize = 8192;
 
 /// Playback events sent to the UI
 #[derive(Debug, Clone, serde::Serialize)]
 pub enum PlaybackEvent {
     Started { duration_ms: u64 },
     Completed,
+    Cancelled,
     Error { message: String },
 }
 
-/// Play a WAV file through the system speakers using cpal
+/// Distinct outcome of a playback operation (P2-4). Cancellation (stop flag)
+/// is NOT success: callers must only report "Finished" for `Completed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackOutcome {
+    Completed,
+    Cancelled,
+}
+
+/// Wait for playback to finish, be cancelled, or fail. Completion is based on
+/// ACTUAL sample progress (P2-3): success only once the output callback has
+/// consumed `total_samples` samples. Elapsed expected duration alone is NOT
+/// proof of successful playback — a stalled output device (no progress) or a
+/// latched output-stream error fails the operation.
+/// Returns Ok(Completed) when every sample was consumed, Ok(Cancelled) on a
+/// controlled stop, and Err on a latched output error or when the absolute
+/// `deadline` passes without progress.
+pub fn await_playback(
+    playback_err: &std::sync::Mutex<Option<String>>,
+    stop_flag: Option<&AtomicBool>,
+    deadline: std::time::Instant,
+    position: &std::sync::atomic::AtomicUsize,
+    total_samples: usize,
+) -> anyhow::Result<PlaybackOutcome> {
+    loop {
+        if let Some(msg) = playback_err.lock().map(|g| g.clone()).unwrap_or_default() {
+            anyhow::bail!("{}", msg);
+        }
+        if position.load(Ordering::Relaxed) >= total_samples {
+            return Ok(PlaybackOutcome::Completed);
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("Playback timed out — output device did not make progress");
+        }
+        if let Some(flag) = stop_flag {
+            if flag.load(Ordering::SeqCst) {
+                return Ok(PlaybackOutcome::Cancelled);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Convert Piper's raw 16-bit little-endian PCM into samples, REJECTING
+/// empty or malformed output (P1-3). Piper exiting 0 with zero PCM must never
+/// be reported as successfully spoken: the candidate heard nothing. An odd
+/// byte length means truncated/corrupt output and is equally rejected.
+pub(crate) fn pcm_bytes_to_samples(pcm: &[u8]) -> anyhow::Result<Vec<i16>> {
+    if pcm.is_empty() {
+        anyhow::bail!("Piper produced no audio output");
+    }
+    if !pcm.len().is_multiple_of(2) {
+        anyhow::bail!(
+            "Piper produced malformed audio (odd byte length {})",
+            pcm.len()
+        );
+    }
+    Ok(pcm
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect())
+}
+
+/// Play a WAV file through the system speakers using cpal.
+/// Respects `stop_flag` for cancellation and enforces an internal timeout.
+/// On timeout or stop, the audio stream is dropped (stopping playback) and
+/// `Cancelled` is emitted.
 pub async fn play_wav(
     file_path: PathBuf,
     event_tx: mpsc::Sender<PlaybackEvent>,
+    stop_flag: Option<Arc<AtomicBool>>,
 ) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -54,10 +136,7 @@ pub async fn play_wav(
                 .filter_map(|s| s.ok())
                 .map(|s| s as f32 / 32768.0)
                 .collect(),
-            hound::SampleFormat::Float => reader
-                .samples::<f32>()
-                .filter_map(|s| s.ok())
-                .collect(),
+            hound::SampleFormat::Float => reader.samples::<f32>().filter_map(|s| s.ok()).collect(),
         };
 
         let samples = std::sync::Arc::new(samples);
@@ -65,6 +144,12 @@ pub async fn play_wav(
         let samples_clone = samples.clone();
         let pos_clone = pos.clone();
 
+        // Latch for asynchronous output-stream errors. The error callback
+        // writes here; the playback loop observes it so a device failure after
+        // stream.play() succeeds still fails the operation (P1-5).
+        let playback_err: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let err_latch = playback_err.clone();
         let err_tx = event_tx.clone();
         let stream = device.build_output_stream(
             &config,
@@ -82,22 +167,49 @@ pub async fn play_wav(
             },
             move |err| {
                 eprintln!("Output stream error: {}", err);
-                let _ = err_tx.try_send(PlaybackEvent::Error {
-                    message: format!("Playback error: {}", err),
-                });
+                let msg = format!("Playback error: {}", err);
+                if let Ok(mut guard) = err_latch.lock() {
+                    if guard.is_none() {
+                        *guard = Some(msg.clone());
+                    }
+                }
+                let _ = err_tx.try_send(PlaybackEvent::Error { message: msg });
             },
             None,
         )?;
 
         stream.play()?;
 
-        // Wait for playback to finish
-        // TODO: Replace busy-poll with tokio::sync::Notify for cleaner async wakeup
+        // Wait for playback to finish, with cancellation and timeout.
         let total_samples = samples.len();
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(PLAYBACK_TIMEOUT_SECS);
         loop {
+            // Async output error is authoritative — never report success after
+            // the device failed.
+            if let Some(msg) = playback_err.lock().map(|g| g.clone()).unwrap_or_default() {
+                drop(stream);
+                anyhow::bail!("{}", msg);
+            }
             let current = pos.load(std::sync::atomic::Ordering::Relaxed);
             if current >= total_samples {
                 break;
+            }
+            // Check external stop flag
+            if let Some(ref flag) = stop_flag {
+                if flag.load(Ordering::SeqCst) {
+                    drop(stream);
+                    let _ = event_tx.try_send(PlaybackEvent::Cancelled);
+                    return Ok(());
+                }
+            }
+            // Check internal deadline
+            if std::time::Instant::now() >= deadline {
+                drop(stream);
+                let _ = event_tx.try_send(PlaybackEvent::Error {
+                    message: format!("Playback timed out after {}s", PLAYBACK_TIMEOUT_SECS),
+                });
+                anyhow::bail!("Playback timed out after {}s", PLAYBACK_TIMEOUT_SECS);
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -110,13 +222,91 @@ pub async fn play_wav(
     .await?
 }
 
-/// Generate a TTS WAV file using Piper via stdin (correct invocation per spike findings)
+/// Generate a TTS WAV file using Piper via stdin.
+/// The child process owner enforces timeout, kill, wait/reap, and partial
+/// output cleanup directly. Any outer timeout is only defense-in-depth.
+/// Internal RAII cleanup for standalone TTS (RC-6): owns the provisional
+/// unique `.<uuid>.wav.tmp` THIS invocation writes. The temp is removed on
+/// EVERY failure path; on success it is atomically claimed via
+/// `finalize_tts_output` (RC-3) and the guard is disarmed. The FINAL path is
+/// never touched by cleanup — a pre-existing WAV (rejected up front) can
+/// never be overwritten or deleted by a failed or colliding generation.
+struct TtsTempGuard {
+    temp_path: PathBuf,
+    armed: bool,
+}
+
+impl TtsTempGuard {
+    fn new(temp_path: PathBuf) -> Self {
+        Self {
+            temp_path,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TtsTempGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.temp_path);
+        }
+    }
+}
+
+/// Atomic no-overwrite finalization for standalone TTS (RC-3). Creates a
+/// hard link from the completed temp to the final path — this is atomic on
+/// all platforms (fails atomically if the final already exists). Only one
+/// concurrent same-request_id invocation can claim the final; the loser
+/// observes AlreadyExists and reports the collision. The temp is unlinked on
+/// success (the hard link carries the content) and the caller may disarm its
+/// guard. On failure, the temp is NOT removed here (the caller's guard owns
+/// it).
+pub(crate) fn finalize_tts_output(temp_path: &Path, output_path: &Path) -> anyhow::Result<()> {
+    match std::fs::hard_link(temp_path, output_path) {
+        Ok(()) => {
+            // The final path now references the same content as temp. Unlink
+            // the temp — the hard link carries the WAV content.
+            let _ = std::fs::remove_file(temp_path);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            anyhow::bail!("TTS output already exists: {}", output_path.display());
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub async fn generate_tts(
     text: &str,
     output_path: PathBuf,
     piper_binary: Option<&str>,
     model_path: Option<&str>,
 ) -> anyhow::Result<()> {
+    // RC-6: a pre-existing final WAV is evidence — never overwrite or delete
+    // it. Reject BEFORE spawning any process or writing anything. This is the
+    // fast pre-check; the atomic hard-link claim below is the race-proof
+    // backstop.
+    if output_path.exists() {
+        anyhow::bail!("TTS output already exists: {}", output_path.display());
+    }
+    // RC-3: UNIQUE invocation-specific temp path — never a shared path that
+    // a concurrent same-ID call could target. The UUID guarantees isolation
+    // so one invocation can never delete another's active provisional file.
+    let stem = output_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("tts");
+    let invocation = uuid::Uuid::new_v4();
+    let temp_path = output_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join(format!("{}.{}.wav.tmp", stem, invocation));
+    let mut temp_guard = TtsTempGuard::new(temp_path.clone());
+
     let piper = piper_binary.unwrap_or("piper");
     let model = model_path.unwrap_or("en_US-amy-medium.onnx");
 
@@ -124,28 +314,135 @@ pub async fn generate_tts(
         .arg("--model")
         .arg(model)
         .arg("--output-raw")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
         .spawn()?;
+
+    // Drain stderr concurrently so Piper can never block on a full stderr
+    // pipe while we consume its stdout PCM.
+    let stderr_drain = child.stderr.take().map(StderrDrain::start);
+
+    // ONE absolute deadline for the whole process lifecycle (P2-4): stdout
+    // reads, cancellation selection, child exit, and the final wait all share
+    // this budget — EOF does not reset the timeout.
+    let deadline =
+        tokio::time::Instant::now() + tokio::time::Duration::from_secs(GENERATE_TTS_TIMEOUT_SECS);
 
     // Send text via stdin
     if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        stdin.write_all(text.as_bytes())?;
+        use tokio::io::AsyncWriteExt;
+        if let Err(e) = stdin.write_all(text.as_bytes()).await {
+            // Child may still be running — kill and reap explicitly. The
+            // temp guard removes only this invocation's artifacts; the final
+            // path is never touched (RC-6).
+            if !crate::audio::pipe::terminate_child(&mut child).await {
+                eprintln!(
+                    "[process-lifecycle] TTS child reap unresolved — child state not proven Reaped"
+                );
+            }
+            anyhow::bail!("Failed to write TTS text to Piper stdin: {}", e);
+        }
         drop(stdin); // close stdin to signal EOF
     }
 
-    let output = child.wait_with_output()?;
+    // Read stdout with async bounded reads and deadline enforcement
+    let mut raw_pcm = Vec::new();
+    let mut stdout = child.stdout.take();
+    let mut buf = vec![0u8; STDOUT_CHUNK_SIZE];
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Piper TTS failed: {}", stderr);
+    let read_result: anyhow::Result<()> = loop {
+        tokio::select! {
+            result = async {
+                if let Some(ref mut stdout) = stdout {
+                    stdout.read(&mut buf).await
+                } else {
+                    Ok(0)
+                }
+            } => {
+                match result {
+                    Ok(0) => break Ok(()), // EOF
+                    Ok(n) => raw_pcm.extend_from_slice(&buf[..n]),
+                    Err(e) => break Err(anyhow::anyhow!("Piper stdout read error: {}", e)),
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                if !crate::audio::pipe::terminate_child(&mut child).await {
+                    eprintln!(
+                        "[process-lifecycle] TTS child reap unresolved — child state not proven Reaped"
+                    );
+                }
+                anyhow::bail!(
+                    "TTS generation timed out after {}s — process killed",
+                    GENERATE_TTS_TIMEOUT_SECS
+                );
+            }
+        }
+    };
+
+    if let Err(e) = read_result {
+        // Child may still be running (stdout read error) — kill and reap.
+        if !crate::audio::pipe::terminate_child(&mut child).await {
+            eprintln!(
+                "[process-lifecycle] TTS child reap unresolved — child state not proven Reaped"
+            );
+        }
+        return Err(e);
+    }
+
+    // Wait for process to finish — the SAME absolute deadline (P2-4), so EOF
+    // does not grant a fresh timeout budget.
+    let wait_result = tokio::time::timeout_at(deadline, child.wait()).await;
+
+    match wait_result {
+        Ok(Ok(status)) => {
+            if !status.success() {
+                let stderr_msg = match &stderr_drain {
+                    Some(d) => d.text().await,
+                    None => String::new(),
+                };
+                anyhow::bail!(
+                    "Piper TTS failed (exit {}): {}",
+                    status.code().unwrap_or(-1),
+                    stderr_msg.trim()
+                );
+            }
+        }
+        Ok(Err(e)) => {
+            // Child state is uncertain after a wait error — terminate and
+            // reap explicitly before propagating (P2-2); kill_on_drop stays
+            // only as defense-in-depth.
+            if !crate::audio::pipe::terminate_child(&mut child).await {
+                eprintln!(
+                    "[process-lifecycle] TTS child reap unresolved — child state not proven Reaped"
+                );
+            }
+            anyhow::bail!("TTS process wait error: {}", e);
+        }
+        Err(_) => {
+            // Timeout waiting for child to exit — force kill and reap.
+            if !crate::audio::pipe::terminate_child(&mut child).await {
+                eprintln!(
+                    "[process-lifecycle] TTS child reap unresolved — child state not proven Reaped"
+                );
+            }
+            anyhow::bail!(
+                "TTS generation timed out after {}s — process killed",
+                GENERATE_TTS_TIMEOUT_SECS
+            );
+        }
     }
 
     // Piper outputs raw PCM (16-bit signed, mono, PIPER_SAMPLE_RATE Hz).
-    // Wrap it in a proper WAV file using hound.
-    let raw_pcm = output.stdout;
+    // Reject empty/malformed output BEFORE writing the WAV (P1-3): a zero-
+    // audio "success" must never produce an empty WAV or be reported as
+    // spoken.
+    let samples = pcm_bytes_to_samples(&raw_pcm)?;
+
+    // Write to the PROVISIONAL temp path, then atomically rename to the
+    // final path (RC-6): a failure here removes only this invocation's temp;
+    // the final path is created atomically and never pre-existed.
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate: PIPER_SAMPLE_RATE,
@@ -153,40 +450,381 @@ pub async fn generate_tts(
         sample_format: hound::SampleFormat::Int,
     };
 
-    let mut writer = hound::WavWriter::create(&output_path, spec)?;
-
-    // Convert raw bytes to i16 samples
-    for chunk in raw_pcm.chunks_exact(2) {
-        let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
-        writer.write_sample(sample)?;
+    {
+        let mut writer = hound::WavWriter::create(&temp_path, spec)?;
+        for sample in samples {
+            writer.write_sample(sample)?;
+        }
+        writer.finalize()?;
     }
 
-    writer.finalize()?;
+    // RC-3: atomic claim — hard-link succeeds only if final does not yet
+    // exist (cross-platform, no overwrite). If a concurrent same-ID call
+    // already claimed the final, this fails with AlreadyExists.
+    finalize_tts_output(&temp_path, &output_path)?;
+    // RC-8: disarm the temp guard ONLY after the temp removal is CONFIRMED.
+    // finalize_tts_output unlinks the temp best-effort; if that unlink failed
+    // (e.g. a transient Windows file lock), the temp still exists and the
+    // guard stays armed so its Drop performs a final best-effort cleanup
+    // attempt. The final WAV is already intact and is never touched again.
+    disarm_after_temp_confirmed(&mut temp_guard, &temp_path);
 
     Ok(())
 }
 
-/// Generate TTS using the absolute path to the Piper binary and model
+/// RC-8: disarm the temp guard ONLY after the temp file is confirmed gone.
+/// If the atomic final claim succeeded but the temp unlink failed, the guard
+/// stays armed so its Drop retries the removal — the final WAV is intact and
+/// never touched again.
+fn disarm_after_temp_confirmed(guard: &mut TtsTempGuard, temp_path: &Path) {
+    if !temp_path.exists() {
+        guard.disarm();
+    }
+}
+
+/// Generate TTS using paths resolved by `AppPaths`
 pub async fn generate_tts_with_paths(
     text: &str,
     output_path: PathBuf,
-    tools_dir: &str,
+    paths: &crate::paths::AppPaths,
 ) -> anyhow::Result<()> {
-    let base = PathBuf::from(tools_dir);
+    // Executable and model resolve from ONE coherent layout (P1-3) — the
+    // same resolver readiness uses, so execution always matches the
+    // validated runtime pair.
+    let piper = crate::paths::resolve_piper(&paths.tool_dir)
+        .ok_or_else(|| anyhow::anyhow!("Piper runtime not found"))?;
+    let piper_bin = piper.executable;
+    let piper_model = piper.model;
 
-    let piper_exe = base.join("piper").join("piper").join("piper.exe");
-    let model = base.join("piper-models").join("en_US-amy-medium.onnx");
-
-    // Validate paths exist before spawning
-    if !piper_exe.exists() {
-        anyhow::bail!("Piper binary not found at: {}", piper_exe.display());
+    // Validate paths exist before spawning process
+    if !piper_bin.exists() {
+        anyhow::bail!("Piper binary not found at: {}", piper_bin.display());
     }
-    if !model.exists() {
-        anyhow::bail!("Piper model not found at: {}", model.display());
+    if !piper_model.exists() {
+        anyhow::bail!("Piper model not found at: {}", piper_model.display());
     }
 
-    let piper_str = piper_exe.to_string_lossy().to_string();
-    let model_str = model.to_string_lossy().to_string();
+    // Ensure output directory exists
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let piper_str = piper_bin.to_string_lossy().to_string();
+    let model_str = piper_model.to_string_lossy().to_string();
 
     generate_tts(text, output_path, Some(&piper_str), Some(&model_str)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P1-5: an injected asynchronous playback error becomes an authoritative
+    /// Err — elapsed duration is NOT treated as proof of success.
+    #[test]
+    fn await_playback_surfaces_latched_output_error() {
+        let err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        *err.lock().unwrap() = Some("Output stream error: simulated device failure".to_string());
+        let stop = Arc::new(AtomicBool::new(false));
+        let position = std::sync::atomic::AtomicUsize::new(0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+
+        let result = await_playback(&err, Some(&stop), deadline, &position, 1000);
+        assert!(result.is_err(), "latched output error must fail playback");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("simulated device failure"),
+            "error message must surface, got: {}",
+            msg
+        );
+    }
+
+    /// P2-3: playback completes successfully only when the output callback has
+    /// consumed every sample — actual sample progress, not elapsed duration.
+    #[test]
+    fn await_playback_succeeds_once_position_reaches_total() {
+        let err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        let stop = Arc::new(AtomicBool::new(false));
+        let position = std::sync::atomic::AtomicUsize::new(44100); // fully consumed
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+
+        let result = await_playback(&err, Some(&stop), deadline, &position, 44100);
+        assert_eq!(
+            result.unwrap(),
+            PlaybackOutcome::Completed,
+            "position >= total must be Completed"
+        );
+    }
+
+    /// P2-3: a stalled output device (no sample progress) until the absolute
+    /// deadline is an error, never a success.
+    #[test]
+    fn await_playback_errors_when_position_stalls_until_deadline() {
+        let err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        let stop = Arc::new(AtomicBool::new(false));
+        let position = std::sync::atomic::AtomicUsize::new(0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+
+        let result = await_playback(&err, Some(&stop), deadline, &position, 44100);
+        assert!(result.is_err(), "stalled playback must time out");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("timed out"),
+            "timeout error must be explicit, got: {}",
+            msg
+        );
+    }
+
+    /// P2-4: cancellation (stop flag) is a DISTINCT outcome — never
+    /// "Completed", so callers must not emit Finished on a cancelled playback.
+    #[test]
+    fn await_playback_returns_cancelled_on_stop() {
+        let err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        let stop = Arc::new(AtomicBool::new(true));
+        let position = std::sync::atomic::AtomicUsize::new(0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+
+        let result = await_playback(&err, Some(&stop), deadline, &position, 1000);
+        assert_eq!(
+            result.unwrap(),
+            PlaybackOutcome::Cancelled,
+            "stop must yield Cancelled, not Completed"
+        );
+    }
+
+    /// P1-3: zero PCM from Piper is an explicit failure, never silent success.
+    #[test]
+    fn pcm_bytes_to_samples_rejects_empty_output() {
+        let err = pcm_bytes_to_samples(&[]).unwrap_err();
+        assert!(
+            err.to_string().contains("no audio output"),
+            "empty PCM must be rejected explicitly, got: {}",
+            err
+        );
+    }
+
+    /// P1-3: truncated (odd-length) PCM is an explicit failure.
+    #[test]
+    fn pcm_bytes_to_samples_rejects_odd_length() {
+        let err = pcm_bytes_to_samples(&[0u8, 0u8, 0u8]).unwrap_err();
+        assert!(
+            err.to_string().contains("odd byte length"),
+            "odd-length PCM must be rejected, got: {}",
+            err
+        );
+    }
+
+    /// P1-3: valid even-length PCM parses into i16 samples.
+    #[test]
+    fn pcm_bytes_to_samples_parses_even_length() {
+        let samples = pcm_bytes_to_samples(&[0x01, 0x00, 0xFF, 0xFF]).unwrap();
+        assert_eq!(samples, vec![1i16, -1i16]);
+    }
+
+    /// RC-6: a pre-existing final WAV is rejected BEFORE any process is
+    /// spawned, and the original file stays byte-for-byte unchanged. No
+    /// temp artifact is left behind.
+    #[tokio::test]
+    async fn generate_tts_rejects_existing_final_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("tts.wav");
+        let original = b"pre-existing-tts-evidence";
+        std::fs::write(&output, original).unwrap();
+
+        let result = generate_tts(
+            "hello",
+            output.clone(),
+            Some("definitely-missing-piper-binary"),
+            Some("model.onnx"),
+        )
+        .await;
+
+        assert!(result.is_err(), "existing final must be rejected");
+        assert!(
+            result.unwrap_err().to_string().contains("already exists"),
+            "collision must be reported explicitly"
+        );
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            original,
+            "pre-existing TTS WAV must be byte-for-byte unchanged"
+        );
+        // RC-3: no temp file of any name may remain.
+        let dir = output.parent().unwrap();
+        assert!(
+            !std::fs::read_dir(dir).unwrap().any(|e| e
+                .as_ref()
+                .is_ok_and(|e| { e.file_name().to_string_lossy().contains(".wav.tmp") })),
+            "no temp artifact may be left after collision rejection"
+        );
+    }
+
+    /// RC-6: a failed generation (process spawn failure) leaves NO final
+    /// and NO temp artifact — only this invocation's artifacts are ever
+    /// removed or created.
+    #[tokio::test]
+    async fn generate_tts_failure_leaves_no_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("tts.wav");
+
+        let result = generate_tts(
+            "hello",
+            output.clone(),
+            Some("definitely-missing-piper-binary"),
+            Some("model.onnx"),
+        )
+        .await;
+
+        assert!(result.is_err(), "missing piper binary must fail");
+        assert!(
+            !output.exists(),
+            "failed generation must not leave a final WAV"
+        );
+        // RC-3: no temp file of any name may remain.
+        let dir = output.parent().unwrap();
+        assert!(
+            !std::fs::read_dir(dir).unwrap().any(|e| e
+                .as_ref()
+                .is_ok_and(|e| { e.file_name().to_string_lossy().contains(".wav.tmp") })),
+            "failed generation must not leave a temp WAV"
+        );
+    }
+
+    /// RC-3: two concurrent same-request_id TTS invocations must not corrupt
+    /// each other's output. This tests the atomic claim function directly: one
+    /// caller owns the final output, the other observes AlreadyExists, and no
+    /// stale temp files remain. Model/Piper process not needed.
+    #[test]
+    fn finalize_tts_output_concurrent_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("tts.wav");
+
+        // Two unique temps with distinct content, targeting the same final.
+        let temp_a = dir.path().join("tts.a.wav.tmp");
+        let temp_b = dir.path().join("tts.b.wav.tmp");
+        let content_a = b"caller-a-content";
+        let content_b = b"caller-b-content";
+        std::fs::write(&temp_a, content_a).unwrap();
+        std::fs::write(&temp_b, content_b).unwrap();
+
+        // Drive both finalizations — at most one succeeds.
+        let mut result_a = None;
+        let mut result_b = None;
+        std::thread::scope(|scope| {
+            let r_a = scope.spawn(|| finalize_tts_output(&temp_a, &final_path));
+            let r_b = scope.spawn(|| finalize_tts_output(&temp_b, &final_path));
+            result_a = Some(r_a.join().unwrap());
+            result_b = Some(r_b.join().unwrap());
+        });
+
+        let ra = result_a.unwrap();
+        let rb = result_b.unwrap();
+
+        // Exactly one succeeded.
+        let winners = [ra.is_ok(), rb.is_ok()];
+        assert_eq!(
+            winners.iter().filter(|&&w| w).count(),
+            1,
+            "exactly one invocation must claim the final output"
+        );
+
+        // The loser must report AlreadyExists.
+        let loser_err = ra.as_ref().err().or_else(|| rb.as_ref().err()).unwrap();
+        assert!(
+            loser_err.to_string().contains("already exists"),
+            "loser must report AlreadyExists, got: {}",
+            loser_err
+        );
+
+        // The final WAV has exactly one caller's complete content (winner).
+        let final_content = std::fs::read(&final_path).unwrap();
+        assert!(
+            final_content == content_a || final_content == content_b,
+            "final must contain exactly one caller's complete content, not mixed/empty"
+        );
+
+        // Clean up the loser's temp (as TtsTempGuard would).
+        for (result, temp) in [(&ra, &temp_a), (&rb, &temp_b)] {
+            if result.is_err() {
+                let _ = std::fs::remove_file(temp);
+            }
+        }
+
+        // No stale .wav.tmp files remain after finalization + guard cleanup.
+        let remaining_temps: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".wav.tmp"))
+            .collect();
+        assert!(
+            remaining_temps.is_empty(),
+            "no stale temp files may remain; found: {:?}",
+            remaining_temps
+        );
+
+        // Re-finalization on the existing final with a fresh temp fails.
+        let temp_c = dir.path().join("tts.c.wav.tmp");
+        std::fs::write(&temp_c, b"stale-content").unwrap();
+        let redo = finalize_tts_output(&temp_c, &final_path);
+        assert!(
+            redo.is_err() && redo.unwrap_err().to_string().contains("already exists"),
+            "re-finalization after a successful claim must be rejected"
+        );
+        let _ = std::fs::remove_file(&temp_c);
+    }
+
+    /// RC-8: a successful final claim leaves no invocation temp behind, and
+    /// the final WAV carries the complete content.
+    #[test]
+    fn finalize_tts_output_leaves_no_temp_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("tts.uuid.wav.tmp");
+        let final_path = dir.path().join("tts.wav");
+        std::fs::write(&temp, b"audio-content").unwrap();
+
+        finalize_tts_output(&temp, &final_path).unwrap();
+
+        assert!(final_path.exists(), "final WAV must be intact");
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"audio-content");
+        assert!(
+            !temp.exists(),
+            "successful claim must not leave a temp file"
+        );
+    }
+
+    /// RC-8: when the temp is confirmed gone, the guard is disarmed (no
+    /// redundant cleanup attempt).
+    #[test]
+    fn tts_temp_guard_disarms_when_temp_confirmed_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("tts.uuid.wav.tmp");
+        std::fs::write(&temp, b"audio").unwrap();
+
+        let mut guard = TtsTempGuard::new(temp.clone());
+        // Successful claim + unlink: remove the temp, then confirm.
+        std::fs::remove_file(&temp).unwrap();
+        disarm_after_temp_confirmed(&mut guard, &temp);
+        drop(guard);
+    }
+
+    /// RC-8: a temp that still exists after the claim (simulated unlink
+    /// failure) keeps the guard ARMED, so its Drop retries the removal — no
+    /// stale temp survives and the final WAV (already claimed) is untouched.
+    #[test]
+    fn tts_temp_guard_stays_armed_until_temp_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("tts.uuid.wav.tmp");
+        std::fs::write(&temp, b"audio").unwrap();
+
+        let mut guard = TtsTempGuard::new(temp.clone());
+        // Unlink failure simulation: the temp still exists -> not disarmed.
+        disarm_after_temp_confirmed(&mut guard, &temp);
+        assert!(
+            temp.exists(),
+            "precondition: temp still exists (simulated unlink failure)"
+        );
+        // Guard Drop performs the final best-effort cleanup attempt.
+        drop(guard);
+        assert!(!temp.exists(), "armed guard Drop must retry temp removal");
+    }
 }

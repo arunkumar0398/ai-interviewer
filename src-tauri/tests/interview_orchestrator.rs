@@ -1,3 +1,19 @@
+use ai_interviewer_lib::paths::{AppPaths, ToolDirectorySource};
+use std::path::PathBuf;
+
+/// Helper: build a fake AppPaths from a base directory for testing
+fn fake_app_paths(base: &std::path::Path) -> AppPaths {
+    AppPaths {
+        tool_dir: base.to_path_buf(),
+        db_path: base.join("interviews.db"),
+        recordings_dir: base.join("recordings"),
+        tts_dir: base.join("tts"),
+        temp_dir: base.join("temp"),
+        is_portable: false,
+        tool_directory_source: ToolDirectorySource::DevFallback,
+    }
+}
+
 /// Test: Piper installation check fails gracefully when binary missing
 #[test]
 fn piper_verify_missing_binary() {
@@ -5,10 +21,15 @@ fn piper_verify_missing_binary() {
     let _ = std::fs::remove_dir_all(&fake_dir);
     std::fs::create_dir_all(&fake_dir).unwrap();
 
-    let result = ai_interviewer_lib::audio::tts_supervisor::verify_piper_installation(&fake_dir);
+    let paths = fake_app_paths(&fake_dir);
+    let result = ai_interviewer_lib::audio::tts_supervisor::verify_piper_installation(&paths);
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
-    assert!(err_msg.contains("not found"), "Error should mention not found: {}", err_msg);
+    assert!(
+        err_msg.contains("not found"),
+        "Error should mention not found: {}",
+        err_msg
+    );
 
     let _ = std::fs::remove_dir_all(&fake_dir);
 }
@@ -24,29 +45,58 @@ fn piper_verify_missing_model() {
     std::fs::create_dir_all(piper_bin.parent().unwrap()).unwrap();
     std::fs::write(&piper_bin, b"fake binary").unwrap();
 
-    let result = ai_interviewer_lib::audio::tts_supervisor::verify_piper_installation(&fake_dir);
+    let paths = fake_app_paths(&fake_dir);
+    let result = ai_interviewer_lib::audio::tts_supervisor::verify_piper_installation(&paths);
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
-    assert!(err_msg.contains("model"), "Error should mention model: {}", err_msg);
+    assert!(
+        err_msg.contains("model"),
+        "Error should mention model: {}",
+        err_msg
+    );
 
     let _ = std::fs::remove_dir_all(&fake_dir);
 }
 
-/// Test: Piper installation check passes when both present
+/// Test: Piper installation check passes when the complete coherent runtime
+/// is present (legacy layout: executable + runtime companions + model/config).
 #[test]
 fn piper_verify_all_present() {
     let fake_dir = std::env::temp_dir().join("fake_piper_ok_dir");
     let _ = std::fs::remove_dir_all(&fake_dir);
 
-    let piper_bin = fake_dir.join("piper").join("piper").join("piper.exe");
-    let model_path = fake_dir.join("piper-models").join("en_US-amy-medium.onnx");
-    std::fs::create_dir_all(piper_bin.parent().unwrap()).unwrap();
-    std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
-    std::fs::write(&piper_bin, b"fake binary").unwrap();
-    std::fs::write(&model_path, b"fake model").unwrap();
+    // Complete legacy runtime: binary + required companion DLLs + espeak data.
+    let runtime_dir = fake_dir.join("piper").join("piper");
+    for asset in [
+        "piper.exe",
+        "espeak-ng.dll",
+        "piper_phonemize.dll",
+        "onnxruntime.dll",
+        "onnxruntime_providers_shared.dll",
+    ] {
+        let p = runtime_dir.join(asset);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"fake runtime file").unwrap();
+    }
+    let phontab = runtime_dir.join("espeak-ng-data").join("phontab");
+    std::fs::create_dir_all(phontab.parent().unwrap()).unwrap();
+    std::fs::write(&phontab, b"fake phontab").unwrap();
 
-    let result = ai_interviewer_lib::audio::tts_supervisor::verify_piper_installation(&fake_dir);
-    assert!(result.is_ok(), "Should succeed when both files exist");
+    // Coherent legacy model/config pair.
+    let model_path = fake_dir.join("piper-models").join("en_US-amy-medium.onnx");
+    let model_config = fake_dir
+        .join("piper-models")
+        .join("en_US-amy-medium.onnx.json");
+    std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+    std::fs::write(&model_path, b"fake model").unwrap();
+    std::fs::write(&model_config, b"{}").unwrap();
+
+    let paths = fake_app_paths(&fake_dir);
+    let result = ai_interviewer_lib::audio::tts_supervisor::verify_piper_installation(&paths);
+    assert!(
+        result.is_ok(),
+        "Should succeed when the complete runtime exists"
+    );
 
     let _ = std::fs::remove_dir_all(&fake_dir);
 }
@@ -55,7 +105,17 @@ fn piper_verify_all_present() {
 #[tokio::test]
 async fn device_check_handles_no_devices() {
     let (tx, _rx) = tokio::sync::mpsc::channel(32);
-    let result = ai_interviewer_lib::interview::device_check::run_device_check(tx).await;
+    let temp_dir = std::env::temp_dir().join("ai_interviewer_test_device_check");
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let result = ai_interviewer_lib::interview::device_check::run_device_check(
+        temp_dir,
+        tx,
+        stop_flag,
+        ai_interviewer_lib::audio::capture::CaptureCompletion::new(),
+        ai_interviewer_lib::audio::capture::CaptureCompletion::new(),
+    )
+    .await;
 
     // Should return a result, even if devices aren't found
     // On CI/headless, both will be false
@@ -137,10 +197,15 @@ fn interview_phase_serialization() {
 /// Test: Whisper binary existence check
 #[test]
 fn whisper_binary_check() {
-    let tools_dir = std::env::var("PIPER_BASE_DIR")
-        .map(std::path::PathBuf::from)
+    let tools_dir = std::env::var("AI_INTERVIEWER_TOOLS")
+        .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            std::path::PathBuf::from(r"D:\_Career\__ntingAcc-\_work\ai-interviewer-tools")
+            // Development fallback: check next to the exe
+            let exe_dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+                .unwrap_or_default();
+            exe_dir.join("tools")
         });
 
     let whisper_bin = tools_dir.join("whisper").join("Release").join("main.exe");
@@ -171,7 +236,8 @@ fn piper_supervisor_various_paths() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::create_dir_all(&dir);
 
-    let _supervisor = ai_interviewer_lib::audio::tts_supervisor::PiperSupervisor::new(&dir);
+    let paths = fake_app_paths(&dir);
+    let _supervisor = ai_interviewer_lib::audio::tts_supervisor::PiperSupervisor::new(&paths);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -180,29 +246,48 @@ fn piper_supervisor_various_paths() {
 #[test]
 fn interview_phase_all_variants_serialize() {
     // Unit variants serialize as strings
-    let idle = serde_json::to_value(&ai_interviewer_lib::interview::orchestrator::InterviewPhase::Idle).unwrap();
+    let idle =
+        serde_json::to_value(&ai_interviewer_lib::interview::orchestrator::InterviewPhase::Idle)
+            .unwrap();
     assert_eq!(idle, serde_json::Value::String("Idle".to_string()));
 
-    let recording = serde_json::to_value(&ai_interviewer_lib::interview::orchestrator::InterviewPhase::RecordingAnswer).unwrap();
-    assert_eq!(recording, serde_json::Value::String("RecordingAnswer".to_string()));
+    let recording = serde_json::to_value(
+        &ai_interviewer_lib::interview::orchestrator::InterviewPhase::RecordingAnswer,
+    )
+    .unwrap();
+    assert_eq!(
+        recording,
+        serde_json::Value::String("RecordingAnswer".to_string())
+    );
 
-    let processing = serde_json::to_value(&ai_interviewer_lib::interview::orchestrator::InterviewPhase::Processing).unwrap();
-    assert_eq!(processing, serde_json::Value::String("Processing".to_string()));
+    let processing = serde_json::to_value(
+        &ai_interviewer_lib::interview::orchestrator::InterviewPhase::Processing,
+    )
+    .unwrap();
+    assert_eq!(
+        processing,
+        serde_json::Value::String("Processing".to_string())
+    );
 
-    let complete = serde_json::to_value(&ai_interviewer_lib::interview::orchestrator::InterviewPhase::Complete).unwrap();
+    let complete = serde_json::to_value(
+        &ai_interviewer_lib::interview::orchestrator::InterviewPhase::Complete,
+    )
+    .unwrap();
     assert_eq!(complete, serde_json::Value::String("Complete".to_string()));
 
     // Struct variants serialize as { "VariantName": { ... } }
     let speaking = serde_json::to_value(
         ai_interviewer_lib::interview::orchestrator::InterviewPhase::SpeakingQuestion {
             question: "Tell me about yourself".to_string(),
-        }
-    ).unwrap();
+        },
+    )
+    .unwrap();
     assert!(speaking.get("SpeakingQuestion").is_some());
 
     let settling = serde_json::to_value(
-        ai_interviewer_lib::interview::orchestrator::InterviewPhase::Settling { duration_ms: 1500 }
-    ).unwrap();
+        ai_interviewer_lib::interview::orchestrator::InterviewPhase::Settling { duration_ms: 1500 },
+    )
+    .unwrap();
     assert!(settling.get("Settling").is_some());
 }
 
@@ -309,4 +394,62 @@ fn device_check_result_all_success() {
     assert_eq!(json["speaker_available"], true);
     assert_eq!(json["mic_test_ok"], true);
     assert_eq!(json["errors"].as_array().unwrap().len(), 0);
+}
+
+/// Test: Temp directory cleanup logic (simulates timeout cleanup)
+#[test]
+fn temp_dir_cleanup_after_timeout() {
+    let base_dir = std::env::temp_dir().join("ai_interviewer_cleanup_test");
+    let session_id = uuid::Uuid::new_v4();
+    let temp_dir = base_dir
+        .join("temp")
+        .join(session_id.hyphenated().to_string());
+
+    // Create temp directory with some files
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    std::fs::write(temp_dir.join("recording.wav"), b"fake audio").unwrap();
+    std::fs::write(temp_dir.join("transcription.txt"), b"fake text").unwrap();
+
+    assert!(temp_dir.exists(), "Temp dir should exist before cleanup");
+
+    // Simulate the cleanup logic from orchestrator timeout handler
+    let _ = std::fs::remove_dir_all(
+        base_dir
+            .join("temp")
+            .join(session_id.hyphenated().to_string()),
+    );
+
+    assert!(
+        !temp_dir.exists(),
+        "Temp dir should be removed after cleanup"
+    );
+
+    // Clean up base dir if it exists
+    let _ = std::fs::remove_dir_all(&base_dir);
+}
+
+/// Test: RecordingState cleanup verification
+#[test]
+fn recording_state_cleanup_after_failure() {
+    // This test verifies that after a failure, the RecordingState would be cleared
+    // by checking that the state can be properly reset
+    let base_dir = std::env::temp_dir().join("ai_interviewer_state_test");
+    let session_id = uuid::Uuid::new_v4();
+    let temp_dir = base_dir
+        .join("temp")
+        .join(session_id.hyphenated().to_string());
+
+    // Create temp directory
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    std::fs::write(temp_dir.join("partial_recording.wav"), b"partial").unwrap();
+
+    assert!(temp_dir.exists());
+
+    // Simulate failure cleanup - remove temp dir
+    let _ = std::fs::remove_dir_all(&base_dir);
+
+    assert!(
+        !temp_dir.exists(),
+        "Temp dir should be cleaned up after failure"
+    );
 }

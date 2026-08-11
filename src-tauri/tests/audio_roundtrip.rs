@@ -36,7 +36,10 @@ fn wav_write_read_roundtrip() {
     let samples: Vec<i16> = reader.samples::<i16>().map(|s| s.unwrap()).collect();
 
     assert_eq!(samples.len(), 16000); // 1 second at 16kHz
-    assert!(samples.iter().any(|&s| s != 0), "Should have non-zero samples");
+    assert!(
+        samples.iter().any(|&s| s != 0),
+        "Should have non-zero samples"
+    );
 
     // Cleanup
     let _ = std::fs::remove_file(&wav_path);
@@ -88,7 +91,9 @@ fn sha256_file_matches_memory() {
         let mut buf = [0u8; 8192];
         loop {
             let n = std::io::Read::read(&mut file, &mut buf).unwrap();
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             hasher.update(&buf[..n]);
         }
         format!("{:x}", hasher.finalize())
@@ -215,7 +220,10 @@ fn wav_settling_period_simulation() {
     let mut reader = hound::WavReader::open(&wav_path).unwrap();
     let samples: Vec<i16> = reader.samples::<i16>().map(|s| s.unwrap()).collect();
     assert_eq!(samples.len(), 80000, "5 seconds at 16kHz");
-    assert!(samples.iter().all(|&s| s == 0), "All samples should be zero");
+    assert!(
+        samples.iter().all(|&s| s == 0),
+        "All samples should be zero"
+    );
 
     let _ = std::fs::remove_file(&wav_path);
 }
@@ -237,7 +245,8 @@ fn wav_max_duration_boundary() {
         let mut writer = hound::WavWriter::create(&wav_path, spec).unwrap();
         // Write 60 seconds of a simple pattern
         for i in 0..(16000 * 60) {
-            let sample = ((i as f64 / 16000.0 * 440.0 * 2.0 * std::f64::consts::PI).sin() * 32767.0) as i16;
+            let sample =
+                ((i as f64 / 16000.0 * 440.0 * 2.0 * std::f64::consts::PI).sin() * 32767.0) as i16;
             writer.write_sample(sample).unwrap();
             // Periodic flush like our capture code
             if i % 8000 == 0 {
@@ -278,7 +287,9 @@ fn sha256_large_file_deterministic() {
         let mut buf = [0u8; 8192];
         loop {
             let n = std::io::Read::read(&mut file, &mut buf).unwrap();
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             hasher.update(&buf[..n]);
         }
         format!("{:x}", hasher.finalize())
@@ -290,7 +301,9 @@ fn sha256_large_file_deterministic() {
         let mut buf = [0u8; 8192];
         loop {
             let n = std::io::Read::read(&mut file, &mut buf).unwrap();
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             hasher.update(&buf[..n]);
         }
         format!("{:x}", hasher.finalize())
@@ -337,7 +350,8 @@ fn wav_multiple_sample_rates() {
         {
             let mut writer = hound::WavWriter::create(&wav_path, spec).unwrap();
             for i in 0..*rate {
-                let sample = ((i as f64 / *rate as f64 * 440.0 * 2.0 * std::f64::consts::PI).sin() * 32767.0) as i16;
+                let sample = ((i as f64 / *rate as f64 * 440.0 * 2.0 * std::f64::consts::PI).sin()
+                    * 32767.0) as i16;
                 writer.write_sample(sample).unwrap();
             }
             writer.finalize().unwrap();
@@ -379,7 +393,8 @@ fn wav_duration_formula_matches_file() {
     {
         let mut writer = hound::WavWriter::create(&wav_path, spec).unwrap();
         for i in 0..(16000 * 3) {
-            let sample = ((i as f64 / 16000.0 * 440.0 * 2.0 * std::f64::consts::PI).sin() * 32767.0) as i16;
+            let sample =
+                ((i as f64 / 16000.0 * 440.0 * 2.0 * std::f64::consts::PI).sin() * 32767.0) as i16;
             writer.write_sample(sample).unwrap();
         }
         writer.finalize().unwrap();
@@ -393,7 +408,7 @@ fn wav_duration_formula_matches_file() {
 
     // Should be approximately 3000ms (within 100ms tolerance for header variations)
     assert!(
-        duration_ms >= 2900 && duration_ms <= 3100,
+        (2900..=3100).contains(&duration_ms),
         "Duration should be ~3000ms, got {}ms (file_size={})",
         duration_ms,
         file_size

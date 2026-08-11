@@ -2,6 +2,8 @@
 
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import Link from "next/link";
+import { INTERVIEW_QUESTIONS } from "../../lib/interview-questions";
 
 interface InterviewSession {
   id: string;
@@ -26,39 +28,18 @@ interface InterviewRound {
   created_at: string;
 }
 
-const QUESTIONS = [
-  "Tell me about yourself and your background.",
-  "What is your experience with Rust or systems programming?",
-  "Describe a challenging technical problem you solved recently.",
-  "How do you approach debugging complex issues?",
-  "What interests you about this role?",
-];
-
+// The question bank is the SAME fixed set /interview asks (single shared
+// source of truth, P1-2) — read-only in this version.
 export default function DashboardPage() {
   const [sessions, setSessions] = useState<InterviewSession[]>([]);
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
   const [rounds, setRounds] = useState<InterviewRound[]>([]);
   const [candidateName, setCandidateName] = useState("");
-  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  // The active interview session created here (id + candidate name). The
+  // session id is handed to /interview so the interview runs against THIS
+  // session — the interview page must not create a second, orphan session.
+  const [activeSession, setActiveSession] = useState<{ id: string; name: string } | null>(null);
   const [dbReady, setDbReady] = useState(false);
-  const [questions, setQuestions] = useState<string[]>(QUESTIONS);
-
-  useEffect(() => {
-    initDb();
-  }, []);
-
-  const initDb = async () => {
-    try {
-      const appDir = await invoke<string>("get_app_dir");
-      await invoke("init_database", {
-        dbPath: `${appDir}/interviews.db`,
-      });
-      setDbReady(true);
-      loadSessions();
-    } catch (e) {
-      console.error("Failed to init DB:", e);
-    }
-  };
 
   const loadSessions = async () => {
     try {
@@ -68,6 +49,19 @@ export default function DashboardPage() {
       console.error("Failed to load sessions:", e);
     }
   };
+
+  useEffect(() => {
+    const initDb = async () => {
+      try {
+        await invoke("get_app_config");
+        setDbReady(true);
+        await loadSessions();
+      } catch (e) {
+        console.error("Failed to init DB:", e);
+      }
+    };
+    initDb();
+  }, []);
 
   const loadRounds = async (sessionId: string) => {
     try {
@@ -81,33 +75,18 @@ export default function DashboardPage() {
 
   const startNewSession = async () => {
     if (!candidateName.trim()) return;
-    const sessionId = `session-${Date.now()}`;
+    const sessionId = crypto.randomUUID();
     try {
       await invoke("create_session", {
         sessionId,
         candidateName: candidateName.trim(),
       });
-      setActiveSessionId(sessionId);
+      setActiveSession({ id: sessionId, name: candidateName.trim() });
       setCandidateName("");
       loadSessions();
     } catch (e) {
       console.error("Failed to create session:", e);
     }
-  };
-
-  const addQuestion = () => {
-    setQuestions([...questions, ""]);
-  };
-
-  const updateQuestion = (index: number, value: string) => {
-    const updated = [...questions];
-    updated[index] = value;
-    setQuestions(updated);
-  };
-
-  const removeQuestion = (index: number) => {
-    if (questions.length <= 1) return;
-    setQuestions(questions.filter((_, i) => i !== index));
   };
 
   return (
@@ -117,12 +96,12 @@ export default function DashboardPage() {
           <h1 className="text-3xl font-bold text-gray-900">
             Recruiter Dashboard
           </h1>
-          <a
+          <Link
             href="/"
             className="text-blue-600 hover:text-blue-800 text-sm font-medium"
           >
             &larr; Back to Home
-          </a>
+          </Link>
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -133,75 +112,61 @@ export default function DashboardPage() {
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">
                   Candidate Name
-                </label>
-                <input
-                  type="text"
-                  value={candidateName}
-                  onChange={(e) => setCandidateName(e.target.value)}
-                  placeholder="Enter candidate name"
-                  className="w-full border rounded-lg px-3 py-2 text-sm"
-                  disabled={!!activeSessionId}
-                />
-              </div>
-              <button
-                onClick={startNewSession}
-                disabled={!dbReady || !candidateName.trim() || !!activeSessionId}
-                className="w-full bg-blue-600 text-white rounded-lg px-4 py-2 text-sm font-medium hover:bg-blue-700 disabled:bg-gray-300"
-              >
-                {activeSessionId ? "Session Active" : "Start Interview"}
-              </button>
-              {activeSessionId && (
-                <div className="bg-green-50 border border-green-200 rounded-lg p-3 text-sm">
-                  <p className="font-medium text-green-800">Session Active</p>
-                  <p className="text-green-600 text-xs mt-1">
-                    ID: {activeSessionId.slice(0, 20)}...
-                  </p>
-                  <p className="text-xs text-gray-500 mt-1">
-                    Go to{" "}
-                    <a href="/interview" className="text-blue-600 underline">
-                      /interview
-                    </a>{" "}
-                    to run the interview
-                  </p>
+                </label>                  <input
+                    type="text"
+                    value={candidateName}
+                    onChange={(e) => setCandidateName(e.target.value)}
+                    placeholder="Enter candidate name"
+                    className="w-full border rounded-lg px-3 py-2 text-sm"
+                    disabled={!!activeSession}
+                  />
                 </div>
-              )}
+                <button
+                  onClick={startNewSession}
+                  disabled={!dbReady || !candidateName.trim() || !!activeSession}
+                  className="w-full bg-blue-600 text-white rounded-lg px-4 py-2 text-sm font-medium hover:bg-blue-700 disabled:bg-gray-300"
+                >
+                  {activeSession ? "Session Active" : "Start Interview"}
+                </button>
+                {activeSession && (
+                  <div className="bg-green-50 border border-green-200 rounded-lg p-3 text-sm">
+                    <p className="font-medium text-green-800">Session Active</p>
+                    <p className="text-green-600 text-xs mt-1">
+                      Candidate: {activeSession.name}
+                    </p>
+                    <p className="text-xs text-gray-500 mt-1">
+                      Go to{" "}
+                      <Link
+                        // Session-only navigation (P2-4): the candidate name
+                        // stays in the DB, never in the URL (history,
+                        // screenshots, logs, copy/paste).
+                        href={`/interview?session=${activeSession.id}`}
+                        className="text-blue-600 underline"
+                      >
+                        /interview
+                      </Link>{" "}
+                      to run the interview — it will continue this session
+                    </p>
+                  </div>
+                )}
             </div>
           </div>
 
-          {/* Center: Question Bank */}
+          {/* Center: Question Bank (read-only in this version) */}
           <div className="bg-white rounded-lg shadow p-6">
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-lg font-semibold">Question Bank</h2>
-              <button
-                onClick={addQuestion}
-                className="text-blue-600 hover:text-blue-800 text-sm font-medium"
-              >
-                + Add
-              </button>
-            </div>
-            <div className="space-y-3 max-h-96 overflow-y-auto">
-              {questions.map((q, i) => (
-                <div key={i} className="flex gap-2">
-                  <span className="text-xs text-gray-400 mt-2 w-5">
-                    {i + 1}.
-                  </span>
-                  <input
-                    type="text"
-                    value={q}
-                    onChange={(e) => updateQuestion(i, e.target.value)}
-                    className="flex-1 border rounded px-2 py-1 text-sm"
-                    placeholder={`Question ${i + 1}`}
-                  />
-                  <button
-                    onClick={() => removeQuestion(i)}
-                    className="text-red-400 hover:text-red-600 text-sm px-1"
-                    disabled={questions.length <= 1}
-                  >
-                    x
-                  </button>
-                </div>
+            <h2 className="text-lg font-semibold mb-4">Question Bank</h2>
+            <p className="text-xs text-gray-400 mb-3">
+              Questions are fixed in this version (5 rounds, matching the
+              backend interview contract). Customization arrives with a later
+              template/session-snapshot feature.
+            </p>
+            <ol className="space-y-2 max-h-96 overflow-y-auto list-decimal list-inside">
+              {INTERVIEW_QUESTIONS.map((q, i) => (
+                <li key={i} className="text-sm text-gray-700">
+                  {q}
+                </li>
               ))}
-            </div>
+            </ol>
           </div>
 
           {/* Right: Past Sessions */}
@@ -212,31 +177,46 @@ export default function DashboardPage() {
             ) : (
               <div className="space-y-2 max-h-96 overflow-y-auto">
                 {sessions.map((s) => (
-                  <button
+                  <div
                     key={s.id}
-                    onClick={() => loadRounds(s.id)}
-                    className={`w-full text-left border rounded-lg p-3 text-sm transition ${
+                    className={`border rounded-lg p-3 text-sm transition ${
                       selectedSession === s.id
                         ? "border-blue-500 bg-blue-50"
                         : "border-gray-200 hover:border-gray-300"
                     }`}
                   >
-                    <div className="flex justify-between">
-                      <span className="font-medium">{s.candidate_name}</span>
-                      <span
-                        className={`text-xs px-2 py-0.5 rounded ${
-                          s.completed_at
-                            ? "bg-green-100 text-green-700"
-                            : "bg-yellow-100 text-yellow-700"
-                        }`}
+                    <button
+                      onClick={() => loadRounds(s.id)}
+                      className="w-full text-left"
+                    >
+                      <div className="flex justify-between">
+                        <span className="font-medium">{s.candidate_name}</span>
+                        <span
+                          className={`text-xs px-2 py-0.5 rounded ${
+                            s.completed_at
+                              ? "bg-green-100 text-green-700"
+                              : "bg-yellow-100 text-yellow-700"
+                          }`}
+                        >
+                          {s.completed_at ? "Completed" : "In Progress"}
+                        </span>
+                      </div>
+                      <div className="text-xs text-gray-500 mt-1">
+                        {s.total_rounds} rounds &middot; {s.started_at}
+                      </div>
+                    </button>
+                    {!s.completed_at && (
+                      <Link
+                        // RC-6: incomplete persisted sessions expose a normal
+                        // Resume action. Session-only URL (P2-4): the
+                        // candidate name stays in the DB, never in the URL.
+                        href={`/interview?session=${s.id}`}
+                        className="mt-2 inline-block text-xs font-medium text-blue-600 hover:text-blue-800"
                       >
-                        {s.completed_at ? "Completed" : "In Progress"}
-                      </span>
-                    </div>
-                    <div className="text-xs text-gray-500 mt-1">
-                      {s.total_rounds} rounds &middot; {s.started_at}
-                    </div>
-                  </button>
+                        Resume Interview &rarr;
+                      </Link>
+                    )}
+                  </div>
                 ))}
               </div>
             )}

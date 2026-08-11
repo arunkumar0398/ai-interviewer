@@ -1,7 +1,15 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+
+/// Result of a successful recording
+#[derive(Debug, Clone)]
+pub struct RecordResult {
+    pub file_path: std::path::PathBuf,
+    pub duration_ms: u64,
+    pub file_size_bytes: u64,
+}
 
 /// Audio capture events sent to the UI
 #[derive(Debug, Clone, serde::Serialize)]
@@ -24,22 +32,396 @@ impl RecordingHandle {
     }
 }
 
+/// Tri-state lifecycle of the PHYSICAL blocking capture worker (RC-2).
+/// `NotScheduled -> Scheduled -> Finished`:
+///
+/// - `NotScheduled`: `spawn_blocking` has not been submitted yet — the
+///   outer async wrapper is the whole lifecycle, so aborting it is safe
+///   (nothing physical can ever start).
+/// - `Scheduled`: the blocking capture HAS been submitted (marked BEFORE
+///   `spawn_blocking`, with no await in between) but the closure has not
+///   signalled `Finished`. The physical closure may begin executing at any
+///   moment — or sit queued on a busy blocking pool — so the recording slot
+///   MUST remain occupied. There is deliberately no intermediate "started"
+///   state: scheduled-but-not-yet-started is indistinguishable from running,
+///   and both own the slot.
+/// - `Finished`: the blocking closure has fully exited — safe to release
+///   the slot.
+///
+/// Recording-slot owners wait on `wait()` rather than trusting the outer
+/// `tokio::spawn` wrapper: aborting an async task cannot kill an
+/// already-submitted `spawn_blocking` CPAL closure, and a queued closure can
+/// start only after the slot would already have been released.
+#[derive(Clone, Default)]
+pub struct CaptureCompletion {
+    inner: Arc<tokio::sync::Notify>,
+    state: Arc<AtomicU8>,
+}
+
+// 0 = NotScheduled (the default), 1 = Scheduled, 2 = Finished.
+const STATE_SCHEDULED: u8 = 1;
+const STATE_FINISHED: u8 = 2;
+
+/// Observable capture lifecycle state (RC-2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CaptureState {
+    NotScheduled,
+    Scheduled,
+    Finished,
+}
+
+impl CaptureCompletion {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// MUST be called immediately BEFORE `tokio::task::spawn_blocking` with
+    /// no await in between (RC-2): once Scheduled, the recording slot can
+    /// never be freed until `Finished` is observed. This closes the race
+    /// where a blocking closure is queued (pool busy) but has not begun
+    /// executing when the owning command is cancelled — the slot stays
+    /// occupied and the queued capture can never start after slot release.
+    pub fn mark_scheduled(&self) {
+        self.state.store(STATE_SCHEDULED, Ordering::SeqCst);
+    }
+
+    /// Current lifecycle state.
+    pub fn state(&self) -> CaptureState {
+        match self.state.load(Ordering::SeqCst) {
+            STATE_SCHEDULED => CaptureState::Scheduled,
+            STATE_FINISHED => CaptureState::Finished,
+            _ => CaptureState::NotScheduled,
+        }
+    }
+
+    /// Whether a blocking capture has been submitted and has not yet
+    /// finished — the slot must remain occupied.
+    pub fn scheduled(&self) -> bool {
+        matches!(self.state(), CaptureState::Scheduled)
+    }
+
+    /// Whether the blocking capture closure has fully exited.
+    pub fn finished(&self) -> bool {
+        self.state() == CaptureState::Finished
+    }
+
+    /// Wait until the blocking capture closure has exited. Signalled exactly
+    /// once, on success or failure; the signal is stored if no waiter is
+    /// present yet, so a late waiter still completes immediately.
+    pub async fn wait(&self) {
+        loop {
+            if self.finished() {
+                return;
+            }
+            let notified = self.inner.notified();
+            if self.finished() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Signal that the blocking closure has exited. Must be called at most
+    /// once per completion.
+    pub fn signal(&self) {
+        self.state.store(STATE_FINISHED, Ordering::SeqCst);
+        self.inner.notify_one();
+    }
+}
+
+/// Drop guard inside ANY physical blocking audio closure (input capture OR
+/// output playback/probe): signals `CaptureCompletion` on EVERY exit path
+/// (success, `?`, bail, panic). The slot owner waits on the completion before
+/// releasing the shared audio slot, so a stuck native call can never free the
+/// slot while the physical worker may still be alive (RC-1/RC-2).
+pub(crate) struct BlockingLifecycle(pub(crate) CaptureCompletion);
+
+impl Drop for BlockingLifecycle {
+    fn drop(&mut self) {
+        self.0.signal();
+    }
+}
+
+/// Bounded sample queue with a non-blocking producer for the real-time CPAL
+/// callback. Overflow policy is explicit: queue available -> enqueue; queue
+/// full -> drop the current chunk and count the overflow. The callback can
+/// never block and never panics, so stop/cancellation can never be stalled
+/// behind a full sample queue.
+pub struct SampleQueue {
+    tx: std::sync::mpsc::SyncSender<Vec<f32>>,
+    overflow: Arc<AtomicU64>,
+}
+
+impl SampleQueue {
+    pub fn new(capacity: usize) -> (Self, std::sync::mpsc::Receiver<Vec<f32>>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(capacity);
+        (
+            Self {
+                tx,
+                overflow: Arc::new(AtomicU64::new(0)),
+            },
+            rx,
+        )
+    }
+
+    /// Non-blocking enqueue from a real-time callback. Never blocks; on a full
+    /// queue the chunk is dropped and the overflow counter is incremented so
+    /// the loss is observable/loggable.
+    pub fn try_enqueue(&self, data: &[f32]) {
+        if self.tx.try_send(data.to_vec()).is_err() {
+            self.overflow.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Number of chunks dropped because the queue was full.
+    pub fn overflow_count(&self) -> u64 {
+        self.overflow.load(Ordering::Relaxed)
+    }
+}
+
+/// P1-2 overflow policy: any dropped production audio chunk fails the
+/// recording. Returns the user-facing error message when `dropped > 0` and
+/// None when nothing was lost. A WAV missing part of the candidate's answer
+/// must never be transcribed or persisted as valid evidence.
+fn overflow_error(dropped: u64) -> Option<String> {
+    if dropped > 0 {
+        Some(format!(
+            "Audio capture lost {} chunk(s); recording discarded. Please retry the round.",
+            dropped
+        ))
+    } else {
+        None
+    }
+}
+
+/// Thread-safe latch for asynchronous capture errors. Written from the
+/// real-time error callback; observed by the recording loop so a device
+/// failure becomes an AUTHORITATIVE operation failure instead of a silent
+/// success. `CaptureEvent::Error` remains supplementary UI information only.
+#[derive(Clone, Default)]
+pub struct CaptureErrorLatch {
+    inner: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl CaptureErrorLatch {
+    /// Record the first error reported by the device callback.
+    pub fn set(&self, message: impl Into<String>) {
+        if let Ok(mut guard) = self.inner.lock() {
+            if guard.is_none() {
+                *guard = Some(message.into());
+            }
+        }
+    }
+
+    /// Non-consuming read of the latched error, if any.
+    pub fn peek(&self) -> Option<String> {
+        self.inner.lock().ok().and_then(|g| g.clone())
+    }
+}
+
+/// Pump chunks from `rx` into `on_chunk` until `target_frames` frames have
+/// been collected, the wall-clock `deadline` passes (explicit timeout error),
+/// an external `stop_flag` is set (explicit cancellation), a capture error is
+/// latched (explicit device error), or the channel disconnects. Pure and
+/// hardware-free, so it is unit-testable. Returns the number of frames
+/// collected.
+fn collect_chunks_until<F>(
+    rx: &std::sync::mpsc::Receiver<Vec<f32>>,
+    error_latch: &CaptureErrorLatch,
+    stop_flag: Option<&AtomicBool>,
+    deadline: std::time::Instant,
+    target_frames: u64,
+    channels: u16,
+    mut on_chunk: F,
+) -> anyhow::Result<u64>
+where
+    F: FnMut(&[f32]) -> anyhow::Result<()>,
+{
+    let mut total_frames = 0u64;
+    while total_frames < target_frames {
+        // Async device failure is authoritative — fail now, never succeed.
+        if let Some(msg) = error_latch.peek() {
+            anyhow::bail!("{}", msg);
+        }
+        // External cancellation (P2-2): the owning command can stop the
+        // device-test capture promptly instead of waiting for the deadline.
+        if let Some(flag) = stop_flag {
+            if flag.load(Ordering::SeqCst) {
+                anyhow::bail!("Capture cancelled");
+            }
+        }
+        // Wall-clock bound independent of sample count: a stream that starts
+        // but delivers no frames still terminates in bounded time.
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "Audio capture timed out — no frames received before the wall-clock deadline"
+            );
+        }
+        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(samples) => {
+                on_chunk(&samples)?;
+                total_frames += samples.len() as u64 / channels as u64;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    Ok(total_frames)
+}
+
+/// Internal RAII cleanup for `record_to_wav` failure paths (P2-2). Removes
+/// ONLY files this invocation created: the partial `.wav.tmp` (once the
+/// writer has created it) and any provisional final WAV (once the temp has
+/// been renamed to it) — when dropped without being committed. A pre-existing
+/// final WAV is rejected before recording begins, so cleanup can never delete
+/// evidence it did not create. Missing files are ignored and cleanup never
+/// panics. Declared BEFORE the `WavWriter` so reverse declaration order
+/// drops the writer (releasing its Windows file handle) before the guard
+/// removes files.
+struct PartialWavGuard {
+    temp_path: PathBuf,
+    final_path: PathBuf,
+    owns_temp: bool,
+    owns_final: bool,
+    committed: bool,
+}
+
+impl PartialWavGuard {
+    fn new(temp_path: PathBuf, final_path: PathBuf) -> Self {
+        Self {
+            temp_path,
+            final_path,
+            owns_temp: false,
+            owns_final: false,
+            committed: false,
+        }
+    }
+
+    /// This invocation created the temp file — cleanup owns it.
+    fn mark_temp_owned(&mut self) {
+        self.owns_temp = true;
+    }
+
+    /// The temp was renamed to the final path — this invocation now owns the
+    /// final (provisional until `commit`).
+    fn mark_final_owned(&mut self) {
+        self.owns_temp = false;
+        self.owns_final = true;
+    }
+
+    /// Mark the recording fully committed — the final WAV must be preserved.
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PartialWavGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if self.owns_temp {
+            let _ = std::fs::remove_file(&self.temp_path);
+        }
+        if self.owns_final {
+            let _ = std::fs::remove_file(&self.final_path);
+        }
+    }
+}
+
+/// Internal RAII cleanup for `record_test_clip` (RC-3): the device-test WAV
+/// created by THIS invocation is removed on EVERY error path — device
+/// lookup, stream build, `stream.play()`, callback failure, wall-clock
+/// timeout, finalize — unless the clip is fully written and committed to
+/// the caller. Declared BEFORE the `WavWriter` so reverse declaration order
+/// drops the writer (releasing its Windows file handle) before removal.
+struct TestClipCleanup {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl TestClipCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            committed: false,
+        }
+    }
+
+    /// The clip was fully written; the caller owns it from here.
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for TestClipCleanup {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// Start recording from the default microphone to a WAV file using cpal (WASAPI on Windows).
 /// Writes to a temp file first, then renames on success for crash recovery.
 /// Periodically flushes the writer so partial data survives a crash.
+/// Returns `RecordResult` with file path, duration, and size on success.
+///
+/// RC-1 (Audio Test lifecycle): `retain_output` decides who owns the final
+/// WAV after a SUCCESSFUL capture. `true` (interview rounds) keeps it as
+/// provisional evidence for the persistence layer. `false` (audio test)
+/// deletes it INSIDE this physical blocking closure — BEFORE the closure
+/// returns and signals Finished — so cleanup is owned by the physical worker
+/// itself. Aborting the outer async wrapper (command timeout) can never kill
+/// an already-submitted `spawn_blocking` closure, so the deletion still runs
+/// after a late temp->final rename; a timed-out audio test can never orphan
+/// a final WAV.
 pub async fn record_to_wav(
     output_path: PathBuf,
     sample_rate: u32,
     channels: u16,
     event_tx: mpsc::Sender<CaptureEvent>,
     stop_flag: Arc<AtomicBool>,
-) -> anyhow::Result<()> {
+    completion: CaptureCompletion,
+    retain_output: bool,
+) -> anyhow::Result<RecordResult> {
     let sr = sample_rate;
     let ch = channels;
     let temp_path = output_path.with_extension("wav.tmp");
 
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+    // RC-2: the capture becomes `Scheduled` BEFORE spawn_blocking is
+    // submitted, with no await in between — a blocking closure queued on a
+    // busy pool still owns the recording slot, so the slot can never be
+    // freed while a physical capture might start later.
+    completion.mark_scheduled();
+
+    tokio::task::spawn_blocking(move || -> anyhow::Result<RecordResult> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+        // P1-1: the physical capture lifecycle is signalled on every exit
+        // path — slot owners wait on `completion` before releasing the slot.
+        let _lifecycle = BlockingLifecycle(completion.clone());
+
+        // Stale partial from a previous crashed run: remove it explicitly as
+        // stale so this invocation starts clean (also when a final WAV
+        // collision below is rejected). It is by definition uncommitted and
+        // cannot be evidence.
+        if temp_path.exists() {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+
+        // P1-2: a pre-existing final WAV is evidence — never overwrite or
+        // delete it. Reject BEFORE any destructive cleanup ownership begins
+        // (and before any audio device is touched).
+        if output_path.exists() {
+            anyhow::bail!("Recording output already exists: {}", output_path.display());
+        }
+
+        // Own partial-file cleanup for EVERY failure path: any `?`/bail below
+        // unwinds with the guard armed, and because the guard is declared
+        // before the writer, the writer (holding the file handle) drops first.
+        // The guard only ever removes files THIS invocation created.
+        let mut cleanup = PartialWavGuard::new(temp_path.clone(), output_path.clone());
 
         let host = cpal::default_host();
         let device = host
@@ -60,20 +442,26 @@ pub async fn record_to_wav(
         };
 
         let mut writer = hound::WavWriter::create(&temp_path, spec)?;
+        // The temp file now exists because of THIS invocation.
+        cleanup.mark_temp_owned();
 
-        let (sample_tx, sample_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(64);
-
+        let (sample_queue, sample_rx) = SampleQueue::new(64);
+        let overflow_watch = sample_queue.overflow.clone();
+        let error_latch = CaptureErrorLatch::default();
+        let err_latch_cb = error_latch.clone();
         let err_tx = event_tx.clone();
         let stream = device.build_input_stream(
             &config,
             move |data: &[f32], _info: &cpal::InputCallbackInfo| {
-                let _ = sample_tx.send(data.to_vec());
+                // Non-blocking: never stall the real-time callback on a full
+                // queue. Full -> drop chunk + count overflow.
+                sample_queue.try_enqueue(data);
             },
             move |err| {
                 eprintln!("Input stream error: {}", err);
-                let _ = err_tx.try_send(CaptureEvent::Error {
-                    message: format!("Audio stream error: {}", err),
-                });
+                let msg = format!("Audio stream error: {}", err);
+                err_latch_cb.set(msg.clone());
+                let _ = err_tx.try_send(CaptureEvent::Error { message: msg });
             },
             None,
         )?;
@@ -86,6 +474,14 @@ pub async fn record_to_wav(
         const FLUSH_INTERVAL: u32 = 50;
 
         while !stop_flag.load(Ordering::SeqCst) {
+            // Async capture failure is authoritative — stop the stream, drop
+            // the writer (release the file handle), and fail the recording.
+            // The armed guard removes the partial temp file.
+            if let Some(msg) = error_latch.peek() {
+                drop(stream);
+                drop(writer);
+                anyhow::bail!("{}", msg);
+            }
             match sample_rx.recv_timeout(std::time::Duration::from_millis(100)) {
                 Ok(samples) => {
                     let rms = if samples.is_empty() {
@@ -114,70 +510,291 @@ pub async fn record_to_wav(
         }
 
         drop(stream);
+        let dropped = overflow_watch.load(Ordering::Relaxed);
+        if let Some(msg) = overflow_error(dropped) {
+            // P1-2: any dropped production audio chunk fails the round. Drop
+            // the writer first so the file handles are released; the armed
+            // guard then removes the partial temp file AND any provisional
+            // final WAV. Surface a CaptureEvent::Error and return Err — never
+            // a successful RecordResult, so no Whisper and no DB persistence
+            // can follow.
+            drop(writer);
+            let _ = event_tx.try_send(CaptureEvent::Error {
+                message: msg.clone(),
+            });
+            anyhow::bail!("{}", msg);
+        }
         writer.finalize()?;
 
-        // Atomic rename: temp -> final (crash-safe)
+        // Atomic rename: temp -> final (crash-safe). From here the invocation
+        // owns the final path; a post-rename failure removes only this
+        // provisional final.
         std::fs::rename(&temp_path, &output_path)?;
+        cleanup.mark_final_owned();
 
         let duration_ms = (total_frames * 1000) / sr as u64;
+        let file_size_bytes = std::fs::metadata(&output_path)?.len();
+
+        // RC-1A: when the caller does not retain the output (audio test), the
+        // final WAV is removed HERE, inside the physical capture closure,
+        // before it signals Finished. The size was already captured above, so
+        // the returned RecordResult stays accurate. This is the ONLY cleanup
+        // that survives an abort of the outer async wrapper: the blocking
+        // closure always runs to completion, and Finished is signalled only
+        // after the artifact is gone — the slot owner never sees Finished
+        // while a test WAV could still exist.
+        //
+        // The removal is a CONTROLLED cleanup (RC-1): failure is surfaced, not
+        // swallowed. On failure the guard is NOT committed, so its Drop
+        // retries the removal best-effort, and the closure returns Err — the
+        // caller can never report "nothing saved" while the WAV may still
+        // exist. Startup reconciliation additionally sweeps `audio_test_*`
+        // leftovers.
+        if !retain_output {
+            match crate::cleanup::remove_owned(&output_path) {
+                crate::cleanup::CleanupOutcome::Removed
+                | crate::cleanup::CleanupOutcome::AlreadyAbsent => {}
+                outcome => {
+                    return Err(anyhow::anyhow!(
+                        "Audio test failed to remove its recording: {}",
+                        crate::cleanup::describe(&outcome, &output_path)
+                    ));
+                }
+            }
+        }
+        // Fully committed — the final WAV must be preserved (retained) or is
+        // already confirmed gone (audio test).
+        cleanup.commit();
+
         let _ = event_tx.try_send(CaptureEvent::Stopped {
             file_path: output_path.to_string_lossy().to_string(),
             duration_ms,
         });
 
-        Ok(())
-    })
-    .await??;
-
-    Ok(())
-}
-
-/// List available audio input devices
-pub async fn list_input_devices() -> anyhow::Result<Vec<String>> {
-    tokio::task::spawn_blocking(|| {
-        use cpal::traits::{DeviceTrait, HostTrait};
-        let host = cpal::default_host();
-        let devices = host
-            .input_devices()?
-            .filter_map(|d| d.name().ok().map(|n| n.to_string()))
-            .collect();
-        Ok(devices)
+        Ok(RecordResult {
+            file_path: output_path,
+            duration_ms,
+            file_size_bytes,
+        })
     })
     .await?
 }
 
-/// List available audio output devices
-pub async fn list_output_devices() -> anyhow::Result<Vec<String>> {
+/// Name of the DEFAULT output device — the one production playback actually
+/// uses (Piper TTS and round playback both select cpal's
+/// `default_output_device()`). Returns `Ok(None)` when the host has no
+/// default output; this is deliberately distinct from listing all output
+/// devices, because a non-default speaker alone must not mark TTS
+/// readiness (P2-1).
+pub async fn get_default_output_device_name() -> anyhow::Result<Option<String>> {
     tokio::task::spawn_blocking(|| {
         use cpal::traits::{DeviceTrait, HostTrait};
         let host = cpal::default_host();
-        let devices = host
-            .output_devices()?
-            .filter_map(|d| d.name().ok().map(|n| n.to_string()))
-            .collect();
-        Ok(devices)
+        Ok(host
+            .default_output_device()
+            .and_then(|d| d.name().ok())
+            .map(|n| n.to_string()))
     })
     .await?
 }
+
+/// Pure decision (RC-4): does ANY supported output-config range cover the
+/// production Piper playback stream — mono at PIPER_SAMPLE_RATE Hz? Each
+/// range is `(channels, min_sample_rate, max_sample_rate)`. Unit-testable
+/// without audio hardware.
+pub fn production_stream_supported(mut ranges: impl Iterator<Item = (u16, u32, u32)>) -> bool {
+    ranges.any(|(channels, min_sr, max_sr)| {
+        channels == 1
+            && min_sr <= crate::audio::playback::PIPER_SAMPLE_RATE
+            && max_sr >= crate::audio::playback::PIPER_SAMPLE_RATE
+    })
+}
+
+/// RC-4/RC-5/RC-2/RC-3: prove the PRODUCTION Piper playback path actually
+/// works on the default output device. Production playback
+/// (`PiperSupervisor::speak`) builds `default_output_device()` with a mono,
+/// 22050 Hz stream and plays it — Device Check must validate that exact
+/// path, not merely that SOME output device exists. Three steps, all inside
+/// ONE blocking probe tracked by `completion`:
+///   1. fast range check — supported configs must cover mono 22050 Hz;
+///   2. build the EXACT production `StreamConfig`;
+///   3. `stream.play()` and observe real output-callback progress (a tiny
+///      silence fragment, ~100ms) — proving the device actually starts and
+///      delivers samples; a stalled device or an async output error fails
+///      readiness.
+///
+/// Lifecycle ownership (RC-2): `completion` is the OUTPUT-probe lifecycle
+/// signal — `mark_scheduled()` runs BEFORE `spawn_blocking` (no await in
+/// between) and the closure signals Finished on EVERY exit, so the owning
+/// recording slot stays occupied until the real output stream has actually
+/// ended, even if the outer async device-check worker is aborted.
+///
+/// Wall-clock contract (RC-3): the CALLBACK-PROGRESS wait is bounded by a
+/// 2s deadline, but the native driver calls that precede it
+/// (`default_output_device()`, `name()`, `supported_output_configs()`,
+/// `build_output_stream()`, `play()`) are NOT independently bounded — a
+/// hung native audio call cannot be force-cancelled. If that happens, the
+/// probe's completion keeps the audio-probe lease (recording slot) occupied
+/// until the native worker actually exits; the slot is never released while
+/// the output probe may still be alive.
+pub async fn validate_production_playback_stream(
+    completion: CaptureCompletion,
+) -> anyhow::Result<String> {
+    // RC-2: mark Scheduled BEFORE spawn_blocking (no await between) so a
+    // queued-but-not-started probe still owns the slot.
+    completion.mark_scheduled();
+
+    tokio::task::spawn_blocking(move || {
+        use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+        // Signal Finished on EVERY exit path (success, ?, bail, panic) —
+        // the slot owner waits on this before releasing the slot.
+        let _lifecycle = BlockingLifecycle(completion.clone());
+
+        let host = cpal::default_host();
+        let device = host
+            .default_output_device()
+            .ok_or_else(|| anyhow::anyhow!("No default output device found"))?;
+        let name = device
+            .name()
+            .unwrap_or_else(|_| "default output device".to_string());
+
+        // Fast pre-check: the supported configs must cover the production
+        // stream (mono, 22050 Hz).
+        let supported = device
+            .supported_output_configs()
+            .map(|ranges| {
+                production_stream_supported(
+                    ranges.map(|r| (r.channels(), r.min_sample_rate().0, r.max_sample_rate().0)),
+                )
+            })
+            .map_err(|e| anyhow::anyhow!("failed to query supported output configs: {}", e))?;
+        if !supported {
+            anyhow::bail!(
+                "default output '{}' does not support the production Piper stream (mono {} Hz)",
+                name,
+                crate::audio::playback::PIPER_SAMPLE_RATE
+            );
+        }
+
+        // Build the EXACT production stream config and actually PLAY it.
+        let config = cpal::StreamConfig {
+            channels: 1,
+            sample_rate: cpal::SampleRate(crate::audio::playback::PIPER_SAMPLE_RATE),
+            buffer_size: cpal::BufferSize::Default,
+        };
+        // Actual output-callback progress, shared with the bounded wait.
+        let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let progress_clone = progress.clone();
+        // Latch for asynchronous output-stream errors — a device failure
+        // after play() must fail readiness, never silently pass.
+        let playback_err: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let err_latch = playback_err.clone();
+        let stream = device.build_output_stream(
+            &config,
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                progress_clone.fetch_add(data.len(), Ordering::Relaxed);
+                for sample in data.iter_mut() {
+                    *sample = 0.0; // silence — the probe must be inaudible
+                }
+            },
+            move |err| {
+                eprintln!("Device-check output stream error: {}", err);
+                if let Ok(mut guard) = err_latch.lock() {
+                    if guard.is_none() {
+                        *guard = Some(format!("output stream error: {}", err));
+                    }
+                }
+            },
+            None,
+        )?;
+        stream.play()?;
+
+        // Bounded wait for real callback progress using the SAME
+        // sample-progress semantics as production playback: ~100ms of
+        // delivered samples (2205 at 22050 Hz). Stalled output or a latched
+        // async error fails readiness. The stream is dropped on every exit
+        // path before the closure returns, so no orphan stream survives.
+        const PROBE_TARGET_SAMPLES: usize = 2205;
+        let outcome = crate::audio::playback::await_playback(
+            &playback_err,
+            None,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+            &progress,
+            PROBE_TARGET_SAMPLES,
+        );
+        drop(stream);
+        debug_assert_eq!(
+            outcome?,
+            crate::audio::playback::PlaybackOutcome::Completed,
+            "probe has no cancellation source"
+        );
+
+        Ok(name)
+    })
+    .await?
+}
+
+/// Result of a microphone probe (RC-1B). The device-test clip is deleted
+/// INSIDE the tracked physical closure before it signals Finished — the
+/// caller never receives a path and never owns test-file deletion, so an
+/// abort of the outer Device Check cannot orphan a `device_test_*.wav`.
+#[derive(Debug, Clone)]
+pub struct MicProbeResult {
+    pub device_name: String,
+    pub captured_bytes: u64,
+    pub duration_ms: u64,
+    pub test_ok: bool,
+}
+
+/// Minimum bytes for a usable device-test clip (~1s of 16 kHz 16-bit mono).
+/// A shorter clip fails the probe (the file is still deleted in-closure).
+const MIN_DEVICE_CLIP_BYTES: u64 = 32000;
 
 /// Record a short audio clip for device verification (3 seconds max).
-/// Returns the path to the recorded temp file.
+/// Returns metadata only — the test clip itself is removed inside the
+/// physical closure, before `Finished` is signalled (RC-1B).
+/// The capture polling loop enforces a deadline (duration + 2s) so the check
+/// terminates instead of looping forever if the stream delivers no frames.
+/// If a native device call itself blocks before the loop (`default_input_device()`,
+/// `build_input_stream()`, `stream.play()`), the backend retains the audio slot
+/// until the physical worker exits rather than detaching it (RC-4).
 pub async fn record_test_clip(
     sample_rate: u32,
     channels: u16,
     duration_secs: u32,
+    temp_dir: PathBuf,
     event_tx: mpsc::Sender<CaptureEvent>,
-) -> anyhow::Result<PathBuf> {
-    let tmp_path = std::env::temp_dir().join(format!("device_test_{}.wav", std::process::id()));
+    stop_flag: Arc<AtomicBool>,
+    completion: CaptureCompletion,
+) -> anyhow::Result<MicProbeResult> {
+    // P2-1: UUID-based name so concurrent device checks can never target the
+    // same path (a PID alone is not unique across concurrent checks).
+    let tmp_path = temp_dir.join(format!("device_test_{}.wav", uuid::Uuid::new_v4()));
     let path_clone = tmp_path.clone();
 
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+    // RC-2: mark Scheduled BEFORE spawn_blocking (no await between) so a
+    // queued-but-not-started closure still owns the recording slot. The
+    // closure also performs the DEFAULT-input lookup and returns the tested
+    // device name — the enumeration is lifecycle-owned by the SAME completion
+    // as the mic test, so Device Check has no separate untracked native
+    // enumeration worker.
+    completion.mark_scheduled();
+
+    let probe_result = tokio::task::spawn_blocking(move || -> anyhow::Result<MicProbeResult> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+        // P1-1: signal the physical capture lifecycle on every exit path.
+        let _lifecycle = BlockingLifecycle(completion.clone());
 
         let host = cpal::default_host();
         let device = host
             .default_input_device()
             .ok_or_else(|| anyhow::anyhow!("No input device found"))?;
+        let device_name = device
+            .name()
+            .unwrap_or_else(|_| "default input device".to_string());
 
         let config = cpal::StreamConfig {
             channels,
@@ -192,19 +809,29 @@ pub async fn record_test_clip(
             sample_format: hound::SampleFormat::Int,
         };
 
+        // RC-3: RAII cleanup for the test clip — declared BEFORE the writer
+        // so reverse-declaration order releases the writer's file handle
+        // before the guard removes the file on EVERY failure path (device
+        // lookup, stream build, stream.play, callback failure, timeout,
+        // finalize). Committed only when the clip is fully written.
+        let mut cleanup = TestClipCleanup::new(path_clone.clone());
         let mut writer = hound::WavWriter::create(&path_clone, spec)?;
-        let (sample_tx, sample_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(64);
-
+        let (sample_queue, sample_rx) = SampleQueue::new(64);
+        let overflow_watch = sample_queue.overflow.clone();
+        let error_latch = CaptureErrorLatch::default();
+        let err_latch_cb = error_latch.clone();
         let err_tx = event_tx.clone();
         let stream = device.build_input_stream(
             &config,
             move |data: &[f32], _info: &cpal::InputCallbackInfo| {
-                let _ = sample_tx.send(data.to_vec());
+                // Non-blocking: never stall the real-time callback on a full
+                // queue. Full -> drop chunk + count overflow.
+                sample_queue.try_enqueue(data);
             },
             move |err| {
-                let _ = err_tx.try_send(CaptureEvent::Error {
-                    message: format!("Test clip error: {}", err),
-                });
+                let msg = format!("Test clip error: {}", err);
+                err_latch_cb.set(msg.clone());
+                let _ = err_tx.try_send(CaptureEvent::Error { message: msg });
             },
             None,
         )?;
@@ -213,32 +840,94 @@ pub async fn record_test_clip(
         let _ = event_tx.try_send(CaptureEvent::Started { sample_rate });
 
         let total_needed = sample_rate as u64 * duration_secs as u64;
-        let mut total_frames = 0u64;
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(duration_secs as u64 + 2);
 
-        while total_frames < total_needed {
-            match sample_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                Ok(samples) => {
-                    let rms = if samples.is_empty() {
-                        0.0
-                    } else {
-                        let sum: f32 = samples.iter().map(|s| s * s).sum();
-                        (sum / samples.len() as f32).sqrt()
-                    };
-                    let _ = event_tx.try_send(CaptureEvent::Level { rms });
+        let collected = collect_chunks_until(
+            &sample_rx,
+            &error_latch,
+            Some(&stop_flag),
+            deadline,
+            total_needed,
+            channels,
+            |samples| {
+                let rms = if samples.is_empty() {
+                    0.0
+                } else {
+                    let sum: f32 = samples.iter().map(|s| s * s).sum();
+                    (sum / samples.len() as f32).sqrt()
+                };
+                let _ = event_tx.try_send(CaptureEvent::Level { rms });
 
-                    for &sample in &samples {
-                        let i16_sample = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
-                        writer.write_sample(i16_sample)?;
-                    }
-                    total_frames += samples.len() as u64 / channels as u64;
+                for &sample in samples {
+                    let i16_sample = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                    writer.write_sample(i16_sample)?;
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Ok(())
+            },
+        );
+
+        // Stream is done regardless of outcome — drop it before handling the
+        // result so device error/timeout paths release the device promptly.
+        drop(stream);
+        let total_frames = match collected {
+            Ok(frames) => frames,
+            Err(e) => {
+                // Windows file-handle ordering (P2-2): drop the writer FIRST
+                // so its file handle is released; the RAII guard (declared
+                // before the writer) then removes the partial file on drop.
+                drop(writer);
+                return Err(e);
             }
+        };
+
+        // Overflow is observable/loggable — the loss is counted, never hidden.
+        let dropped = overflow_watch.load(Ordering::Relaxed);
+        if dropped > 0 {
+            eprintln!(
+                "[capture] device test finished with {} dropped chunk(s) (sample queue full)",
+                dropped
+            );
+        }
+        writer.finalize()?;
+
+        // RC-1B: validate size AND delete the test clip INSIDE this physical
+        // closure, before Finished is signalled — the caller never owns
+        // test-file deletion. A stat failure still unwinds with the armed
+        // guard, so the file is removed on drop; a too-short clip is a failed
+        // test, not evidence. Deletion failure is surfaced (never swallowed),
+        // and the guard stays armed (not committed) so its Drop retries.
+        let metadata = match std::fs::metadata(&path_clone) {
+            Ok(m) => m,
+            Err(e) => {
+                return Err(anyhow::anyhow!("failed to stat device test clip: {}", e));
+            }
+        };
+        let captured_bytes = metadata.len();
+        if captured_bytes < 100 {
+            let outcome = crate::cleanup::remove_owned(&path_clone);
+            if outcome.failed() {
+                return Err(anyhow::anyhow!(
+                    "failed to remove device test clip: {}",
+                    crate::cleanup::describe(&outcome, &path_clone)
+                ));
+            }
+            cleanup.commit();
+            anyhow::bail!("Test clip too short ({} bytes)", captured_bytes);
         }
 
-        drop(stream);
-        writer.finalize()?;
+        match crate::cleanup::remove_owned(&path_clone) {
+            crate::cleanup::CleanupOutcome::Removed
+            | crate::cleanup::CleanupOutcome::AlreadyAbsent => {}
+            outcome => {
+                return Err(anyhow::anyhow!(
+                    "failed to remove device test clip: {}",
+                    crate::cleanup::describe(&outcome, &path_clone)
+                ));
+            }
+        }
+        // Removal confirmed — the guard no longer owns anything.
+        cleanup.commit();
 
         let duration_ms = (total_frames * 1000) / sample_rate as u64;
         let _ = event_tx.try_send(CaptureEvent::Stopped {
@@ -246,22 +935,73 @@ pub async fn record_test_clip(
             duration_ms,
         });
 
-        Ok(())
+        Ok(MicProbeResult {
+            device_name,
+            captured_bytes,
+            duration_ms,
+            test_ok: captured_bytes >= MIN_DEVICE_CLIP_BYTES,
+        })
     })
     .await??;
 
-    // Verify the file was created and has content
-    let metadata = std::fs::metadata(&tmp_path)?;
-    if metadata.len() < 100 {
-        anyhow::bail!("Test clip too short ({} bytes)", metadata.len());
-    }
-
-    Ok(tmp_path)
+    Ok(probe_result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RC-2: the capture lifecycle is explicitly tri-state — NotScheduled ->
+    /// Scheduled -> Finished — and mark_scheduled is the transition that
+    /// reserves the slot BEFORE spawn_blocking is submitted.
+    #[test]
+    fn capture_completion_tri_state_lifecycle() {
+        let completion = CaptureCompletion::new();
+        assert_eq!(completion.state(), CaptureState::NotScheduled);
+        assert!(!completion.scheduled());
+        assert!(!completion.finished());
+
+        completion.mark_scheduled();
+        assert_eq!(completion.state(), CaptureState::Scheduled);
+        assert!(completion.scheduled());
+        assert!(!completion.finished());
+
+        completion.signal();
+        assert_eq!(completion.state(), CaptureState::Finished);
+        assert!(!completion.scheduled());
+        assert!(completion.finished());
+    }
+
+    /// RC-4: production_stream_supported decides whether the supported output
+    /// configs cover the production mono 22050 Hz stream — the pure,
+    /// hardware-free core of speaker readiness.
+    #[test]
+    fn production_stream_supported_decisions() {
+        use crate::audio::playback::PIPER_SAMPLE_RATE;
+
+        // No ranges -> unsupported.
+        assert!(!production_stream_supported(std::iter::empty()));
+        // Stereo-only device -> unsupported.
+        assert!(!production_stream_supported(
+            vec![(2, 44100, 48000)].into_iter()
+        ));
+        // Mono but wrong rates -> unsupported.
+        assert!(!production_stream_supported(
+            vec![(1, 44100, 48000)].into_iter()
+        ));
+        // Mono range covering 22050 -> supported.
+        assert!(production_stream_supported(
+            vec![(1, 8000, 24000)].into_iter()
+        ));
+        // Exact production rate -> supported.
+        assert!(production_stream_supported(
+            vec![(1, PIPER_SAMPLE_RATE, PIPER_SAMPLE_RATE)].into_iter()
+        ));
+        // Range that barely misses the rate -> unsupported.
+        assert!(!production_stream_supported(
+            vec![(1, 24000, 48000)].into_iter()
+        ));
+    }
 
     #[test]
     fn recording_handle_stop_sets_flag() {
@@ -305,5 +1045,387 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("Error"));
         assert!(json.contains("test error"));
+    }
+
+    /// P1-2: the overflow policy fails production capture on ANY dropped
+    /// chunk — incomplete evidence can never be marked successful.
+    #[test]
+    fn overflow_policy_fails_recording_on_any_dropped_chunk() {
+        assert!(overflow_error(0).is_none(), "no loss must not fail");
+        let msg = overflow_error(2).unwrap();
+        assert!(
+            msg.contains("lost 2 chunk(s)"),
+            "must report the dropped count, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("recording discarded"),
+            "must clearly discard the recording, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("Please retry the round"),
+            "must tell the user to retry, got: {}",
+            msg
+        );
+    }
+
+    /// P2-2: an armed cleanup guard removes the partial temp file it created.
+    #[test]
+    fn partial_wav_guard_armed_removes_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("round.wav.tmp");
+        let final_path = dir.path().join("round.wav");
+        std::fs::write(&temp, b"partial").unwrap();
+
+        {
+            let mut guard = PartialWavGuard::new(temp.clone(), final_path.clone());
+            guard.mark_temp_owned();
+        }
+        assert!(!temp.exists(), "armed guard must remove the temp file");
+    }
+
+    /// P2-2: an uncommitted provisional final WAV owned by this invocation is
+    /// also removed (the final is provisional until the caller commits it —
+    /// e.g. after DB commit). After the rename the temp no longer exists, so
+    /// only the provisional final is owned.
+    #[test]
+    fn partial_wav_guard_armed_removes_uncommitted_final() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("round.wav.tmp");
+        let final_path = dir.path().join("round.wav");
+        std::fs::write(&final_path, b"provisional").unwrap();
+
+        {
+            let mut guard = PartialWavGuard::new(temp.clone(), final_path.clone());
+            guard.mark_temp_owned();
+            guard.mark_final_owned();
+        }
+        assert!(!temp.exists(), "temp is gone after the rename lifecycle");
+        assert!(
+            !final_path.exists(),
+            "uncommitted provisional final must be removed"
+        );
+    }
+
+    /// P1-2 core invariant: a final WAV this invocation did NOT create is
+    /// never removed — the guard only owns what it marked.
+    #[test]
+    fn partial_wav_guard_never_removes_unowned_final() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("round.wav.tmp");
+        let final_path = dir.path().join("round.wav");
+        let original = b"pre-existing-evidence";
+        std::fs::write(&temp, b"partial").unwrap();
+        std::fs::write(&final_path, original).unwrap();
+
+        {
+            let mut guard = PartialWavGuard::new(temp.clone(), final_path.clone());
+            // Only the temp was created by this invocation.
+            guard.mark_temp_owned();
+        }
+        assert!(!temp.exists(), "owned temp removed");
+        assert!(final_path.exists(), "unowned final must survive");
+        assert_eq!(
+            std::fs::read(&final_path).unwrap(),
+            original,
+            "unowned final must be byte-for-byte unchanged"
+        );
+    }
+
+    /// P2-2: a committed guard preserves the final WAV.
+    #[test]
+    fn partial_wav_guard_committed_preserves_final() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("round.wav.tmp");
+        let final_path = dir.path().join("round.wav");
+        std::fs::write(&final_path, b"committed-evidence").unwrap();
+
+        {
+            let mut guard = PartialWavGuard::new(temp.clone(), final_path.clone());
+            guard.commit();
+        }
+        assert!(final_path.exists(), "committed final WAV must be preserved");
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"committed-evidence");
+    }
+
+    /// P2-2: cleanup of missing files is harmless and never panics.
+    #[test]
+    fn partial_wav_guard_missing_files_harmless() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("never-created.wav.tmp");
+        let final_path = dir.path().join("never-created.wav");
+
+        // Must not panic and must not error.
+        let _guard = PartialWavGuard::new(temp.clone(), final_path.clone());
+        drop(_guard);
+    }
+
+    /// RC-3: an armed TestClipCleanup removes the device-test WAV on drop.
+    #[test]
+    fn test_clip_cleanup_armed_removes_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device_test_abc.wav");
+        std::fs::write(&path, b"partial").unwrap();
+        {
+            let _guard = TestClipCleanup::new(path.clone());
+        }
+        assert!(
+            !path.exists(),
+            "armed guard must remove the test clip on drop"
+        );
+    }
+
+    /// RC-3: a committed TestClipCleanup preserves the written clip.
+    #[test]
+    fn test_clip_cleanup_committed_preserves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device_test_abc.wav");
+        std::fs::write(&path, b"partial").unwrap();
+        {
+            let mut guard = TestClipCleanup::new(path.clone());
+            guard.commit();
+        }
+        assert!(
+            path.exists(),
+            "committed guard must preserve the clip for the caller"
+        );
+    }
+
+    /// RC-1B/RC-3: on EVERY outcome (success or error — including device
+    /// lookup / stream build / play / timeout failures) the device-test call
+    /// leaves no stray `device_test_*.wav` behind: deletion runs INSIDE the
+    /// tracked physical closure (before Finished is signalled), the RAII
+    /// guard removes this invocation's file on failure paths, and the caller
+    /// never owns test-file deletion.
+    #[tokio::test]
+    async fn record_test_clip_leaves_no_stray_wav_after_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let result = record_test_clip(
+            16000,
+            1,
+            1,
+            dir.path().to_path_buf(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            CaptureCompletion::new(),
+        )
+        .await;
+
+        // The caller receives metadata only — never a path. On success the
+        // clip is already gone.
+        if let Ok(probe) = result {
+            assert!(
+                !probe.device_name.is_empty(),
+                "probe must report the tested device name"
+            );
+        }
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("device_test_"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "stray device-test files left behind: {:?}",
+            leftovers
+        );
+    }
+
+    /// P1-2: a pre-existing final WAV is rejected BEFORE any audio device is
+    /// touched, the original file stays byte-for-byte unchanged, and a stale
+    /// temp from a previous run is removed by policy.
+    #[tokio::test]
+    async fn record_to_wav_rejects_existing_final_before_audio() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("round.wav");
+        let original = b"pre-existing-evidence";
+        std::fs::write(&final_path, original).unwrap();
+        let temp_path = final_path.with_extension("wav.tmp");
+        std::fs::write(&temp_path, b"stale").unwrap();
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let result = record_to_wav(
+            final_path.clone(),
+            16000,
+            1,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            CaptureCompletion::new(),
+            true,
+        )
+        .await;
+
+        assert!(result.is_err(), "existing final must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("already exists"), "unexpected error: {}", msg);
+        assert_eq!(
+            std::fs::read(&final_path).unwrap(),
+            original,
+            "original WAV must be byte-for-byte unchanged"
+        );
+        assert!(
+            !temp_path.exists(),
+            "stale temp must be removed by the stale-temp policy"
+        );
+    }
+
+    /// A full sample queue never blocks the producer: the chunk is dropped and
+    /// the overflow is counted, while the queued chunk is still delivered.
+    #[test]
+    fn sample_queue_full_drops_and_counts_overflow() {
+        let (queue, rx) = SampleQueue::new(1);
+        queue.try_enqueue(&[1.0, 2.0]);
+        // Queue is full — this must NOT block; the chunk is dropped + counted.
+        queue.try_enqueue(&[3.0, 4.0]);
+        assert_eq!(queue.overflow_count(), 1);
+        // The first chunk is still delivered intact.
+        assert_eq!(rx.recv().unwrap(), vec![1.0, 2.0]);
+        // Room is available again — enqueue succeeds without more overflow.
+        queue.try_enqueue(&[5.0]);
+        assert_eq!(queue.overflow_count(), 1);
+        assert_eq!(rx.recv().unwrap(), vec![5.0]);
+    }
+
+    /// The producer path never blocks even with a full queue and no consumer.
+    #[test]
+    fn sample_queue_never_blocks_producer_when_full() {
+        let (queue, _rx) = SampleQueue::new(2);
+        queue.try_enqueue(&[1.0]);
+        queue.try_enqueue(&[2.0]);
+        // Full — the following calls return immediately (structural guarantee
+        // of try_send) and only count overflow.
+        queue.try_enqueue(&[3.0]);
+        queue.try_enqueue(&[4.0]);
+        assert_eq!(queue.overflow_count(), 2);
+    }
+
+    #[test]
+    fn capture_error_latch_sets_once_and_peeks() {
+        let latch = CaptureErrorLatch::default();
+        assert!(latch.peek().is_none());
+        latch.set("first");
+        latch.set("second");
+        // First error wins; peek is non-consuming.
+        assert_eq!(latch.peek().as_deref(), Some("first"));
+        assert_eq!(latch.peek().as_deref(), Some("first"));
+    }
+
+    /// A latched capture error becomes an authoritative failure: the loop
+    /// returns Err instead of succeeding, in bounded time.
+    #[test]
+    fn collect_chunks_until_surfaces_latched_capture_error() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(4);
+        let latch = CaptureErrorLatch::default();
+        latch.set("Audio stream error: simulated device failure");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let result = collect_chunks_until(&rx, &latch, None, deadline, 100, 1, |_| Ok(()));
+        assert!(result.is_err(), "latched error must fail the capture loop");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("simulated device failure"),
+            "expected the latched message, got: {}",
+            msg
+        );
+        drop(tx);
+    }
+
+    /// Zero-frame case: a stream that delivers no chunks must terminate in
+    /// bounded time with an explicit timeout error (P1-4 acceptance).
+    #[test]
+    fn collect_chunks_until_times_out_when_no_frames_arrive() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(4);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+        let started = std::time::Instant::now();
+
+        let result = collect_chunks_until(
+            &rx,
+            &CaptureErrorLatch::default(),
+            None,
+            deadline,
+            16000,
+            1,
+            |_| Ok(()),
+        );
+        assert!(result.is_err(), "no frames + deadline must error");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("timed out"),
+            "timeout error must be explicit, got: {}",
+            msg
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "zero-frame case must exit in bounded time"
+        );
+        drop(tx);
+    }
+
+    /// Normal capture: chunks arrive, target frame count is reached, frames
+    /// are written.
+    #[test]
+    fn collect_chunks_until_succeeds_when_frames_arrive() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(8);
+        let mut written: Vec<f32> = Vec::new();
+
+        let sender = std::thread::spawn(move || {
+            tx.send(vec![1.0; 160]).unwrap();
+            tx.send(vec![2.0; 160]).unwrap();
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let frames = collect_chunks_until(
+            &rx,
+            &CaptureErrorLatch::default(),
+            None,
+            deadline,
+            320,
+            1,
+            |samples| {
+                written.extend_from_slice(samples);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(frames, 320);
+        assert_eq!(written.len(), 320);
+
+        sender.join().unwrap();
+    }
+
+    /// P2-2: an outer cancellation (stop flag) terminates the capture loop
+    /// promptly with an explicit error — the device test observes the owning
+    /// command's cancellation instead of running until its deadline.
+    #[test]
+    fn collect_chunks_until_stops_on_outer_cancellation() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(4);
+        let stop = Arc::new(AtomicBool::new(false));
+        stop.store(true, Ordering::SeqCst);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let started = std::time::Instant::now();
+        let result = collect_chunks_until(
+            &rx,
+            &CaptureErrorLatch::default(),
+            Some(&stop),
+            deadline,
+            16000,
+            1,
+            |_| Ok(()),
+        );
+        assert!(result.is_err(), "outer cancellation must fail the loop");
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Capture cancelled",
+            "cancellation must be explicit"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "cancellation must be prompt, not deadline-bound"
+        );
+        drop(tx);
     }
 }

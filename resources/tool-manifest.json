@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Pinned tool versions and SHA-256 checksums for reproducible builds.",
+  "version": "1.0.0",
+  "tools": {
+    "piper": {
+      "type": "archive",
+      "version": "2023.11.14-2",
+      "url": "https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_windows_amd64.zip",
+      "sha256": "f3c58906402b24f3a96d92145f58acba6d86c9b5db896d207f78dc80811efcea",
+      "destination": "piper"
+    },
+    "piper-model": {
+      "type": "file",
+      "version": "en_US-amy-medium",
+      "url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx",
+      "sha256": "b3a6e47b57b8c7fbe6a0ce2518161a50f59a9cdd8a50835c02cb02bdd6206c18",
+      "destination": "piper/model.onnx"
+    },
+    "piper-model-json": {
+      "type": "file",
+      "version": "en_US-amy-medium",
+      "url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx.json",
+      "sha256": "95a23eb4d42909d38df73bb9ac7f45f597dbfcde2d1bf9526fdeaf5466977d77",
+      "destination": "piper/model.onnx.json"
+    },
+    "whisper": {
+      "type": "archive",
+      "version": "cc7e72f",
+      "url": "https://github.com/ggerganov/whisper.cpp/releases/download/v1.5.4/whisper-bin-x64.zip",
+      "sha256": "9cb13bbe167e0947afedd7ff9766575c4324b3cd01b4267be2ba9648dc7e8cc9",
+      "destination": "whisper"
+    },
+    "whisper-model": {
+      "type": "file",
+      "version": "tiny.en",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin",
+      "sha256": "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f",
+      "destination": "models/ggml-tiny.en.bin"
+    }
+  }
+}

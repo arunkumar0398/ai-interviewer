@@ -1,0 +1,72 @@
+# AI Model & Tool Attribution
+
+## Text-to-Speech: Piper + en_US-amy-medium
+
+### Piper Executable
+- **Source**: https://github.com/rhasspy/piper
+- **Version**: 2023.11.14-2 (pinned in resources/tool-manifest.json)
+- **License**: MIT — Copyright (c) 2022 Michael Hansen
+- **See**: Piper-LICENSE.txt
+
+### Voice Model: en_US-amy-medium
+
+> **RELEASE BLOCKER — exact voice-model distribution terms not yet resolved.**
+> Do not publish a public binary release containing this model until the
+> ambiguity below is resolved upstream or the model is replaced with one
+> having clearly documented redistribution rights.
+
+- **Exact source**:
+  - Model: https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx
+  - Config: https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx.json
+  - Distribution repo: https://huggingface.co/rhasspy/piper-voices (path `en/en_US/amy/medium`)
+- **Exact version/hash** (pinned in resources/tool-manifest.json):
+  - `en_US-amy-medium.onnx` SHA-256: `b3a6e47b57b8c7fbe6a0ce2518161a50f59a9cdd8a50835c02cb02bdd6206c18`
+  - `en_US-amy-medium.onnx.json` SHA-256: `95a23eb4d42909d38df73bb9ac7f45f597dbfcde2d1bf9526fdeaf5466977d77`
+- **MODEL_CARD** (fetched from the source above): language en_US, 1 speaker,
+  medium quality, 22,050 Hz samplerate. Training dataset URL:
+  https://github.com/MycroftAI/mimic3-voices with license line "See URL".
+  Finetuned from the U.S. English lessac voice (medium quality).
+- **Model license — status: AMBIGUOUS, needs upstream confirmation.**
+  - The `rhasspy/piper-voices` HuggingFace repo declares `license: mit` in its
+    repo metadata, but that tag is repo-wide and does not carry per-voice
+    license files for this model.
+  - The per-voice MODEL_CARD defers the dataset license to
+    https://github.com/MycroftAI/mimic3-voices, whose LICENSE file is
+    **Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0)**.
+  - Maintainer guidance in rhasspy/piper issue #253 treats the Mycroft-derived
+    voices (including Amy) as CC-BY-SA licensed.
+- **Training dataset/source**: MycroftAI/mimic3-voices (CC BY-SA 4.0); the
+  voice is finetuned from the lessac medium checkpoint, itself trained on
+  LibriVox recordings (public domain audiobooks).
+- **Attribution requirements (if CC BY-SA 4.0 governs)**: credit the licensor
+  and indicate changes made to the material.
+- **Redistribution requirements (if CC BY-SA 4.0 governs)**: ShareAlike —
+  adapted material must be distributed under the same CC BY-SA 4.0 license,
+  which would impose share-alike obligations on any redistribution of the
+  voice model. The Piper executable MIT license does not extend to voice
+  model weights or training data.
+
+**Decision required before public release**: either (a) obtain explicit
+confirmation from upstream of the exact license governing
+`en_US-amy-medium` and document it here, including any model-specific legal
+file in the portable ZIP, or (b) switch to a voice with clearly documented
+redistribution rights (e.g. a LibriVox-derived voice such as
+`en_US-lessac-medium`, whose training data is public domain) before
+publishing binary releases.
+
+## Speech-to-Text: whisper.cpp + ggml-tiny.en
+
+### whisper.cpp Executable
+- **Source**: https://github.com/ggerganov/whisper.cpp
+- **Version**: v1.5.4 / cc7e72f (pinned in resources/tool-manifest.json)
+- **License**: MIT — Copyright (c) 2023 Georgi Gerganov
+- **See**: WhisperCPP-LICENSE.txt
+
+### Model: ggml-tiny.en
+- **Source repository**: https://github.com/ggerganov/whisper.cpp
+- **Model file**: ggml-tiny.en.bin (SHA-256 pinned in tool-manifest.json)
+- **HuggingFace**: ggerganov/whisper.cpp
+- **Description**: English-only Whisper model, tiny variant, optimized for CPU inference via ggml format
+- **Model license**: Distributed alongside whisper.cpp under MIT; see upstream repository
+- **Original paper**: Robust Speech Recognition via Large-Scale Weak Supervision (Radford et al., 2019)
+- **Original model**: OpenAI Whisper (https://github.com/openai/whisper)
