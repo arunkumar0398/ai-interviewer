@@ -58,18 +58,27 @@ impl Drop for StderrDrain {
 /// write error, stdout read error, timeout, cancellation). The caller must
 /// use this whenever the child may still be running; `.kill_on_drop(true)` is
 /// only emergency defense-in-depth, never the normal cleanup path.
-pub async fn terminate_child(child: &mut tokio::process::Child) {
+///
+/// Returns whether the child was CONCLUSIVELY reaped — `wait()` succeeded.
+/// A `false` return means the child state is unresolved and the caller must
+/// NOT claim a reaped process (RC-F4).
+pub async fn terminate_child(child: &mut tokio::process::Child) -> bool {
     let _ = child.kill().await;
-    let _ = child.wait().await;
+    child.wait().await.is_ok()
 }
 
-/// Tri-state lifecycle of a native child process (RC-2B):
-/// `NotStarted -> Running -> Reaped`.
+/// Lifecycle of a native child process (RC-2B/RC-F4):
+/// `NotStarted -> Running -> Reaped | ReapFailed`.
 ///
 /// - `NotStarted`: no child has been spawned yet.
 /// - `Running`: a child has been spawned and may be alive.
 /// - `Reaped`: the last child has been conclusively killed (if needed) AND
-///   waited — the OS-level zombie is gone.
+///   waited — the OS-level zombie is gone. This state is ONLY entered when
+///   `wait()` conclusively succeeded (RC-F4); it is never a best-effort
+///   default.
+/// - `ReapFailed`: the OS wait could not conclusively confirm reaping. The
+///   child state is unresolved — owners must NOT report the process as
+///   reaped and must surface the unresolved lifecycle result.
 ///
 /// The slot/evidence owner waits on `wait()` before resolving ownership, so
 /// a force-abort of the owning async task cannot release the recording slot
@@ -80,9 +89,10 @@ pub struct ProcessCompletion {
     state: Arc<std::sync::atomic::AtomicU8>,
 }
 
-// 0 = NotStarted (the default), 1 = Running, 2 = Reaped.
+// 0 = NotStarted (the default), 1 = Running, 2 = Reaped, 3 = ReapFailed.
 const PROC_RUNNING: u8 = 1;
 const PROC_REAPED: u8 = 2;
+const PROC_REAP_FAILED: u8 = 3;
 
 impl ProcessCompletion {
     /// Mark that a child is about to be / has been spawned. MUST be called
@@ -102,16 +112,31 @@ impl ProcessCompletion {
         self.state.load(Ordering::SeqCst) == PROC_REAPED
     }
 
-    /// Wait until the child is conclusively Reaped. Signalled exactly once;
-    /// the signal is stored, so a late waiter still completes immediately.
-    pub async fn wait(&self) {
+    /// Whether a conclusive reap FAILED (wait errored). The child state is
+    /// unresolved and must never be reported as Reaped (RC-F4).
+    pub fn reap_failed(&self) -> bool {
+        self.state.load(Ordering::SeqCst) == PROC_REAP_FAILED
+    }
+
+    /// Wait until the lifecycle reaches a conclusive terminal state. Returns
+    /// `true` when the child was conclusively reaped (`wait()` succeeded) and
+    /// `false` when reaping FAILED — the owner then resolves the lifecycle as
+    /// explicitly unresolved, never as Reaped (RC-F4). Signalled exactly
+    /// once; the signal is stored, so a late waiter still completes
+    /// immediately. Never blocks forever on an unreapable process: a failed
+    /// wait transitions to `ReapFailed` and unblocks waiters.
+    pub async fn wait(&self) -> bool {
         loop {
-            if self.reaped() {
-                return;
+            match self.state.load(Ordering::SeqCst) {
+                PROC_REAPED => return true,
+                PROC_REAP_FAILED => return false,
+                _ => {}
             }
             let notified = self.inner.notified();
-            if self.reaped() {
-                return;
+            match self.state.load(Ordering::SeqCst) {
+                PROC_REAPED => return true,
+                PROC_REAP_FAILED => return false,
+                _ => {}
             }
             notified.await;
         }
@@ -121,6 +146,13 @@ impl ProcessCompletion {
     /// path, or after the detached reap task finished).
     pub fn signal_reaped(&self) {
         self.state.store(PROC_REAPED, Ordering::SeqCst);
+        self.inner.notify_one();
+    }
+
+    /// Mark that a conclusive reap could NOT be established (wait failed).
+    /// The lifecycle is explicitly unresolved — never a Reaped claim (RC-F4).
+    pub fn signal_reap_failed(&self) {
+        self.state.store(PROC_REAP_FAILED, Ordering::SeqCst);
         self.inner.notify_one();
     }
 }
@@ -187,13 +219,29 @@ impl ChildProcessGuard {
         self.completion.signal_reaped();
     }
 
-    /// Controlled kill + wait + mark Reaped (timeout/cancellation paths).
+    /// Controlled kill + wait. Reaped is signalled ONLY when `wait()`
+    /// conclusively succeeds; a failed wait transitions to `ReapFailed` and
+    /// is surfaced (RC-F4) — the guard's `Drop` then retries the reap once
+    /// more, bounded, and still never claims Reaped unless that retry's wait
+    /// succeeds.
     pub async fn terminate(&mut self) {
         if let Some(child) = self.child.as_mut() {
             let _ = child.kill().await;
-            let _ = child.wait().await;
+            match child.wait().await {
+                Ok(_) => self.mark_reaped(),
+                Err(e) => {
+                    // Kill may have taken effect but the OS wait could not
+                    // confirm it — the child state is unresolved. Do NOT
+                    // claim Reaped.
+                    self.completion.signal_reap_failed();
+                    eprintln!(
+                        "[process-lifecycle] kill+wait could not conclusively reap child: {e} — lifecycle unresolved, not Reaped"
+                    );
+                }
+            }
+        } else {
+            self.mark_reaped();
         }
-        self.mark_reaped();
     }
 }
 
@@ -206,18 +254,30 @@ impl Drop for ChildProcessGuard {
         }
         if let Some(mut child) = self.child.take() {
             // The owning task is being dropped without a controlled reap
-            // (e.g. force-abort). Kill + wait on a detached task and signal
-            // Reaped ONLY after the wait completes — ownership never resolves
-            // while the child may still be alive (RC-2B).
+            // (e.g. force-abort). Kill + wait on a detached task. RC-F4:
+            // Reaped is signalled ONLY after the wait conclusively succeeds;
+            // a failed wait leaves the lifecycle in ReapFailed — ownership
+            // never resolves as "reaped" while the child state is unproven
+            // (RC-2B/RC-F4).
             let completion = self.completion.clone();
             spawn_detached(async move {
                 let _ = child.kill().await;
-                let _ = child.wait().await;
-                completion.signal_reaped();
+                match child.wait().await {
+                    Ok(_) => completion.signal_reaped(),
+                    Err(e) => {
+                        // Bounded: one detached retry already happened; stay
+                        // in ReapFailed rather than spinning or lying.
+                        completion.signal_reap_failed();
+                        eprintln!(
+                            "[process-lifecycle] detached reap could not conclusively reap child: {e} — lifecycle unresolved, not Reaped"
+                        );
+                    }
+                }
             });
         } else {
-            // No child left (already waited/taken) — nothing to reap.
-            self.completion.signal_reaped();
+            // No child left and no controlled reap was recorded — a Reaped
+            // claim cannot be proven (RC-F4).
+            self.completion.signal_reap_failed();
         }
     }
 }
@@ -305,6 +365,42 @@ mod tests {
         completion.signal_reaped();
         assert!(!completion.running());
         assert!(completion.reaped());
+    }
+
+    /// RC-F4: a failed wait must transition to ReapFailed — `reaped()` stays
+    /// false and the state is never reported as a conclusive reap.
+    #[test]
+    fn process_completion_reap_failed_state() {
+        let completion = ProcessCompletion::default();
+        completion.mark_running();
+        assert!(completion.running());
+
+        completion.signal_reap_failed();
+        assert!(
+            !completion.reaped(),
+            "ReapFailed must never be reported as Reaped"
+        );
+        assert!(completion.reap_failed());
+        assert!(!completion.running());
+    }
+
+    /// RC-F4: `wait()` resolves `true` only for a conclusive Reaped and
+    /// `false` for ReapFailed — owners distinguish the two terminal states.
+    #[tokio::test]
+    async fn process_completion_wait_returns_reap_result() {
+        // Failed reap -> wait resolves false (never a Reaped claim).
+        let failed = ProcessCompletion::default();
+        failed.mark_running();
+        failed.signal_reap_failed();
+        assert!(!failed.wait().await);
+        assert!(!failed.reaped());
+
+        // Conclusively reaped -> wait resolves true.
+        let ok = ProcessCompletion::default();
+        ok.mark_running();
+        ok.signal_reaped();
+        assert!(ok.wait().await);
+        assert!(ok.reaped());
     }
 
     fn sleep_command() -> tokio::process::Command {

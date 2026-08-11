@@ -818,33 +818,58 @@ fn verify_file_hash(path: &Path, expected_hex: &str) -> Result<(), String> {
     }
 }
 
-/// RC-6: verify critical pinned assets against the authoritative manifest
-/// hashes. Only `type: "file"` entries carry per-file hashes in the
-/// manifest; `type: "archive"` entries hash the archive, not the extracted
-/// contents, so extracted binaries/DLLs remain existence-validated (by
-/// `validate_readiness`) — the manifest does not contain executable hashes
-/// and none are invented here. Missing files are skipped (the existing
-/// missing-asset readiness path reports them); a file that EXISTS but hashes
-/// differently makes integrity fail — a modified/corrupted critical asset
-/// can never report fully ready.
+/// RC-6/RC-F1: verify critical pinned assets against the authoritative
+/// manifest hashes.
+///
+/// Contract (Strategy B — truthful limited scope):
+/// - Piper model and Piper model config are SHA-256 verified at the SELECTED
+///   runtime paths (see `verify_runtime_integrity_with_manifest`).
+/// - Whisper model is SHA-256 verified.
+/// - Executables/DLLs carry NO authoritative per-file hashes in the manifest:
+///   `type: "archive"` entries hash the source archive, not the extracted
+///   contents. They remain coherent-layout/existence validated by
+///   `validate_readiness`, source-archive checksum verified by packaging, and
+///   exercised by the staged Piper smoke in Windows CI. No executable hashes
+///   are invented here.
+///
+/// Missing files are skipped (the existing missing-asset readiness path
+/// reports them); a file that EXISTS but hashes differently makes integrity
+/// fail — a modified/corrupted critical asset can never report fully ready.
 pub(crate) fn verify_runtime_integrity(tool_dir: &Path) -> RuntimeIntegrity {
-    let mut issues = Vec::new();
     let manifest: ToolManifest = match serde_json::from_str(TOOL_MANIFEST_JSON) {
         Ok(m) => m,
         Err(e) => {
             // The embedded manifest is part of the binary — a parse failure
             // is a build integrity problem, reported rather than ignored.
-            issues.push(AppConfigurationIssue {
-                code: "MANIFEST_UNREADABLE".into(),
-                message: format!("Tool manifest could not be parsed: {e}"),
-                expected_path: None,
-            });
             return RuntimeIntegrity {
                 verified: false,
-                issues,
+                issues: vec![AppConfigurationIssue {
+                    code: "MANIFEST_UNREADABLE".into(),
+                    message: format!("Tool manifest could not be parsed: {e}"),
+                    expected_path: None,
+                }],
             };
         }
     };
+    verify_runtime_integrity_with_manifest(tool_dir, &manifest)
+}
+
+/// Core integrity check over a parsed manifest (split out so tests can drive
+/// synthetic manifests with known hashes).
+///
+/// RC-F1: the Piper model/config are verified at the SELECTED layout's paths
+/// resolved by `resolve_piper` — the SAME resolver the runtime uses — never
+/// merely the manifest's canonical destination. A selected legacy layout
+/// uses `piper-models/en_US-amy-medium.onnx(.json)`, which is the exact file
+/// the manifest pins (its URL is `en_US-amy-medium.onnx`), so the manifest
+/// hash is authoritative for both layouts. An inactive alternative layout is
+/// never hashed: modifying a stray canonical model next to a selected legacy
+/// runtime does not fail the active runtime (and vice versa).
+fn verify_runtime_integrity_with_manifest(
+    tool_dir: &Path,
+    manifest: &ToolManifest,
+) -> RuntimeIntegrity {
+    let mut issues = Vec::new();
 
     for (name, entry) in &manifest.tools {
         if entry.tool_type != "file" {
@@ -853,10 +878,22 @@ pub(crate) fn verify_runtime_integrity(tool_dir: &Path) -> RuntimeIntegrity {
         let Some(expected) = entry.sha256.as_deref() else {
             continue;
         };
-        let Some(destination) = entry.destination.as_deref() else {
+        // The ACTIVE path for this asset: Piper model/config resolve through
+        // the SELECTED layout (canonical or legacy); Whisper model has a
+        // single layout so its canonical destination is the active path.
+        let path: Option<PathBuf> = match name.as_str() {
+            "piper-model" | "piper-model-json" => resolve_piper(tool_dir).map(|p| {
+                if name == "piper-model" {
+                    p.model
+                } else {
+                    p.model_config
+                }
+            }),
+            _ => entry.destination.as_deref().map(|d| tool_dir.join(d)),
+        };
+        let Some(path) = path else {
             continue;
         };
-        let path = tool_dir.join(destination);
         if !path.is_file() {
             // Missing assets are reported by validate_readiness with the
             // existing missing-code behavior — do not duplicate.
@@ -1751,5 +1788,163 @@ mod tests {
             "an empty tools dir has no corrupt assets — existence handles it"
         );
         assert!(integrity.issues.is_empty());
+    }
+
+    /// Build a synthetic manifest with known hashes for the three hashed
+    /// assets (Piper model, Piper config, Whisper model).
+    fn manifest_for_hashes(model_sha: &str, config_sha: &str, whisper_sha: &str) -> ToolManifest {
+        let mut tools = HashMap::new();
+        tools.insert(
+            "piper-model".into(),
+            ManifestToolEntry {
+                tool_type: "file".into(),
+                sha256: Some(model_sha.into()),
+                destination: Some("piper/model.onnx".into()),
+            },
+        );
+        tools.insert(
+            "piper-model-json".into(),
+            ManifestToolEntry {
+                tool_type: "file".into(),
+                sha256: Some(config_sha.into()),
+                destination: Some("piper/model.onnx.json".into()),
+            },
+        );
+        tools.insert(
+            "whisper-model".into(),
+            ManifestToolEntry {
+                tool_type: "file".into(),
+                sha256: Some(whisper_sha.into()),
+                destination: Some("models/ggml-tiny.en.bin".into()),
+            },
+        );
+        ToolManifest { tools }
+    }
+
+    fn sha_hex(content: &[u8]) -> String {
+        format!("{:x}", sha2::Sha256::digest(content))
+    }
+
+    /// RC-F1: integrity verifies the SELECTED legacy runtime — the
+    /// `piper-models/en_US-amy-medium.onnx(.json)` files, which are the exact
+    /// files the manifest pins. A corrupt ACTIVE legacy model fails; a stray
+    /// corrupt CANONICAL model next to a selected legacy runtime is an
+    /// inactive layout and must NOT fail the selected runtime.
+    #[test]
+    fn verify_runtime_integrity_hashes_selected_legacy_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("tools");
+        // Legacy layout: executable under piper/piper/, model/config under
+        // piper-models/.
+        fs::create_dir_all(tool.join("piper").join("piper")).unwrap();
+        fs::write(
+            tool.join("piper").join("piper").join("piper.exe"),
+            b"legacy-exe",
+        )
+        .unwrap();
+        fs::create_dir_all(tool.join("piper-models")).unwrap();
+        let model = b"legacy-model-content";
+        let config = b"legacy-config-content";
+        fs::write(
+            tool.join("piper-models").join("en_US-amy-medium.onnx"),
+            model,
+        )
+        .unwrap();
+        fs::write(
+            tool.join("piper-models").join("en_US-amy-medium.onnx.json"),
+            config,
+        )
+        .unwrap();
+        fs::create_dir_all(tool.join("models")).unwrap();
+        let whisper = b"whisper-model-content";
+        fs::write(tool.join("models").join("ggml-tiny.en.bin"), whisper).unwrap();
+
+        let manifest = manifest_for_hashes(&sha_hex(model), &sha_hex(config), &sha_hex(whisper));
+
+        // The selected legacy runtime verifies against the manifest hashes.
+        assert_eq!(resolve_piper_layout(&tool), Some(PiperLayout::Legacy));
+        let integrity = verify_runtime_integrity_with_manifest(&tool, &manifest);
+        assert!(
+            integrity.verified,
+            "selected legacy model/config must hash-verify, got {:#?}",
+            integrity.issues
+        );
+
+        // One-byte corruption of the ACTIVE legacy model flips integrity.
+        fs::write(
+            tool.join("piper-models").join("en_US-amy-medium.onnx"),
+            b"legacy-model-contenX",
+        )
+        .unwrap();
+        let integrity = verify_runtime_integrity_with_manifest(&tool, &manifest);
+        assert!(!integrity.verified);
+        assert!(
+            integrity
+                .issues
+                .iter()
+                .any(|i| i.code == "PIPER_MODEL_INTEGRITY"),
+            "corrupt active legacy model must be reported"
+        );
+
+        // A stray corrupt CANONICAL model next to the selected legacy runtime
+        // is an inactive layout — it must not fail the active runtime.
+        fs::write(
+            tool.join("piper-models").join("en_US-amy-medium.onnx"),
+            model,
+        )
+        .unwrap();
+        fs::create_dir_all(tool.join("piper")).unwrap();
+        fs::write(
+            tool.join("piper").join("model.onnx"),
+            b"stray-canonical-bad",
+        )
+        .unwrap();
+        let integrity = verify_runtime_integrity_with_manifest(&tool, &manifest);
+        assert!(
+            integrity.verified,
+            "inactive canonical layout must not fail the selected legacy runtime"
+        );
+    }
+
+    /// RC-F1: integrity verifies the SELECTED canonical runtime — corrupting
+    /// the active canonical model or config flips integrity.
+    #[test]
+    fn verify_runtime_integrity_hashes_selected_canonical_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("tools");
+        fs::create_dir_all(tool.join("piper")).unwrap();
+        fs::write(tool.join("piper").join("piper.exe"), b"canonical-exe").unwrap();
+        let model = b"canonical-model-content";
+        let config = b"canonical-config-content";
+        fs::write(tool.join("piper").join("model.onnx"), model).unwrap();
+        fs::write(tool.join("piper").join("model.onnx.json"), config).unwrap();
+        fs::create_dir_all(tool.join("models")).unwrap();
+        let whisper = b"whisper-model-content";
+        fs::write(tool.join("models").join("ggml-tiny.en.bin"), whisper).unwrap();
+
+        let manifest = manifest_for_hashes(&sha_hex(model), &sha_hex(config), &sha_hex(whisper));
+        assert_eq!(resolve_piper_layout(&tool), Some(PiperLayout::Canonical));
+        let integrity = verify_runtime_integrity_with_manifest(&tool, &manifest);
+        assert!(
+            integrity.verified,
+            "selected canonical model/config must hash-verify, got {:#?}",
+            integrity.issues
+        );
+
+        // Config corruption fails with the config-specific code.
+        fs::write(
+            tool.join("piper").join("model.onnx.json"),
+            b"canonical-config-contenX",
+        )
+        .unwrap();
+        let integrity = verify_runtime_integrity_with_manifest(&tool, &manifest);
+        assert!(!integrity.verified);
+        assert!(
+            integrity
+                .issues
+                .iter()
+                .any(|i| i.code == "PIPER_MODEL_JSON_INTEGRITY"),
+            "corrupt active canonical config must be reported"
+        );
     }
 }

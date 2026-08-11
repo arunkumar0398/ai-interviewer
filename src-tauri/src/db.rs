@@ -421,6 +421,27 @@ impl Database {
         Ok(count > 0)
     }
 
+    /// Look up the persisted identity (sha256 + audio_path) of a round by its
+    /// authoritative session + round index (RC-F2 journal reconciliation).
+    /// `Ok(None)` means the row is conclusively absent.
+    pub fn round_identity(
+        &self,
+        session_id: &str,
+        round_index: i32,
+    ) -> SqlResult<Option<(String, String)>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn.prepare(
+            "SELECT sha256, audio_path FROM rounds WHERE session_id = ?1 AND round_index = ?2",
+        )?;
+        let mut rows = stmt.query_map(params![session_id, round_index], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
     /// Get all rounds for a session
     pub fn get_rounds(&self, session_id: &str) -> SqlResult<Vec<InterviewRound>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());

@@ -64,6 +64,16 @@ pub fn is_retryable(kind: std::io::ErrorKind) -> bool {
     )
 }
 
+/// Windows sharing/lock violations can surface as `Uncategorized` while
+/// carrying the Win32 codes ERROR_ACCESS_DENIED (5), ERROR_SHARING_VIOLATION
+/// (32), and ERROR_LOCK_VIOLATION (33). Classifying those as retryable is
+/// what makes a locked WAV/transcript reconcile instead of being declared
+/// permanently failed (QA-F1 — verified against a real FileShare.None lock).
+#[cfg(windows)]
+fn is_windows_retryable_raw(raw: i32) -> bool {
+    matches!(raw, 5 | 32 | 33)
+}
+
 /// Controlled deletion of an owned artifact (RC-1). `NotFound` is treated as
 /// success (`AlreadyAbsent`). Any other failure is classified as retryable or
 /// permanent so the caller can decide whether to retry/reconcile.
@@ -72,7 +82,17 @@ pub fn remove_owned(path: &Path) -> CleanupOutcome {
         Ok(()) => CleanupOutcome::Removed,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => CleanupOutcome::AlreadyAbsent,
         Err(e) if is_retryable(e.kind()) => CleanupOutcome::RetryableFailure(e.kind()),
-        Err(e) => CleanupOutcome::PermanentFailure(e.kind()),
+        Err(e) => {
+            #[cfg(windows)]
+            {
+                if let Some(raw) = e.raw_os_error() {
+                    if is_windows_retryable_raw(raw) {
+                        return CleanupOutcome::RetryableFailure(e.kind());
+                    }
+                }
+            }
+            CleanupOutcome::PermanentFailure(e.kind())
+        }
     }
 }
 
@@ -292,6 +312,46 @@ mod tests {
         assert!(!legacy_transcript.exists());
         assert!(!stale_partial.exists());
         assert!(!stale_tts.exists());
+    }
+
+    /// QA-F1: REAL Windows sharing-violation check. Hold a file open with
+    /// `FileShare.None` (the same exclusive lock the OS enforces across
+    /// processes) and verify the controlled cleanup path reports a
+    /// retryable failure instead of claiming success; after the lock is
+    /// released, the retry removes it. This is the real Windows cleanup-lock
+    /// acceptance check, run in CI on the Windows runner.
+    #[cfg(windows)]
+    #[test]
+    fn windows_sharing_violation_fails_then_retry_succeeds() {
+        use std::fs::OpenOptions;
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audio_test_locked.wav");
+        std::fs::write(&path, b"x").unwrap();
+
+        // Hold an exclusive non-shared read handle — Windows then refuses to
+        // delete the file (sharing violation surfaces as PermissionDenied).
+        let handle = OpenOptions::new()
+            .read(true)
+            .share_mode(0) // FILE_SHARE_NONE
+            .open(&path)
+            .unwrap();
+
+        let outcome = remove_owned(&path);
+        assert!(
+            matches!(outcome, CleanupOutcome::RetryableFailure(_)),
+            "a sharing-violated file must surface a RETRYABLE failure, got {outcome:?}"
+        );
+        assert!(
+            path.exists(),
+            "failed deletion must leave the artifact in place (reconcilable)"
+        );
+
+        // Release the lock -> the retry succeeds.
+        drop(handle);
+        assert_eq!(remove_owned(&path), CleanupOutcome::Removed);
+        assert!(!path.exists());
     }
 
     #[test]

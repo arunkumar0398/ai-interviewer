@@ -269,8 +269,14 @@ impl<T: Send + 'static> Drop for RecordingGuard<T> {
                     // Running when the outer worker died is killed + waited
                     // by the detached task spawned from the aborted task's
                     // own RAII guard; the slot is not released until Reaped.
-                    if process_completion.running() {
-                        process_completion.wait().await;
+                    // RC-F4: wait() reports whether the child was
+                    // CONCLUSIVELY reaped — a failed wait is surfaced as an
+                    // explicit unresolved lifecycle, never a silent
+                    // "reaped" assumption.
+                    if process_completion.running() && !process_completion.wait().await {
+                        eprintln!(
+                            "[process-lifecycle] process reap unresolved after outer-worker abort — child state not proven Reaped"
+                        );
                     }
                 }
                 // 6. Only now is the shared audio slot released.
@@ -927,7 +933,13 @@ async fn run_interview_round(
         // ownership must not resolve before that reap completes.
         let process_completion = recording_guard.process_completion();
         if process_completion.running() {
-            process_completion.wait().await;
+            // RC-F4: a failed wait leaves the lifecycle explicitly unresolved
+            // (ReapFailed) — surfaced, never reported as a proven Reaped.
+            if !process_completion.wait().await {
+                eprintln!(
+                    "[process-lifecycle] process reap unresolved at round timeout — child state not proven Reaped"
+                );
+            }
         }
         // A worker that exited cooperatively finished its capture; a capture
         // that Finished or was never Scheduled has nothing left to run. Only
@@ -1067,34 +1079,141 @@ fn round_timeout_message(
     }
 }
 
-/// RC-1E/RC-4: startup reconciliation of candidate EVIDENCE (final WAVs
-/// under `recordings/`). These are NEVER deleted: a WAV with a matching DB
-/// round is durable evidence and is left untouched; a WAV with no DB
-/// reference is ambiguous orphaned evidence and is MOVED to the quarantine
-/// directory (preserved for review, reported); the reconciliation-needed
-/// journal from an Unknown COMMIT outcome is reported but never touched.
+/// Classification of a `reconciliation-needed.log` entry against the
+/// authoritative DB state (RC-F2).
+enum JournalResolution {
+    /// The round row exists with matching identity — the commit went through
+    /// and the entry is resolved.
+    Committed,
+    /// No round row exists — persistence is conclusively absent; the
+    /// evidence was either quarantined by the WAV reconciliation above or is
+    /// already absent. The entry is resolved.
+    NotCommitted,
+    /// DB/checksum state cannot be conclusively classified — keep pending.
+    Unknown(String),
+    /// The record could not be parsed — preserved verbatim, never dropped.
+    Malformed,
+}
+
+/// Parse a journal line (`{ts} | session=.. | round_index=.. | audio_path=..
+/// | sha256=.. | source=..`) into its resolution-relevant fields. Returns
+/// `None` when a required field is missing/unparseable or the session is not
+/// a well-formed UUID — the caller preserves the raw line (RC-F2: malformed
+/// records are never silently discarded).
+fn parse_journal_entry(line: &str) -> Option<(String, i32, String, String)> {
+    let mut session: Option<String> = None;
+    let mut round_index: Option<i32> = None;
+    let mut audio_path: Option<String> = None;
+    let mut sha256: Option<String> = None;
+    for field in line.split('|') {
+        let field = field.trim();
+        let Some((key, value)) = field.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "session" => session = Some(value.to_string()),
+            "round_index" => round_index = value.parse::<i32>().ok(),
+            "audio_path" => audio_path = Some(value.to_string()),
+            "sha256" => sha256 = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    let (session, round_index, audio_path, sha256) = (session?, round_index?, audio_path?, sha256?);
+    if uuid::Uuid::parse_str(&session).is_err() {
+        return None;
+    }
+    Some((session, round_index, audio_path, sha256))
+}
+
+/// Classify one journal entry against authoritative DB state (RC-F2). The
+/// caller NEVER deletes evidence based on this classification — it only
+/// decides whether the pending record may be dropped.
+fn resolve_journal_entry(line: &str, db: &db::Database) -> JournalResolution {
+    let Some((session, round_index, audio_path, sha256)) = parse_journal_entry(line) else {
+        return JournalResolution::Malformed;
+    };
+    match db.round_identity(&session, round_index) {
+        Err(e) => JournalResolution::Unknown(format!("DB query failed: {e}")),
+        Ok(None) => JournalResolution::NotCommitted,
+        Ok(Some((stored_sha, stored_path))) => {
+            if stored_sha == sha256 || stored_path == audio_path {
+                JournalResolution::Committed
+            } else {
+                JournalResolution::Unknown(format!(
+                    "round row exists but identity mismatches (stored sha {stored_sha:?} != journal {sha256:?}, stored path {stored_path:?} != journal {audio_path:?})"
+                ))
+            }
+        }
+    }
+}
+
+/// Split `<stem>.<ext>` — used to build collision-safe quarantine names
+/// (RC-F3).
+fn split_extension(file_name: &str) -> (String, String) {
+    match file_name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem.to_string(), format!(".{ext}")),
+        _ => (file_name.to_string(), String::new()),
+    }
+}
+
+/// Atomically rewrite the reconciliation journal with ONLY the still-
+/// unresolved lines (RC-F2): write a `.tmp` sibling, then rename over the
+/// original. On any failure the original journal is left untouched.
+fn rewrite_reconciliation_journal(journal: &std::path::Path, kept: &[&str]) -> bool {
+    let tmp = journal.with_extension("log.tmp");
+    let mut content = String::new();
+    for line in kept {
+        content.push_str(line);
+        content.push('\n');
+    }
+    if std::fs::write(&tmp, content).is_err() {
+        return false;
+    }
+    std::fs::rename(&tmp, journal).is_ok()
+}
+
+/// RC-1E/RC-4/RC-F2/RC-F3: startup reconciliation of candidate EVIDENCE
+/// (final WAVs under `recordings/`) and of the reconciliation-needed journal.
+///
+/// Evidence is NEVER deleted: a WAV with a matching DB round is durable
+/// evidence and is left untouched; a WAV with no DB reference is ambiguous
+/// orphaned evidence and is MOVED to the quarantine directory (preserved for
+/// review, reported). Quarantine preserves the source session identity
+/// (`quarantine/<session>/<file>`) and never overwrites an existing artifact
+/// (RC-F3).
+///
+/// The reconciliation-needed journal is then RESOLVED against the DB (RC-F2):
+/// entries whose round is now conclusively committed (or conclusively
+/// absent) are dropped; unresolved/anomalous/malformed entries remain
+/// pending, and the journal is rewritten atomically with only those. Journal
+/// state never deletes evidence — resolution only removes the pending record.
 fn reconcile_orphaned_evidence(paths: &crate::paths::AppPaths, db: &db::Database) -> Vec<String> {
     let mut messages = Vec::new();
     let quarantine = paths.quarantine_dir();
 
-    // 1. Report pending reconciliation-needed entries (Unknown COMMIT
-    // outcomes) — never delete them.
-    let journal = quarantine.join("reconciliation-needed.log");
-    if let Ok(content) = std::fs::read_to_string(&journal) {
-        for line in content.lines().filter(|l| !l.trim().is_empty()) {
-            messages.push(format!(
-                "[startup-reconcile] pending reconciliation: {line}"
-            ));
-        }
-    }
-
-    // 2. Final WAVs under recordings/ — reconcile against the DB.
+    // 1. Final WAVs under recordings/ — reconcile against the DB FIRST so the
+    //    journal resolution below can classify NotCommitted entries whose
+    //    evidence has now been moved to quarantine.
     if let Ok(sessions) = std::fs::read_dir(&paths.recordings_dir) {
         for session in sessions.flatten() {
             let session_dir = session.path();
             if !session_dir.is_dir() {
                 continue;
             }
+            let session_name = match session_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+            {
+                Some(name) if crate::paths::validate_path_component(&name).is_ok() => name,
+                _ => {
+                    messages.push(format!(
+                        "[startup-reconcile] skipping recordings entry with unsafe name: {}",
+                        session_dir.display()
+                    ));
+                    continue;
+                }
+            };
             if let Ok(files) = std::fs::read_dir(&session_dir) {
                 for file in files.flatten() {
                     let path = file.path();
@@ -1112,14 +1231,25 @@ fn reconcile_orphaned_evidence(paths: &crate::paths::AppPaths, db: &db::Database
                         Ok(true) => { /* durable evidence — untouched */ }
                         Ok(false) => {
                             // Ambiguous orphaned evidence: preserve by moving
-                            // to quarantine; never delete.
-                            if let Err(e) = std::fs::create_dir_all(&quarantine) {
+                            // to a SESSION-SCOPED, collision-safe quarantine
+                            // destination; never delete (RC-F3).
+                            let dest_dir = quarantine.join(&session_name);
+                            if let Err(e) = std::fs::create_dir_all(&dest_dir) {
                                 messages.push(format!(
                                     "[startup-reconcile] cannot create quarantine dir: {e}"
                                 ));
                                 continue;
                             }
-                            let dest = quarantine.join(file.file_name());
+                            let file_name = file.file_name().to_string_lossy().to_string();
+                            let mut dest = dest_dir.join(&file_name);
+                            let (stem, ext) = split_extension(&file_name);
+                            let mut n = 1u32;
+                            while dest.exists() {
+                                // No-overwrite: never clobber an existing
+                                // quarantine artifact.
+                                dest = dest_dir.join(format!("{stem}.{n}{ext}"));
+                                n += 1;
+                            }
                             match std::fs::rename(&path, &dest) {
                                 Ok(()) => messages.push(format!(
                                     "[startup-reconcile] quarantined unreferenced evidence: {} -> {}",
@@ -1127,7 +1257,7 @@ fn reconcile_orphaned_evidence(paths: &crate::paths::AppPaths, db: &db::Database
                                     dest.display()
                                 )),
                                 Err(e) => messages.push(format!(
-                                    "[startup-reconcile] could not quarantine {}: {e}",
+                                    "[startup-reconcile] could not quarantine {} (original left intact): {e}",
                                     path.display()
                                 )),
                             }
@@ -1138,6 +1268,60 @@ fn reconcile_orphaned_evidence(paths: &crate::paths::AppPaths, db: &db::Database
                         )),
                     }
                 }
+            }
+        }
+    }
+
+    // 2. RC-F2: resolve the reconciliation-needed journal. Entries whose
+    //    round is now conclusively committed (or conclusively absent) are
+    //    resolved and dropped; Unknown/anomalous and malformed entries stay
+    //    pending. The journal is rewritten atomically with only the
+    //    unresolved subset — a subsequent startup never repeats stale
+    //    "pending" warnings for already-resolved entries.
+    let journal = quarantine.join("reconciliation-needed.log");
+    if let Ok(content) = std::fs::read_to_string(&journal) {
+        let mut kept: Vec<&str> = Vec::new();
+        let mut resolved = 0usize;
+        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+            match resolve_journal_entry(line, db) {
+                JournalResolution::Committed => {
+                    resolved += 1;
+                    messages.push(format!(
+                        "[startup-reconcile] reconciliation resolved (committed): {line}"
+                    ));
+                }
+                JournalResolution::NotCommitted => {
+                    resolved += 1;
+                    messages.push(format!(
+                        "[startup-reconcile] reconciliation resolved (not committed): {line}"
+                    ));
+                }
+                JournalResolution::Unknown(reason) => {
+                    kept.push(line);
+                    messages.push(format!(
+                        "[startup-reconcile] pending reconciliation ({reason}): {line}"
+                    ));
+                }
+                JournalResolution::Malformed => {
+                    // Preserved verbatim — never silently discarded.
+                    kept.push(line);
+                    messages.push(format!(
+                        "[startup-reconcile] malformed reconciliation entry preserved: {line}"
+                    ));
+                }
+            }
+        }
+        if resolved > 0 {
+            if rewrite_reconciliation_journal(&journal, &kept) {
+                messages.push(format!(
+                    "[startup-reconcile] reconciliation journal rewritten: {resolved} resolved, {} pending remain",
+                    kept.len()
+                ));
+            } else {
+                messages.push(
+                    "[startup-reconcile] could not rewrite reconciliation journal — original preserved"
+                        .to_string(),
+                );
             }
         }
     }
@@ -3435,5 +3619,259 @@ mod tests {
         let too_many = "\u{1F600}".repeat(MAX_TTS_LEN + 1);
         let err = validate_tts_text(&too_many).unwrap_err();
         assert!(err.contains("too long"), "got: {}", err);
+    }
+
+    // ------------------------------------------------------------------
+    // RC-F2: reconciliation journal reaches a resolved state
+    // ------------------------------------------------------------------
+
+    const SESSION_UUID: &str = "11111111-1111-1111-1111-111111111111";
+
+    /// Build a temp AppPaths rooted in a tempdir.
+    fn temp_paths() -> (tempfile::TempDir, crate::paths::AppPaths) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::AppPaths::from_tool_dir(
+            dir.path().join("tools"),
+            dir.path().join("data"),
+        )
+        .unwrap();
+        // The data dir must exist for Database::open (real startup calls
+        // ensure_directories first).
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        (dir, paths)
+    }
+
+    fn journal_path(paths: &crate::paths::AppPaths) -> std::path::PathBuf {
+        paths.quarantine_dir().join("reconciliation-needed.log")
+    }
+
+    /// RC-F2: an entry whose round is now conclusively committed (matching
+    /// sha256) is resolved and dropped from the journal; the durable WAV is
+    /// never touched; a second startup emits no stale pending warning.
+    #[test]
+    fn journal_committed_entry_resolves_and_never_repeats() {
+        let (_dir, paths) = temp_paths();
+        let db = db::Database::open(&paths.db_path).unwrap();
+        db.create_session(SESSION_UUID, "Alice").unwrap();
+
+        let wav = paths.recordings_dir.join(SESSION_UUID).join("round.wav");
+        std::fs::create_dir_all(wav.parent().unwrap()).unwrap();
+        std::fs::write(&wav, b"committed-evidence").unwrap();
+        let audio_path = wav.to_string_lossy().to_string();
+        let sha = "sha-committed";
+        let outcome = db.insert_round_with_session_update(
+            SESSION_UUID,
+            0,
+            "Q",
+            "A",
+            &audio_path,
+            sha,
+            5000,
+            16000,
+            1,
+            160044,
+            false,
+        );
+        assert!(matches!(outcome, db::PersistenceOutcome::Committed(_)));
+        record_reconciliation_needed(&paths, SESSION_UUID, 0, &audio_path, sha, "test");
+        assert!(journal_path(&paths).exists());
+
+        let messages = reconcile_orphaned_evidence(&paths, &db);
+        assert!(
+            messages.iter().any(|m| m.contains("resolved (committed)")),
+            "committed entry must resolve, got {messages:?}"
+        );
+        let content = std::fs::read_to_string(journal_path(&paths)).unwrap();
+        assert!(
+            !content.contains(sha),
+            "resolved entry must be dropped from the journal"
+        );
+        assert_eq!(
+            std::fs::read(&wav).unwrap(),
+            b"committed-evidence",
+            "durable evidence must never be touched by journal resolution"
+        );
+
+        // Second startup: no stale pending/repeated resolution for the entry.
+        let again = reconcile_orphaned_evidence(&paths, &db);
+        assert!(
+            !again.iter().any(|m| m.contains(sha)),
+            "second startup must not repeat stale warnings, got {again:?}"
+        );
+    }
+
+    /// RC-F2/RC-F3: an entry whose round has no DB row resolves as not
+    /// committed; the unreferenced WAV is moved to a session-scoped
+    /// quarantine and the journal entry is dropped.
+    #[test]
+    fn journal_unreferenced_entry_resolves_and_evidence_is_quarantined() {
+        let (_dir, paths) = temp_paths();
+        let db = db::Database::open(&paths.db_path).unwrap();
+
+        let wav = paths.recordings_dir.join(SESSION_UUID).join("round.wav");
+        std::fs::create_dir_all(wav.parent().unwrap()).unwrap();
+        std::fs::write(&wav, b"orphan-evidence").unwrap();
+        let audio_path = wav.to_string_lossy().to_string();
+        record_reconciliation_needed(&paths, SESSION_UUID, 0, &audio_path, "sha-orphan", "test");
+
+        let messages = reconcile_orphaned_evidence(&paths, &db);
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("resolved (not committed)")),
+            "absent-row entry must resolve, got {messages:?}"
+        );
+        // Evidence preserved — moved to quarantine/<session>/round.wav.
+        let quarantined = paths.quarantine_dir().join(SESSION_UUID).join("round.wav");
+        assert!(
+            quarantined.exists(),
+            "orphan evidence must be quarantined, got {messages:?}"
+        );
+        assert_eq!(std::fs::read(&quarantined).unwrap(), b"orphan-evidence");
+        assert!(!wav.exists());
+        // Journal entry resolved away.
+        let content = std::fs::read_to_string(journal_path(&paths)).unwrap();
+        assert!(!content.contains("sha-orphan"));
+    }
+
+    /// RC-F2: an anomalous entry (row exists but sha AND path mismatch) stays
+    /// pending; a DB query failure stays pending; a malformed line is
+    /// preserved verbatim.
+    #[test]
+    fn journal_unknown_and_malformed_entries_stay_pending() {
+        let (_dir, paths) = temp_paths();
+        let db = db::Database::open(&paths.db_path).unwrap();
+        db.create_session(SESSION_UUID, "Bob").unwrap();
+        // The persisted row has DIFFERENT identity than the journal entry.
+        let outcome = db.insert_round_with_session_update(
+            SESSION_UUID,
+            0,
+            "Q",
+            "A",
+            "/other/path.wav",
+            "other-sha",
+            5000,
+            16000,
+            1,
+            160044,
+            false,
+        );
+        assert!(matches!(outcome, db::PersistenceOutcome::Committed(_)));
+        record_reconciliation_needed(
+            &paths,
+            SESSION_UUID,
+            0,
+            "/journal/path.wav",
+            "journal-sha",
+            "mismatch",
+        );
+        // Append a malformed line that must survive untouched.
+        let malformed = "this is not a valid journal record";
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(journal_path(&paths))
+            .unwrap();
+        std::io::Write::write_all(&mut file, format!("\n{malformed}\n").as_bytes()).unwrap();
+
+        let messages = reconcile_orphaned_evidence(&paths, &db);
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("pending reconciliation")),
+            "anomalous entry must stay pending, got {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("malformed")),
+            "malformed entry must be reported as preserved, got {messages:?}"
+        );
+        let content = std::fs::read_to_string(journal_path(&paths)).unwrap();
+        assert!(
+            content.contains("journal-sha"),
+            "anomalous entry must remain in the journal"
+        );
+        assert!(
+            content.contains(malformed),
+            "malformed entry must be preserved verbatim"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // RC-F3: collision-safe, session-preserving quarantine
+    // ------------------------------------------------------------------
+
+    /// RC-F3: same filename under two source sessions yields two preserved
+    /// quarantine artifacts; a pre-existing quarantine destination is never
+    /// overwritten (alternate name used); a failed quarantine move leaves the
+    /// source intact; a successful move preserves bytes exactly.
+    #[test]
+    fn quarantine_is_session_scoped_and_never_overwrites() {
+        let (_dir, paths) = temp_paths();
+        let db = db::Database::open(&paths.db_path).unwrap();
+
+        // Session A: unreferenced round.wav; pre-existing quarantine file
+        // with the same name must NOT be overwritten.
+        let session_a = paths.recordings_dir.join(SESSION_UUID);
+        std::fs::create_dir_all(&session_a).unwrap();
+        std::fs::write(session_a.join("round.wav"), b"orphan-a").unwrap();
+        let existing = paths.quarantine_dir().join(SESSION_UUID).join("round.wav");
+        std::fs::create_dir_all(existing.parent().unwrap()).unwrap();
+        std::fs::write(&existing, b"pre-existing").unwrap();
+
+        // Session B: same filename, different session identity.
+        let session_b = paths
+            .recordings_dir
+            .join("22222222-2222-2222-2222-222222222222");
+        std::fs::create_dir_all(&session_b).unwrap();
+        std::fs::write(session_b.join("round.wav"), b"orphan-b").unwrap();
+
+        let messages = reconcile_orphaned_evidence(&paths, &db);
+
+        // A's artifact went to the alternate no-overwrite name; the
+        // pre-existing file is untouched with its exact bytes.
+        let alt = paths
+            .quarantine_dir()
+            .join(SESSION_UUID)
+            .join("round.1.wav");
+        assert!(
+            alt.exists(),
+            "pre-existing quarantine target must not be overwritten, got {messages:?}"
+        );
+        assert_eq!(std::fs::read(&alt).unwrap(), b"orphan-a");
+        assert_eq!(std::fs::read(&existing).unwrap(), b"pre-existing");
+
+        // B's artifact preserved under ITS session directory.
+        let b_dest = paths
+            .quarantine_dir()
+            .join("22222222-2222-2222-2222-222222222222")
+            .join("round.wav");
+        assert!(b_dest.exists());
+        assert_eq!(std::fs::read(&b_dest).unwrap(), b"orphan-b");
+
+        // A failed quarantine move leaves the source intact: make the
+        // session's quarantine destination uncreatable by placing a FILE at
+        // the session directory path.
+        let session_c = paths
+            .recordings_dir
+            .join("33333333-3333-3333-3333-333333333333");
+        std::fs::create_dir_all(&session_c).unwrap();
+        std::fs::write(session_c.join("round.wav"), b"orphan-c").unwrap();
+        let blocker = paths
+            .quarantine_dir()
+            .join("33333333-3333-3333-3333-333333333333");
+        std::fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+        std::fs::write(&blocker, b"i-am-a-file").unwrap();
+
+        let messages = reconcile_orphaned_evidence(&paths, &db);
+        assert!(
+            messages.iter().any(|m| m.contains("could not quarantine")
+                || m.contains("cannot create quarantine dir")),
+            "failed quarantine must be surfaced, got {messages:?}"
+        );
+        assert_eq!(
+            std::fs::read(session_c.join("round.wav")).unwrap(),
+            b"orphan-c",
+            "failed quarantine must leave the source evidence intact"
+        );
     }
 }

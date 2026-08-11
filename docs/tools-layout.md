@@ -67,3 +67,31 @@ scripts\smoke-test.bat
 ```
 
 This verifies all tools are present and functional.
+
+## Runtime Integrity Contract
+
+At application startup, the app verifies the files the manifest pins per-file
+hashes for (entries with `type: "file"` in `resources/tool-manifest.json`):
+
+- **Piper model** — SHA-256 verified at the SELECTED layout's path (canonical
+  `tools/piper/model.onnx` or legacy `tools/piper-models/en_US-amy-medium.onnx`);
+- **Piper model config** — SHA-256 verified at the SELECTED layout's path;
+- **Whisper model** (`tools/models/ggml-tiny.en.bin`) — SHA-256 verified.
+
+The verifier follows the same layout resolver the runtime uses
+(`resolve_piper`), so a selected legacy runtime is hash-checked against its
+actual active files, never only the canonical destinations.
+
+Runtime executables and companion DLLs (`piper.exe`, `espeak-ng.dll`,
+`piper_phonemize.dll`, `onnxruntime*.dll`, `espeak-ng-data/`, `main.exe`)
+are **not** independently hashed at startup: the manifest stores archive-level
+checksums for those packages, not per-file executable hashes. Their guarantees
+are:
+
+- coherent layout/existence validation at startup (readiness);
+- source-archive SHA-256 verification during packaging
+  (`scripts/fetch-tools.ps1` / `scripts/verify-tools.ps1`);
+- a real staged Piper execution smoke test in Windows CI.
+
+This is a deliberate, truthful scope: the app does not claim full executable
+hash verification.

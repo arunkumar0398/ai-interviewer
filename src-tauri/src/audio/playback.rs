@@ -337,7 +337,11 @@ pub async fn generate_tts(
             // Child may still be running — kill and reap explicitly. The
             // temp guard removes only this invocation's artifacts; the final
             // path is never touched (RC-6).
-            crate::audio::pipe::terminate_child(&mut child).await;
+            if !crate::audio::pipe::terminate_child(&mut child).await {
+                eprintln!(
+                    "[process-lifecycle] TTS child reap unresolved — child state not proven Reaped"
+                );
+            }
             anyhow::bail!("Failed to write TTS text to Piper stdin: {}", e);
         }
         drop(stdin); // close stdin to signal EOF
@@ -364,7 +368,11 @@ pub async fn generate_tts(
                 }
             }
             _ = tokio::time::sleep_until(deadline) => {
-                crate::audio::pipe::terminate_child(&mut child).await;
+                if !crate::audio::pipe::terminate_child(&mut child).await {
+                    eprintln!(
+                        "[process-lifecycle] TTS child reap unresolved — child state not proven Reaped"
+                    );
+                }
                 anyhow::bail!(
                     "TTS generation timed out after {}s — process killed",
                     GENERATE_TTS_TIMEOUT_SECS
@@ -375,7 +383,11 @@ pub async fn generate_tts(
 
     if let Err(e) = read_result {
         // Child may still be running (stdout read error) — kill and reap.
-        crate::audio::pipe::terminate_child(&mut child).await;
+        if !crate::audio::pipe::terminate_child(&mut child).await {
+            eprintln!(
+                "[process-lifecycle] TTS child reap unresolved — child state not proven Reaped"
+            );
+        }
         return Err(e);
     }
 
@@ -401,12 +413,20 @@ pub async fn generate_tts(
             // Child state is uncertain after a wait error — terminate and
             // reap explicitly before propagating (P2-2); kill_on_drop stays
             // only as defense-in-depth.
-            crate::audio::pipe::terminate_child(&mut child).await;
+            if !crate::audio::pipe::terminate_child(&mut child).await {
+                eprintln!(
+                    "[process-lifecycle] TTS child reap unresolved — child state not proven Reaped"
+                );
+            }
             anyhow::bail!("TTS process wait error: {}", e);
         }
         Err(_) => {
             // Timeout waiting for child to exit — force kill and reap.
-            crate::audio::pipe::terminate_child(&mut child).await;
+            if !crate::audio::pipe::terminate_child(&mut child).await {
+                eprintln!(
+                    "[process-lifecycle] TTS child reap unresolved — child state not proven Reaped"
+                );
+            }
             anyhow::bail!(
                 "TTS generation timed out after {}s — process killed",
                 GENERATE_TTS_TIMEOUT_SECS
