@@ -11,18 +11,29 @@ use tokio::sync::{mpsc, Mutex};
 
 use paths::{get_app_config, resolve_app_paths, uuid_to_path, PathsState};
 
-/// Holds the current recording handle — the shared EXCLUSIVE audio-slot
-/// lease. Every raw microphone/audio command acquires it before touching a
-/// device and clears it only after the physical worker has fully terminated.
+/// Shared EXCLUSIVE audio/process slot (RC-G1B): ONE mutex-protected state
+/// machine so that poison checking + acquisition is a single atomic
+/// transition under one synchronization boundary — there is no check-then-act
+/// window for a concurrent ReapFailed cleanup to slip a new operation past a
+/// poison that was already set.
 ///
-/// RC-G1: a second, sticky `poisoned` flag makes the subsystem fail closed.
-/// When a native child process (Piper/Whisper) could not be conclusively
-/// reaped, the subsystem is poisoned for the remainder of the app session:
-/// every future acquisition is rejected with an explicit restart-required
-/// error, and ordinary `clear_active_recording` can never erase the poison.
-struct RecordingState {
-    handle: Mutex<Option<audio::capture::RecordingHandle>>,
-    poisoned: Mutex<Option<String>>,
+/// - `Free -> Active(handle)` admits exactly one operation.
+/// - `Active -> Free` is the ordinary release.
+/// - `Free | Active -> Poisoned` is the fail-closed transition; `Poisoned`
+///   is sticky and rejects EVERY future acquisition with a restart-required
+///   error for the remainder of the app session.
+/// - `Poisoned -> Free` NEVER happens.
+enum AudioSlotState {
+    Free,
+    Active(audio::capture::RecordingHandle),
+    Poisoned {
+        /// Retained stop handle of the operation that was active when the
+        /// subsystem was poisoned — poisoning never loses lifecycle
+        /// ownership. The ordinary release path clears only this component;
+        /// the poison itself is never erased.
+        active: Option<audio::capture::RecordingHandle>,
+        reason: String,
+    },
 }
 
 /// RC-G1: acquire must check the poison FIRST — Poisoned is distinct from
@@ -31,42 +42,97 @@ const POISONED_ACQUIRE_ERROR: &str =
     "Audio subsystem is unavailable because a previous native process could not be \
      conclusively terminated. Restart the application before continuing.";
 
-/// Atomically acquire the recording slot. Returns Err if the subsystem is
-/// poisoned (RC-G1, restart required) or if already active.
+struct RecordingState {
+    slot: Mutex<AudioSlotState>,
+}
+
+impl RecordingState {
+    #[cfg(test)]
+    /// Whether an operation is currently admitted (Active).
+    async fn is_active(&self) -> bool {
+        matches!(&*self.slot.lock().await, AudioSlotState::Active(_))
+    }
+
+    #[cfg(test)]
+    /// Whether the slot is in the plain reusable Free state.
+    async fn slot_is_free(&self) -> bool {
+        matches!(&*self.slot.lock().await, AudioSlotState::Free)
+    }
+
+    #[cfg(test)]
+    /// Whether NO operation is admitted — Free, or Poisoned after its active
+    /// component was released by the ordinary clear path.
+    async fn slot_is_released(&self) -> bool {
+        !matches!(
+            &*self.slot.lock().await,
+            AudioSlotState::Active(_)
+                | AudioSlotState::Poisoned {
+                    active: Some(_),
+                    ..
+                }
+        )
+    }
+
+    #[cfg(test)]
+    /// The sticky poison reason, if the subsystem is poisoned.
+    async fn poison_reason(&self) -> Option<String> {
+        match &*self.slot.lock().await {
+            AudioSlotState::Poisoned { reason, .. } => Some(reason.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// Atomically acquire the recording slot: ONE lock, ONE transition. Rejects
+/// with a restart-required error when poisoned (RC-G1), or as ordinary busy
+/// when already active.
 async fn acquire_recording(
     state: &RecordingState,
     handle: audio::capture::RecordingHandle,
 ) -> Result<(), String> {
-    let poisoned = state.poisoned.lock().await;
-    if let Some(reason) = poisoned.as_ref() {
-        return Err(format!("{POISONED_ACQUIRE_ERROR} (reason: {reason})"));
+    let mut slot = state.slot.lock().await;
+    match &mut *slot {
+        AudioSlotState::Free => {
+            *slot = AudioSlotState::Active(handle);
+            Ok(())
+        }
+        AudioSlotState::Active(_) => Err("A recording is already active".to_string()),
+        AudioSlotState::Poisoned { reason, .. } => {
+            Err(format!("{POISONED_ACQUIRE_ERROR} (reason: {reason})"))
+        }
     }
-    drop(poisoned);
-    let mut guard = state.handle.lock().await;
-    if guard.is_some() {
-        return Err("A recording is already active".to_string());
-    }
-    *guard = Some(handle);
-    Ok(())
 }
 
-/// Clear the recording slot unconditionally. RC-G1: this NEVER clears a
-/// poisoned state — poison is sticky for the app lifetime and survives every
-/// ordinary release.
+/// Ordinary release: `Active -> Free`, `Free -> Free`. On a Poisoned state
+/// only the retained active component is cleared — the poison is sticky and
+/// NEVER erased (RC-G1).
 async fn clear_active_recording(state: &RecordingState) {
-    let mut guard = state.handle.lock().await;
-    *guard = None;
+    let mut slot = state.slot.lock().await;
+    match &mut *slot {
+        AudioSlotState::Active(_) => *slot = AudioSlotState::Free,
+        AudioSlotState::Poisoned { active, .. } => *active = None,
+        AudioSlotState::Free => {}
+    }
 }
 
-/// RC-G1: mark the shared audio/process subsystem poisoned/unavailable. Once
-/// set, the reason is sticky for the app lifetime; the FIRST recorded reason
-/// is kept and later failures never downgrade it to Free/reusable. Ordinary
-/// clears and guard disarms cannot erase it.
+/// RC-G1: mark the shared audio/process subsystem poisoned/unavailable under
+/// the SAME lock as acquisition. The FIRST recorded reason is kept and later
+/// failures never downgrade the state to Free/reusable. An active handle is
+/// retained inside the Poisoned state so lifecycle ownership is never lost.
 async fn poison_recording(state: &RecordingState, reason: &str) {
-    let mut poisoned = state.poisoned.lock().await;
-    if poisoned.is_none() {
-        *poisoned = Some(reason.to_string());
-    }
+    let mut slot = state.slot.lock().await;
+    let current = std::mem::replace(&mut *slot, AudioSlotState::Free);
+    *slot = match current {
+        AudioSlotState::Free => AudioSlotState::Poisoned {
+            active: None,
+            reason: reason.to_string(),
+        },
+        AudioSlotState::Active(handle) => AudioSlotState::Poisoned {
+            active: Some(handle),
+            reason: reason.to_string(),
+        },
+        poisoned @ AudioSlotState::Poisoned { .. } => poisoned,
+    };
 }
 
 /// Holds the database connection
@@ -301,21 +367,17 @@ impl<T: Send + 'static> Drop for RecordingGuard<T> {
                     // Running when the outer worker died is killed + waited
                     // by the detached task spawned from the aborted task's
                     // own RAII guard; the slot is not released until Reaped.
-                    // RC-G1 fail-closed: a conclusive Reaped releases
-                    // normally; a failed wait (ReapFailed) POISONS the audio
-                    // subsystem so no later operation can reuse the slot
-                    // while a child state is unresolved — the user must
-                    // restart before continuing.
-                    if process_completion.started() && !process_completion.wait().await {
-                        poison_recording(
-                            &state,
-                            "a native process could not be conclusively reaped after an outer-worker abort",
-                        )
-                        .await;
-                        eprintln!(
-                            "[process-lifecycle] process reap unresolved after outer-worker abort — child state not proven Reaped; audio subsystem poisoned, restart required"
-                        );
-                    }
+                    // RC-G1 fail-closed via the SHARED policy: a conclusive
+                    // Reaped releases normally; a failed wait (ReapFailed)
+                    // atomically POISONS the audio subsystem so no later
+                    // operation can reuse the slot while a child state is
+                    // unresolved — the user must restart before continuing.
+                    let _ = resolve_process_completion(
+                        &state,
+                        &process_completion,
+                        "outer-worker abort",
+                    )
+                    .await;
                 }
                 // 6. Only now is the shared audio slot released. The poison,
                 // if any, is sticky and survives this clear (RC-G1).
@@ -416,31 +478,6 @@ async fn run_audio_test(
     })
 }
 
-#[tauri::command]
-async fn generate_tts(
-    text: String,
-    request_id: uuid::Uuid,
-    paths: State<'_, PathsState>,
-) -> Result<String, String> {
-    validate_tts_text(&text)?;
-
-    let output_path = paths.paths.tts_output_path(request_id);
-    if let Some(parent) = output_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    // The inner generate_tts function owns process-level timeout enforcement
-    // (kill, wait/reap, cleanup). This outer timeout is only defense-in-depth.
-    let tts_timeout = std::time::Duration::from_secs(30);
-    tokio::time::timeout(
-        tts_timeout,
-        audio::playback::generate_tts_with_paths(&text, output_path.clone(), &paths.paths),
-    )
-    .await
-    .map_err(|_| "TTS generation timed out".to_string())?
-    .map_err(|e| e.to_string())?;
-    Ok(output_path.to_string_lossy().to_string())
-}
-
 // --- Phase 2 Commands ---
 
 #[tauri::command]
@@ -515,22 +552,6 @@ const EXPECTED_ROUNDS: i32 = 5;
 
 /// Maximum accepted question length at the Rust boundary.
 const MAX_QUESTION_LEN: usize = 10_000;
-
-/// Maximum accepted standalone-TTS text length at the Rust boundary.
-const MAX_TTS_LEN: usize = 10_000;
-
-/// Validate standalone TTS text at the command boundary (P3). The limit is
-/// CHARACTERS, matching the error message — `chars().count()` keeps the
-/// contract truthful for multibyte text.
-fn validate_tts_text(text: &str) -> Result<(), String> {
-    if text.trim().is_empty() {
-        return Err("Text cannot be empty".to_string());
-    }
-    if text.chars().count() > MAX_TTS_LEN {
-        return Err(format!("Text too long (max {} characters)", MAX_TTS_LEN));
-    }
-    Ok(())
-}
 
 /// Validate question text at the Rust boundary (P2-1). Runs BEFORE any DB
 /// preflight, recording-slot acquisition, or hardware work: a blank or
@@ -792,126 +813,187 @@ async fn run_interview_round(
             None => Err("Interview worker handle lost".to_string()),
         };
 
+        // RC-G1A: resolve the native child lifecycle BEFORE any transition
+        // that makes the subsystem reusable. A ReapFailed outcome atomically
+        // poisons the shared subsystem (sticky) and the round must NOT claim
+        // successful completion.
+        let lifecycle_error = resolve_process_completion(
+            &state,
+            &recording_guard.process_completion(),
+            "round completion",
+        )
+        .await
+        .err();
+
         // RecordingState is held until persistence FULLY finishes (P1-1):
         // a concurrent request for the same logical round cannot acquire
         // the slot and start TTS/audio work while this request is between
         // worker completion and DB COMMIT.
-        let round_result = match result {
-            Ok((metadata, transcription, mut evidence)) => {
-                // Persist round atomically: round INSERT + session
-                // total_rounds increment + completed_at (when final) commit
-                // in ONE transaction. The WAV stays provisional (evidence
-                // armed) until this COMMIT succeeds.
-                let persist_outcome = {
-                    let guard = db_state.db.lock().await;
-                    let db = guard
-                        .as_ref()
-                        .ok_or_else(|| "Database not initialized".to_string())?;
-                    db.insert_round_with_session_update(
+        let round_result = if let Some(lifecycle_error) = lifecycle_error {
+            // RC-G1A: the native child lifecycle is unresolved (ReapFailed) —
+            // the subsystem is already poisoned (sticky). Never emit
+            // "complete" for an unresolved lifecycle; preserve evidence per
+            // existing rules and surface the restart-required condition.
+            match result {
+                Ok((metadata, _, mut evidence)) => {
+                    // The worker itself completed, but the round must not
+                    // claim success while a child lifecycle is unresolved.
+                    // Preserve the captured evidence (never destroy it — it
+                    // is real captured audio) and journal it for startup
+                    // reconciliation, exactly like the ambiguous-COMMIT path.
+                    evidence.preserve();
+                    let note = record_reconciliation_needed(
+                        &paths.paths,
                         &session_id_str,
                         round_index,
-                        &question,
-                        &transcription,
                         &metadata.file_path,
                         &metadata.sha256,
-                        metadata.duration_ms,
-                        metadata.sample_rate,
-                        metadata.channels,
-                        metadata.file_size_bytes,
-                        is_final,
-                    )
-                };
-
-                match persist_outcome {
-                    db::PersistenceOutcome::Committed(_) => {
-                        // Durable: disarm the evidence guard (WAV retained)
-                        // and only NOW emit "complete" — it means the round
-                        // is durably persisted.
-                        evidence.commit();
-                        let _ = app.emit(
-                            "interview-phase",
-                            PhaseEventPayload {
-                                phase: "complete".to_string(),
-                                question: None,
-                                duration_ms: None,
-                            },
-                        );
-                        Ok(InterviewRoundResult {
-                            metadata,
-                            transcription,
-                        })
-                    }
-                    db::PersistenceOutcome::NotCommitted { source } => {
-                        // Persistence is CONCLUSIVELY absent — the round was
-                        // never committed. Remove the provisional evidence
-                        // with explicit controlled cleanup (RC-1C): the
-                        // result is observable and failures are surfaced,
-                        // never silently converted to success.
-                        let cleanup_result = evidence.cleanup();
-                        let message = match cleanup_result {
-                            Ok(()) => source,
-                            Err(cleanup_err) => {
-                                format!("{} — {}", source, cleanup_err)
-                            }
-                        };
-                        // "complete" is NEVER emitted for an unpersisted
-                        // round.
-                        let _ = app.emit(
-                            "interview-phase",
-                            PhaseEventPayload {
-                                phase: "error".to_string(),
-                                question: Some(message.clone()),
-                                duration_ms: None,
-                            },
-                        );
-                        Err(message)
-                    }
-                    db::PersistenceOutcome::Unknown { source } => {
-                        // AMBIGUOUS commit state (RC-4): the WAV is NEVER
-                        // deleted based on an unverified assumption. The
-                        // evidence is preserved in place, the
-                        // reconciliation-needed state is durably recorded,
-                        // and an explicit persistence-uncertain error is
-                        // surfaced. Startup reconciliation reconciles the
-                        // evidence against the DB (matching row -> retain;
-                        // unmatched -> quarantine, never delete).
-                        evidence.preserve();
-                        let note = record_reconciliation_needed(
-                            &paths.paths,
-                            &session_id_str,
-                            round_index,
-                            &metadata.file_path,
-                            &metadata.sha256,
-                            &source,
-                        );
-                        let message =
-                            format!("Round persistence is uncertain: {}. {}", source, note);
-                        let _ = app.emit(
-                            "interview-phase",
-                            PhaseEventPayload {
-                                phase: "error".to_string(),
-                                question: Some(message.clone()),
-                                duration_ms: None,
-                            },
-                        );
-                        Err(message)
-                    }
+                        "round completed with unresolved native process lifecycle",
+                    );
+                    let message = format!("{lifecycle_error} — {note}");
+                    let _ = app.emit(
+                        "interview-phase",
+                        PhaseEventPayload {
+                            phase: "error".to_string(),
+                            question: Some(message.clone()),
+                            duration_ms: None,
+                        },
+                    );
+                    Err(message)
+                }
+                Err(e) => {
+                    // Preserve the original cause and append the stronger
+                    // restart-required lifecycle condition.
+                    let message = format!("{e}. {lifecycle_error}");
+                    let _ = app.emit(
+                        "interview-phase",
+                        PhaseEventPayload {
+                            phase: "error".to_string(),
+                            question: Some(message.clone()),
+                            duration_ms: None,
+                        },
+                    );
+                    Err(message)
                 }
             }
-            Err(e) => {
-                // P2-3: every round termination must produce ONE terminal
-                // backend event. The worker failed (TTS, recording,
-                // checksum, transcription) — emit error before returning.
-                // The relay was drained above, so this is the last word.
-                let _ = app.emit(
-                    "interview-phase",
-                    PhaseEventPayload {
-                        phase: "error".to_string(),
-                        question: Some(e.clone()),
-                        duration_ms: None,
-                    },
-                );
-                Err(e)
+        } else {
+            match result {
+                Ok((metadata, transcription, mut evidence)) => {
+                    // Persist round atomically: round INSERT + session
+                    // total_rounds increment + completed_at (when final) commit
+                    // in ONE transaction. The WAV stays provisional (evidence
+                    // armed) until this COMMIT succeeds.
+                    let persist_outcome = {
+                        let guard = db_state.db.lock().await;
+                        let db = guard
+                            .as_ref()
+                            .ok_or_else(|| "Database not initialized".to_string())?;
+                        db.insert_round_with_session_update(
+                            &session_id_str,
+                            round_index,
+                            &question,
+                            &transcription,
+                            &metadata.file_path,
+                            &metadata.sha256,
+                            metadata.duration_ms,
+                            metadata.sample_rate,
+                            metadata.channels,
+                            metadata.file_size_bytes,
+                            is_final,
+                        )
+                    };
+
+                    match persist_outcome {
+                        db::PersistenceOutcome::Committed(_) => {
+                            // Durable: disarm the evidence guard (WAV retained)
+                            // and only NOW emit "complete" — it means the round
+                            // is durably persisted.
+                            evidence.commit();
+                            let _ = app.emit(
+                                "interview-phase",
+                                PhaseEventPayload {
+                                    phase: "complete".to_string(),
+                                    question: None,
+                                    duration_ms: None,
+                                },
+                            );
+                            Ok(InterviewRoundResult {
+                                metadata,
+                                transcription,
+                            })
+                        }
+                        db::PersistenceOutcome::NotCommitted { source } => {
+                            // Persistence is CONCLUSIVELY absent — the round was
+                            // never committed. Remove the provisional evidence
+                            // with explicit controlled cleanup (RC-1C): the
+                            // result is observable and failures are surfaced,
+                            // never silently converted to success.
+                            let cleanup_result = evidence.cleanup();
+                            let message = match cleanup_result {
+                                Ok(()) => source,
+                                Err(cleanup_err) => {
+                                    format!("{} — {}", source, cleanup_err)
+                                }
+                            };
+                            // "complete" is NEVER emitted for an unpersisted
+                            // round.
+                            let _ = app.emit(
+                                "interview-phase",
+                                PhaseEventPayload {
+                                    phase: "error".to_string(),
+                                    question: Some(message.clone()),
+                                    duration_ms: None,
+                                },
+                            );
+                            Err(message)
+                        }
+                        db::PersistenceOutcome::Unknown { source } => {
+                            // AMBIGUOUS commit state (RC-4): the WAV is NEVER
+                            // deleted based on an unverified assumption. The
+                            // evidence is preserved in place, the
+                            // reconciliation-needed state is durably recorded,
+                            // and an explicit persistence-uncertain error is
+                            // surfaced. Startup reconciliation reconciles the
+                            // evidence against the DB (matching row -> retain;
+                            // unmatched -> quarantine, never delete).
+                            evidence.preserve();
+                            let note = record_reconciliation_needed(
+                                &paths.paths,
+                                &session_id_str,
+                                round_index,
+                                &metadata.file_path,
+                                &metadata.sha256,
+                                &source,
+                            );
+                            let message =
+                                format!("Round persistence is uncertain: {}. {}", source, note);
+                            let _ = app.emit(
+                                "interview-phase",
+                                PhaseEventPayload {
+                                    phase: "error".to_string(),
+                                    question: Some(message.clone()),
+                                    duration_ms: None,
+                                },
+                            );
+                            Err(message)
+                        }
+                    }
+                }
+                Err(e) => {
+                    // P2-3: every round termination must produce ONE terminal
+                    // backend event. The worker failed (TTS, recording,
+                    // checksum, transcription) — emit error before returning.
+                    // The relay was drained above, so this is the last word.
+                    let _ = app.emit(
+                        "interview-phase",
+                        PhaseEventPayload {
+                            phase: "error".to_string(),
+                            question: Some(e.clone()),
+                            duration_ms: None,
+                        },
+                    );
+                    Err(e)
+                }
             }
         };
 
@@ -1090,32 +1172,54 @@ async fn run_interview_round(
     }
 }
 
-/// RC-G1: resolve a native child's lifecycle at round timeout. A conclusive
-/// Reaped is normal; a failed wait (ReapFailed) POISONS the audio/process
-/// subsystem so no later round or audio operation can reuse the slot — the
-/// user must restart before continuing. Returns whether the lifecycle is
-/// unresolved (subsystem poisoned). Bounded: a terminal ReapFailed resolves
-/// immediately, so this never waits forever on an unreapable process.
+/// RC-G1 SHARED process-finalization policy — the ONE policy used at every
+/// operation-release boundary (normal worker completion, round timeout,
+/// RecordingGuard Drop/cancellation cleanup).
+///
+/// - `NotStarted` -> `Ok` (no native process ever existed).
+/// - `Reaped` -> `Ok` (conclusive wait; release normally).
+/// - `ReapFailed` -> atomically poison the shared subsystem under the same
+///   lock acquisition uses, and return the canonical restart-required
+///   lifecycle error. Bounded: a terminal `ReapFailed` resolves immediately,
+///   so this never waits forever on an unreapable process.
+///
+/// The poison is set BEFORE the caller performs any reusable release, so no
+/// future native audio/process operation can begin after a ReapFailed.
+async fn resolve_process_completion(
+    state: &RecordingState,
+    completion: &audio::pipe::ProcessCompletion,
+    context: &str,
+) -> Result<(), String> {
+    if !completion.started() {
+        return Ok(());
+    }
+    if completion.wait().await {
+        Ok(())
+    } else {
+        poison_recording(
+            state,
+            &format!("{context}: a native process could not be conclusively reaped"),
+        )
+        .await;
+        eprintln!(
+            "[process-lifecycle] {context}: process reap unresolved — child state not proven Reaped; audio subsystem poisoned, restart required"
+        );
+        Err(format!(
+            "{POISONED_ACQUIRE_ERROR} ({context}: a native process could not be conclusively terminated)"
+        ))
+    }
+}
+
+/// RC-G1 round-timeout wrapper: returns whether the lifecycle is unresolved
+/// (subsystem poisoned) so the timeout path can append the restart-required
+/// condition to its terminal message. Delegates to the shared policy.
 async fn resolve_process_lifecycle_at_timeout(
     state: &RecordingState,
     process_completion: &audio::pipe::ProcessCompletion,
 ) -> bool {
-    if !process_completion.started() {
-        return false;
-    }
-    if process_completion.wait().await {
-        false
-    } else {
-        poison_recording(
-            state,
-            "a native process could not be conclusively reaped at round timeout",
-        )
-        .await;
-        eprintln!(
-            "[process-lifecycle] process reap unresolved at round timeout — child state not proven Reaped; audio subsystem poisoned, restart required"
-        );
-        true
-    }
+    resolve_process_completion(state, process_completion, "round timeout")
+        .await
+        .is_err()
 }
 
 /// RC-7: truthful terminal timeout message, chosen from the ACTUAL cleanup
@@ -1656,13 +1760,25 @@ async fn retry_interview_round(
 
 #[tauri::command]
 async fn stop_interview_round(state: State<'_, Arc<RecordingState>>) -> Result<String, String> {
-    let guard = state.handle.lock().await;
+    let guard = state.slot.lock().await;
     match &*guard {
-        Some(handle) => {
+        AudioSlotState::Active(handle) => {
             handle.stop();
             Ok("Stop signal sent".to_string())
         }
-        None => Err("No active interview round".to_string()),
+        // A round that was active when the subsystem was poisoned still owns
+        // its stop handle (RC-G1B: poisoning never loses lifecycle
+        // ownership) — stopping it remains possible.
+        AudioSlotState::Poisoned {
+            active: Some(handle),
+            ..
+        } => {
+            handle.stop();
+            Ok("Stop signal sent".to_string())
+        }
+        AudioSlotState::Free | AudioSlotState::Poisoned { active: None, .. } => {
+            Err("No active interview round".to_string())
+        }
     }
 }
 
@@ -1756,8 +1872,7 @@ pub fn run() {
             // 4. Manage all states
             app.manage(paths);
             app.manage(Arc::new(RecordingState {
-                handle: Mutex::new(None),
-                poisoned: Mutex::new(None),
+                slot: Mutex::new(AudioSlotState::Free),
             }));
             app.manage(Arc::new(DbState {
                 db: Mutex::new(Some(database)),
@@ -1768,7 +1883,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_app_config,
             run_audio_test,
-            generate_tts,
             check_audio_devices,
             run_interview_round,
             retry_interview_round,
@@ -1806,7 +1920,7 @@ mod tests {
     /// clear, so once the slot is empty the poison decision is final.
     async fn wait_for_slot_clear(state: &Arc<RecordingState>) {
         for _ in 0..200 {
-            if state.handle.lock().await.is_none() {
+            if state.slot_is_released().await {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1820,8 +1934,7 @@ mod tests {
     #[tokio::test]
     async fn recording_worker_deadline_returns_while_guard_retains_ownership() {
         let state = Arc::new(RecordingState {
-            handle: Mutex::new(None),
-            poisoned: Mutex::new(None),
+            slot: Mutex::new(AudioSlotState::Free),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1866,14 +1979,14 @@ mod tests {
         assert!(stop.load(Ordering::SeqCst));
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         assert!(
-            state.handle.lock().await.is_some(),
+            state.is_active().await,
             "slot must remain owned while the physical worker is blocked"
         );
 
         release.store(true, Ordering::SeqCst);
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if state.handle.lock().await.is_none() {
+                if state.slot_is_released().await {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -1900,8 +2013,7 @@ mod tests {
         let tmp_path = final_path.with_extension("wav.tmp");
 
         let state = Arc::new(RecordingState {
-            handle: Mutex::new(None),
-            poisoned: Mutex::new(None),
+            slot: Mutex::new(AudioSlotState::Free),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         acquire_recording(&state, fake_handle()).await.unwrap();
@@ -1950,7 +2062,7 @@ mod tests {
         let start = std::time::Instant::now();
         while start.elapsed() < std::time::Duration::from_millis(80) {
             assert!(
-                state.handle.lock().await.is_some(),
+                state.is_active().await,
                 "slot must stay occupied while the physical capture is alive"
             );
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -1961,7 +2073,7 @@ mod tests {
         release.store(true, Ordering::SeqCst);
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if state.handle.lock().await.is_none() {
+                if state.slot_is_released().await {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -1981,7 +2093,7 @@ mod tests {
 
         // Retry can start cleanly.
         acquire_recording(&state, fake_handle()).await.unwrap();
-        assert!(state.handle.lock().await.is_some());
+        assert!(state.is_active().await);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2032,8 +2144,7 @@ mod tests {
     #[tokio::test]
     async fn recording_slot_reusable_after_explicit_clear_and_disarm() {
         let state = Arc::new(RecordingState {
-            handle: Mutex::new(None),
-            poisoned: Mutex::new(None),
+            slot: Mutex::new(AudioSlotState::Free),
         });
         let handle = fake_handle();
 
@@ -2046,10 +2157,10 @@ mod tests {
         guard.disarm();
         drop(guard);
 
-        assert!(state.handle.lock().await.is_none());
+        assert!(state.slot_is_released().await);
         // Second round can acquire the slot without waiting.
         acquire_recording(&state, handle).await.unwrap();
-        assert!(state.handle.lock().await.is_some());
+        assert!(state.is_active().await);
     }
 
     // ------------------------------------------------------------------
@@ -2064,8 +2175,7 @@ mod tests {
     #[tokio::test]
     async fn reap_failed_poisons_subsystem_and_blocks_second_acquire() {
         let state = Arc::new(RecordingState {
-            handle: Mutex::new(None),
-            poisoned: Mutex::new(None),
+            slot: Mutex::new(AudioSlotState::Free),
         });
         acquire_recording(&state, fake_handle()).await.unwrap();
 
@@ -2084,7 +2194,7 @@ mod tests {
         wait_for_slot_clear(&state).await;
 
         assert!(
-            state.poisoned.lock().await.is_some(),
+            state.poison_reason().await.is_some(),
             "ReapFailed must poison the subsystem"
         );
         let err = acquire_recording(&state, fake_handle()).await.unwrap_err();
@@ -2099,8 +2209,7 @@ mod tests {
     #[tokio::test]
     async fn reaped_releases_slot_normally_and_second_acquire_succeeds() {
         let state = Arc::new(RecordingState {
-            handle: Mutex::new(None),
-            poisoned: Mutex::new(None),
+            slot: Mutex::new(AudioSlotState::Free),
         });
         acquire_recording(&state, fake_handle()).await.unwrap();
 
@@ -2115,11 +2224,11 @@ mod tests {
         wait_for_slot_clear(&state).await;
 
         assert!(
-            state.poisoned.lock().await.is_none(),
+            state.poison_reason().await.is_none(),
             "a conclusive Reaped must never poison the subsystem"
         );
         acquire_recording(&state, fake_handle()).await.unwrap();
-        assert!(state.handle.lock().await.is_some());
+        assert!(state.is_active().await);
     }
 
     /// Test C: the ordinary clear path cannot erase a poisoned state — the
@@ -2127,15 +2236,14 @@ mod tests {
     #[tokio::test]
     async fn poison_survives_ordinary_clear() {
         let state = Arc::new(RecordingState {
-            handle: Mutex::new(None),
-            poisoned: Mutex::new(None),
+            slot: Mutex::new(AudioSlotState::Free),
         });
         poison_recording(&state, "simulated reap failure").await;
 
         // Ordinary release path must NOT erase the poison.
         clear_active_recording(&state).await;
         assert!(
-            state.poisoned.lock().await.is_some(),
+            state.poison_reason().await.is_some(),
             "clear must never erase a poisoned state"
         );
         let err = acquire_recording(&state, fake_handle()).await.unwrap_err();
@@ -2152,8 +2260,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_reap_failed_poisons_and_blocks_future_acquisition() {
         let state = Arc::new(RecordingState {
-            handle: Mutex::new(None),
-            poisoned: Mutex::new(None),
+            slot: Mutex::new(AudioSlotState::Free),
         });
         let completion = audio::pipe::ProcessCompletion::default();
         completion.mark_running();
@@ -2164,7 +2271,7 @@ mod tests {
             unresolved,
             "ReapFailed at round timeout must be surfaced as an unresolved lifecycle"
         );
-        assert!(state.poisoned.lock().await.is_some());
+        assert!(state.poison_reason().await.is_some());
         let err = acquire_recording(&state, fake_handle()).await.unwrap_err();
         assert!(
             err.contains("Restart the application"),
@@ -2177,8 +2284,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_reaped_does_not_poison() {
         let state = Arc::new(RecordingState {
-            handle: Mutex::new(None),
-            poisoned: Mutex::new(None),
+            slot: Mutex::new(AudioSlotState::Free),
         });
         let completion = audio::pipe::ProcessCompletion::default();
         completion.mark_running();
@@ -2186,8 +2292,237 @@ mod tests {
 
         let unresolved = resolve_process_lifecycle_at_timeout(&state, &completion).await;
         assert!(!unresolved);
-        assert!(state.poisoned.lock().await.is_none());
+        assert!(state.poison_reason().await.is_none());
         acquire_recording(&state, fake_handle()).await.unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // RC-G1A: NORMAL (non-timeout) worker completion must resolve the native
+    // child lifecycle before any reusable release — same shared policy as
+    // timeout and Drop, exercised through the guard mechanics the real
+    // normal-completion path uses (take_result -> resolve -> clear -> disarm).
+    // ------------------------------------------------------------------
+
+    /// G1A-1: a worker that finishes before the deadline with a ReapFailed
+    /// lifecycle poisons the subsystem; the safe release runs; a second
+    /// acquire is REJECTED with the restart-required error.
+    #[tokio::test]
+    async fn normal_completion_reap_failed_poisons_and_blocks_second_acquire() {
+        let state = Arc::new(RecordingState {
+            slot: Mutex::new(AudioSlotState::Free),
+        });
+        acquire_recording(&state, fake_handle()).await.unwrap();
+        let mut guard = new_guard(&state).0;
+        let completion = guard.process_completion();
+        completion.mark_running();
+        completion.signal_reap_failed();
+        // The worker completed before the deadline (trivial, already done).
+        guard.attach_worker(tokio::spawn(async {}));
+
+        // Normal-completion release order: take result -> resolve lifecycle
+        // -> (persistence) -> clear -> disarm.
+        let _ = guard.take_result().await;
+        let err = resolve_process_completion(&state, &completion, "round completion")
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("Restart the application"),
+            "restart-required error must be surfaced, got: {err}"
+        );
+        clear_active_recording(&state).await;
+        guard.disarm();
+
+        assert!(state.poison_reason().await.is_some());
+        assert!(state.slot_is_released().await);
+        let second = acquire_recording(&state, fake_handle()).await.unwrap_err();
+        assert!(
+            second.contains("Restart the application"),
+            "second acquire after normal-completion ReapFailed must be rejected, got: {second}"
+        );
+    }
+
+    /// G1A-2: a conclusive Reaped on normal completion releases normally —
+    /// no poison, second acquire succeeds.
+    #[tokio::test]
+    async fn normal_completion_reaped_releases_normally() {
+        let state = Arc::new(RecordingState {
+            slot: Mutex::new(AudioSlotState::Free),
+        });
+        acquire_recording(&state, fake_handle()).await.unwrap();
+        let mut guard = new_guard(&state).0;
+        let completion = guard.process_completion();
+        completion.mark_running();
+        completion.signal_reaped();
+        guard.attach_worker(tokio::spawn(async {}));
+
+        let _ = guard.take_result().await;
+        resolve_process_completion(&state, &completion, "round completion")
+            .await
+            .unwrap();
+        clear_active_recording(&state).await;
+        guard.disarm();
+
+        assert!(state.poison_reason().await.is_none());
+        assert!(state.slot_is_free().await);
+        acquire_recording(&state, fake_handle()).await.unwrap();
+    }
+
+    /// G1A-3: a worker that returns an ordinary error while the lifecycle is
+    /// ReapFailed — the original cause is preserved and the stronger
+    /// restart-required condition is appended; the subsystem is poisoned.
+    #[tokio::test]
+    async fn normal_worker_error_with_reap_failed_preserves_cause_and_poisons() {
+        let state = Arc::new(RecordingState {
+            slot: Mutex::new(AudioSlotState::Free),
+        });
+        acquire_recording(&state, fake_handle()).await.unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut guard = RecordingGuard::<Result<(), String>>::new(state.clone(), stop);
+        let completion = guard.process_completion();
+        completion.mark_running();
+        completion.signal_reap_failed();
+        let worker = tokio::spawn(async {
+            Err::<(), String>("Piper wait error: child exited abnormally".to_string())
+        });
+        guard.attach_worker(worker);
+
+        let join_result = guard.take_result().await;
+        let result = match join_result {
+            Some(Ok(inner)) => inner.map_err(|e| e.to_string()),
+            Some(Err(join_err)) => Err(format!("Interview worker failed: {}", join_err)),
+            None => Err("Interview worker handle lost".to_string()),
+        };
+        let lifecycle_error = resolve_process_completion(&state, &completion, "round completion")
+            .await
+            .unwrap_err();
+
+        // Normal-completion error branch composition: original cause +
+        // restart-required lifecycle condition.
+        let original = result.unwrap_err();
+        let message = format!("{original}. {lifecycle_error}");
+        assert!(
+            message.contains("Piper wait error"),
+            "original cause must be preserved: {message}"
+        );
+        assert!(
+            message.contains("Restart the application"),
+            "restart-required condition must be surfaced: {message}"
+        );
+        assert!(state.poison_reason().await.is_some());
+        clear_active_recording(&state).await;
+        guard.disarm();
+        assert!(acquire_recording(&state, fake_handle()).await.is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // RC-G1B: poison check + slot acquisition are ONE atomic transition under
+    // one mutex — deterministic concurrency regressions, no timing-only
+    // sleeps.
+    // ------------------------------------------------------------------
+
+    /// G1B-1/G1B-2: a deterministic barrier forces a concurrent acquire and
+    /// poison. In EVERY interleaving the final state is Poisoned: either the
+    /// acquire was rejected, or it was admitted BEFORE the poison transition
+    /// and its handle is retained INSIDE the Poisoned state — never an
+    /// admitted operation outside the poison boundary.
+    #[tokio::test]
+    async fn poison_and_acquire_race_never_admits_operation_after_poison() {
+        let state = Arc::new(RecordingState {
+            slot: Mutex::new(AudioSlotState::Free),
+        });
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+        let a_state = state.clone();
+        let a_bar = barrier.clone();
+        let a = tokio::spawn(async move {
+            a_bar.wait().await;
+            acquire_recording(&a_state, fake_handle()).await
+        });
+        let b_state = state.clone();
+        let b_bar = barrier.clone();
+        let b = tokio::spawn(async move {
+            b_bar.wait().await;
+            poison_recording(&b_state, "simulated reap failure").await;
+        });
+
+        barrier.wait().await;
+        let a_result = a.await.unwrap();
+        b.await.unwrap();
+
+        assert!(
+            state.poison_reason().await.is_some(),
+            "poison must win the race in every interleaving"
+        );
+        match a_result {
+            Ok(()) => {
+                // Admitted before the poison transition — the handle must be
+                // retained inside Poisoned, not left as an un-poisoned Active.
+                let slot = &*state.slot.lock().await;
+                assert!(
+                    matches!(
+                        slot,
+                        AudioSlotState::Poisoned {
+                            active: Some(_),
+                            ..
+                        }
+                    ),
+                    "admitted handle must be retained inside Poisoned"
+                );
+            }
+            Err(e) => {
+                assert!(e.contains("Restart the application"), "got: {e}");
+                assert!(state.slot_is_released().await);
+            }
+        }
+        // A NEW acquisition after the race is impossible.
+        assert!(acquire_recording(&state, fake_handle()).await.is_err());
+    }
+
+    /// G1B-1 deterministic "poison wins" ordering: an acquire that is already
+    /// parked on the slot mutex while the poison transition completes under
+    /// that SAME held critical section must be rejected — the historical
+    /// check-then-act TOCTOU has no window in the single-lock design. The
+    /// test applies the poison transition directly under the held lock
+    /// (mirroring `poison_recording`'s transition) because the lock is held
+    /// by the test itself.
+    #[tokio::test]
+    async fn acquire_parked_before_poison_cannot_cross_poison_boundary() {
+        let state = Arc::new(RecordingState {
+            slot: Mutex::new(AudioSlotState::Free),
+        });
+        // Hold the slot lock so the acquire parks on the mutex.
+        let mut held = state.slot.lock().await;
+
+        let a_state = state.clone();
+        let a = tokio::spawn(async move { acquire_recording(&a_state, fake_handle()).await });
+        // Let the acquire start and park on the mutex (it cannot proceed —
+        // the lock is held).
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // The poison transition happens under the SAME critical section the
+        // parked acquire is blocked on.
+        match &mut *held {
+            AudioSlotState::Free => {
+                *held = AudioSlotState::Poisoned {
+                    active: None,
+                    reason: "simulated reap failure".to_string(),
+                }
+            }
+            _ => unreachable!("slot started Free"),
+        }
+        drop(held);
+
+        // When the acquire finally obtains the lock it sees Poisoned and is
+        // rejected — it cannot install an operation across the poison
+        // boundary.
+        let err = a.await.unwrap().unwrap_err();
+        assert!(
+            err.contains("Restart the application"),
+            "parked acquire must be rejected after the poison transition, got: {err}"
+        );
+        assert!(state.poison_reason().await.is_some());
+        assert!(state.slot_is_released().await);
     }
 
     /// Safety net: a guard dropped while still armed (panic/cancellation path)
@@ -2195,8 +2530,7 @@ mod tests {
     #[tokio::test]
     async fn recording_slot_cleared_by_guard_safety_net_on_drop() {
         let state = Arc::new(RecordingState {
-            handle: Mutex::new(None),
-            poisoned: Mutex::new(None),
+            slot: Mutex::new(AudioSlotState::Free),
         });
         let handle = fake_handle();
         acquire_recording(&state, handle.clone()).await.unwrap();
@@ -2207,7 +2541,7 @@ mod tests {
         }
         // Let the spawned safety-net clear task run.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert!(state.handle.lock().await.is_none());
+        assert!(state.slot_is_released().await);
     }
 
     /// P2-1: a guard dropped while armed with a live worker sets the stop
@@ -2217,8 +2551,7 @@ mod tests {
     #[tokio::test]
     async fn recording_guard_drop_with_live_worker_terminates_before_clearing() {
         let state = Arc::new(RecordingState {
-            handle: Mutex::new(None),
-            poisoned: Mutex::new(None),
+            slot: Mutex::new(AudioSlotState::Free),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         acquire_recording(&state, fake_handle()).await.unwrap();
@@ -2248,7 +2581,7 @@ mod tests {
             "drop must set the stop flag so the worker terminates"
         );
         assert!(
-            state.handle.lock().await.is_none(),
+            state.slot_is_released().await,
             "slot must be cleared only after the worker terminated"
         );
     }
@@ -2263,8 +2596,7 @@ mod tests {
     #[tokio::test]
     async fn recording_guard_drop_waits_for_nested_blocking_worker() {
         let state = Arc::new(RecordingState {
-            handle: Mutex::new(None),
-            poisoned: Mutex::new(None),
+            slot: Mutex::new(AudioSlotState::Free),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2318,7 +2650,7 @@ mod tests {
         // acquire must fail.
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         assert!(
-            state.handle.lock().await.is_some(),
+            state.is_active().await,
             "slot must stay occupied while the nested blocking worker is alive"
         );
         let second = acquire_recording(&state, fake_handle()).await;
@@ -2332,7 +2664,7 @@ mod tests {
         release.store(true, Ordering::SeqCst);
         let mut cleared = false;
         for _ in 0..200 {
-            if state.handle.lock().await.is_none() {
+            if state.slot_is_released().await {
                 cleared = true;
                 break;
             }
@@ -2345,7 +2677,7 @@ mod tests {
 
         // 5. Slot is reusable.
         acquire_recording(&state, fake_handle()).await.unwrap();
-        assert!(state.handle.lock().await.is_some());
+        assert!(state.is_active().await);
     }
 
     /// P1-1 force-abort regression: a nested blocking capture that survives
@@ -2357,8 +2689,7 @@ mod tests {
     #[tokio::test]
     async fn recording_guard_drop_force_abort_does_not_free_slot_early() {
         let state = Arc::new(RecordingState {
-            handle: Mutex::new(None),
-            poisoned: Mutex::new(None),
+            slot: Mutex::new(AudioSlotState::Free),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2413,7 +2744,7 @@ mod tests {
         // second acquire must fail.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         assert!(
-            state.handle.lock().await.is_some(),
+            state.is_active().await,
             "slot must stay occupied past the grace/abort while the blocking worker is alive"
         );
         let second = acquire_recording(&state, fake_handle()).await;
@@ -2427,7 +2758,7 @@ mod tests {
         release.store(true, Ordering::SeqCst);
         let mut cleared = false;
         for _ in 0..200 {
-            if state.handle.lock().await.is_none() {
+            if state.slot_is_released().await {
                 cleared = true;
                 break;
             }
@@ -2440,7 +2771,7 @@ mod tests {
 
         // Slot is reusable.
         acquire_recording(&state, fake_handle()).await.unwrap();
-        assert!(state.handle.lock().await.is_some());
+        assert!(state.is_active().await);
     }
 
     /// RC-2 regression: the capture lifecycle is explicitly tri-state
@@ -2455,8 +2786,7 @@ mod tests {
     #[tokio::test]
     async fn recording_guard_drop_scheduled_but_not_started_holds_slot() {
         let state = Arc::new(RecordingState {
-            handle: Mutex::new(None),
-            poisoned: Mutex::new(None),
+            slot: Mutex::new(AudioSlotState::Free),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // The blocking closure cannot BEGIN executing (and therefore cannot
@@ -2536,7 +2866,7 @@ mod tests {
             "closure must still be gated (never started) while the slot is held"
         );
         assert!(
-            state.handle.lock().await.is_some(),
+            state.is_active().await,
             "slot must stay occupied while a scheduled capture has not terminated"
         );
         let second = acquire_recording(&state, fake_handle()).await;
@@ -2550,7 +2880,7 @@ mod tests {
         gate.store(true, Ordering::SeqCst);
         let mut cleared = false;
         for _ in 0..300 {
-            if state.handle.lock().await.is_none() {
+            if state.slot_is_released().await {
                 cleared = true;
                 break;
             }
@@ -2564,7 +2894,7 @@ mod tests {
 
         // Reusable.
         acquire_recording(&state, fake_handle()).await.unwrap();
-        assert!(state.handle.lock().await.is_some());
+        assert!(state.is_active().await);
     }
 
     /// RC-3 regression: a timed-out round whose physical capture is still
@@ -2599,8 +2929,7 @@ mod tests {
         std::fs::write(&transcript_path, b"partial").unwrap();
 
         let state = Arc::new(RecordingState {
-            handle: Mutex::new(None),
-            poisoned: Mutex::new(None),
+            slot: Mutex::new(AudioSlotState::Free),
         });
         acquire_recording(&state, fake_handle()).await.unwrap();
 
@@ -2629,7 +2958,7 @@ mod tests {
             "transcript temp must survive until capture termination"
         );
         assert!(
-            state.handle.lock().await.is_some(),
+            state.is_active().await,
             "slot must stay occupied until capture termination"
         );
         let second = acquire_recording(&state, fake_handle()).await;
@@ -2657,13 +2986,13 @@ mod tests {
             "transcript temp must be removed after capture termination"
         );
         assert!(
-            state.handle.lock().await.is_none(),
+            state.slot_is_released().await,
             "slot must be released only after cleanup"
         );
 
         // Reusable.
         acquire_recording(&state, fake_handle()).await.unwrap();
-        assert!(state.handle.lock().await.is_some());
+        assert!(state.is_active().await);
     }
 
     /// RC-2: round-artifact ownership is derived from the capture lifecycle,
@@ -2791,8 +3120,7 @@ mod tests {
     #[tokio::test]
     async fn recording_guard_drop_awaits_outer_worker_after_physical_completion() {
         let state = Arc::new(RecordingState {
-            handle: Mutex::new(None),
-            poisoned: Mutex::new(None),
+            slot: Mutex::new(AudioSlotState::Free),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2862,7 +3190,7 @@ mod tests {
         // occupied (physical completion alone must not free it).
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
-            state.handle.lock().await.is_some(),
+            state.is_active().await,
             "slot must stay occupied until the outer worker is resolved"
         );
 
@@ -2872,7 +3200,7 @@ mod tests {
             .expect("outer worker must resolve");
         let mut cleared = false;
         for _ in 0..200 {
-            if state.handle.lock().await.is_none() {
+            if state.slot_is_released().await {
                 cleared = true;
                 break;
             }
@@ -2882,7 +3210,7 @@ mod tests {
 
         // Reusable.
         acquire_recording(&state, fake_handle()).await.unwrap();
-        assert!(state.handle.lock().await.is_some());
+        assert!(state.is_active().await);
     }
 
     /// RC-2: the SPEAKER probe (output probe) lifecycle is tracked by its own
@@ -2894,8 +3222,7 @@ mod tests {
     #[tokio::test]
     async fn recording_guard_drop_waits_for_speaker_probe_output_completion() {
         let state = Arc::new(RecordingState {
-            handle: Mutex::new(None),
-            poisoned: Mutex::new(None),
+            slot: Mutex::new(AudioSlotState::Free),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // The probe cannot BEGIN executing (and therefore cannot signal
@@ -2962,7 +3289,7 @@ mod tests {
             "speaker probe must still be gated while the slot is held"
         );
         assert!(
-            state.handle.lock().await.is_some(),
+            state.is_active().await,
             "slot must stay occupied while the speaker probe is unresolved"
         );
         let second = acquire_recording(&state, fake_handle()).await;
@@ -2977,7 +3304,7 @@ mod tests {
         gate.store(true, Ordering::SeqCst);
         let mut cleared = false;
         for _ in 0..300 {
-            if state.handle.lock().await.is_none() {
+            if state.slot_is_released().await {
                 cleared = true;
                 break;
             }
@@ -2991,7 +3318,7 @@ mod tests {
 
         // Reusable.
         acquire_recording(&state, fake_handle()).await.unwrap();
-        assert!(state.handle.lock().await.is_some());
+        assert!(state.is_active().await);
     }
 
     /// RC-2A regression: the Drop safety net MUST re-read every physical
@@ -3005,8 +3332,7 @@ mod tests {
     #[tokio::test]
     async fn recording_guard_drop_rescans_completions_after_snapshot() {
         let state = Arc::new(RecordingState {
-            handle: Mutex::new(None),
-            poisoned: Mutex::new(None),
+            slot: Mutex::new(AudioSlotState::Free),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let input_release = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3102,7 +3428,7 @@ mod tests {
             "output probe must have been scheduled by now"
         );
         assert!(
-            state.handle.lock().await.is_some(),
+            state.is_active().await,
             "slot must stay occupied while the late-scheduled output probe is unresolved"
         );
         let second = acquire_recording(&state, fake_handle()).await;
@@ -3116,7 +3442,7 @@ mod tests {
         output_release.store(true, Ordering::SeqCst);
         let mut cleared = false;
         for _ in 0..300 {
-            if state.handle.lock().await.is_none() {
+            if state.slot_is_released().await {
                 cleared = true;
                 break;
             }
@@ -3136,8 +3462,7 @@ mod tests {
     #[tokio::test]
     async fn recording_guard_drop_waits_for_running_process() {
         let state = Arc::new(RecordingState {
-            handle: Mutex::new(None),
-            poisoned: Mutex::new(None),
+            slot: Mutex::new(AudioSlotState::Free),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         acquire_recording(&state, fake_handle()).await.unwrap();
@@ -3177,7 +3502,7 @@ mod tests {
         // fail.
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         assert!(
-            state.handle.lock().await.is_some(),
+            state.is_active().await,
             "slot must stay occupied while a child may be running"
         );
         let second = acquire_recording(&state, fake_handle()).await;
@@ -3192,7 +3517,7 @@ mod tests {
         process_for_test.signal_reaped();
         let mut cleared = false;
         for _ in 0..300 {
-            if state.handle.lock().await.is_none() {
+            if state.slot_is_released().await {
                 cleared = true;
                 break;
             }
@@ -3221,8 +3546,7 @@ mod tests {
     #[tokio::test]
     async fn recording_guard_drop_waits_for_production_tts_output_scheduled_but_not_started() {
         let state = Arc::new(RecordingState {
-            handle: Mutex::new(None),
-            poisoned: Mutex::new(None),
+            slot: Mutex::new(AudioSlotState::Free),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // The production output closure cannot BEGIN executing (and therefore
@@ -3296,7 +3620,7 @@ mod tests {
             "output closure must still be gated while the slot is held"
         );
         assert!(
-            state.handle.lock().await.is_some(),
+            state.is_active().await,
             "slot must stay occupied while production output is unresolved"
         );
         let second = acquire_recording(&state, fake_handle()).await;
@@ -3310,7 +3634,7 @@ mod tests {
         gate.store(true, Ordering::SeqCst);
         let mut cleared = false;
         for _ in 0..300 {
-            if state.handle.lock().await.is_none() {
+            if state.slot_is_released().await {
                 cleared = true;
                 break;
             }
@@ -3324,7 +3648,7 @@ mod tests {
 
         // Reusable.
         acquire_recording(&state, fake_handle()).await.unwrap();
-        assert!(state.handle.lock().await.is_some());
+        assert!(state.is_active().await);
     }
 
     /// RC-1 Test B — production output running during owner cancellation:
@@ -3336,8 +3660,7 @@ mod tests {
     #[tokio::test]
     async fn recording_guard_drop_holds_slot_until_production_tts_output_finishes() {
         let state = Arc::new(RecordingState {
-            handle: Mutex::new(None),
-            poisoned: Mutex::new(None),
+            slot: Mutex::new(AudioSlotState::Free),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // The output worker runs (began) but stays alive a controlled delay
@@ -3399,7 +3722,7 @@ mod tests {
         assert!(stop.load(Ordering::SeqCst), "drop must set the stop flag");
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         assert!(
-            state.handle.lock().await.is_some(),
+            state.is_active().await,
             "slot must stay occupied while production output is still running"
         );
         let second = acquire_recording(&state, fake_handle()).await;
@@ -3413,7 +3736,7 @@ mod tests {
         release.store(true, Ordering::SeqCst);
         let mut cleared = false;
         for _ in 0..300 {
-            if state.handle.lock().await.is_none() {
+            if state.slot_is_released().await {
                 cleared = true;
                 break;
             }
@@ -3427,7 +3750,7 @@ mod tests {
 
         // Reusable only now.
         acquire_recording(&state, fake_handle()).await.unwrap();
-        assert!(state.handle.lock().await.is_some());
+        assert!(state.is_active().await);
     }
 
     /// RC-1 Test C — production TTS exits normally: the output worker runs
@@ -3438,8 +3761,7 @@ mod tests {
     #[tokio::test]
     async fn production_tts_output_completion_normal_exit_no_slot_leak() {
         let state = Arc::new(RecordingState {
-            handle: Mutex::new(None),
-            poisoned: Mutex::new(None),
+            slot: Mutex::new(AudioSlotState::Free),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         acquire_recording(&state, fake_handle()).await.unwrap();
@@ -3479,21 +3801,20 @@ mod tests {
             "normal production TTS exit must reach Finished"
         );
         assert!(
-            state.handle.lock().await.is_none(),
+            state.slot_is_released().await,
             "slot must be free after the normal path — no leak"
         );
 
         // Reusable immediately.
         acquire_recording(&state, fake_handle()).await.unwrap();
-        assert!(state.handle.lock().await.is_some());
+        assert!(state.is_active().await);
     }
 
     /// P2-1: take_result captures the worker's JoinHandle result exactly once.
     #[tokio::test]
     async fn recording_guard_take_result_captures_once() {
         let state = Arc::new(RecordingState {
-            handle: Mutex::new(None),
-            poisoned: Mutex::new(None),
+            slot: Mutex::new(AudioSlotState::Free),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         acquire_recording(&state, fake_handle()).await.unwrap();
@@ -3517,8 +3838,7 @@ mod tests {
     #[tokio::test]
     async fn recording_guard_abort_then_await_resolves_worker() {
         let state = Arc::new(RecordingState {
-            handle: Mutex::new(None),
-            poisoned: Mutex::new(None),
+            slot: Mutex::new(AudioSlotState::Free),
         });
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         acquire_recording(&state, fake_handle()).await.unwrap();
@@ -3549,8 +3869,7 @@ mod tests {
     #[tokio::test]
     async fn acquire_rejects_while_slot_held() {
         let state = Arc::new(RecordingState {
-            handle: Mutex::new(None),
-            poisoned: Mutex::new(None),
+            slot: Mutex::new(AudioSlotState::Free),
         });
         let handle = fake_handle();
         acquire_recording(&state, handle.clone()).await.unwrap();
@@ -3568,8 +3887,7 @@ mod tests {
     #[tokio::test]
     async fn recording_slot_held_through_persistence_window() {
         let state = Arc::new(RecordingState {
-            handle: Mutex::new(None),
-            poisoned: Mutex::new(None),
+            slot: Mutex::new(AudioSlotState::Free),
         });
         let handle = fake_handle();
         acquire_recording(&state, handle.clone()).await.unwrap();
@@ -3594,7 +3912,7 @@ mod tests {
         drop(guard);
 
         acquire_recording(&state, fake_handle()).await.unwrap();
-        assert!(state.handle.lock().await.is_some());
+        assert!(state.is_active().await);
     }
 
     // ------------------------------------------------------------------
@@ -3856,6 +4174,21 @@ mod tests {
     }
 
     // --- Standalone TTS text validation (P3) ---
+    // The public standalone `generate_tts` command was removed (RC-G1C); the
+    // text validation it used survives here for the retained standalone TTS
+    // helpers' contract. The limit is CHARACTERS — `chars().count()` keeps
+    // the contract truthful for multibyte text.
+    const MAX_TTS_LEN: usize = 10_000;
+
+    fn validate_tts_text(text: &str) -> Result<(), String> {
+        if text.trim().is_empty() {
+            return Err("Text cannot be empty".to_string());
+        }
+        if text.chars().count() > MAX_TTS_LEN {
+            return Err(format!("Text too long (max {} characters)", MAX_TTS_LEN));
+        }
+        Ok(())
+    }
 
     #[test]
     fn validate_tts_text_rejects_empty() {
